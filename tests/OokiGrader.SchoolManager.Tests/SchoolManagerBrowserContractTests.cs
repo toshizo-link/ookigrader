@@ -8,27 +8,50 @@ namespace OokiGrader.SchoolManager.Tests;
 public sealed class SchoolManagerBrowserContractTests
 {
     [EdgeFact]
-    public Task LoadingTimeoutBeforeSendIsAKnownFailure() => CheckTimeoutAsync(afterSend: false);
+    public Task LoadingTimeoutBeforeSendIsAKnownFailure() => CheckDeliveryAsync(Scenario.NoLoginForm);
 
     [EdgeFact]
-    public Task LostResponseAfterSendIsUnknownAndDoesNotClickAgain() => CheckTimeoutAsync(afterSend: true);
+    public Task LostResponseAfterSendIsUnknownAndDoesNotClickAgain() => CheckDeliveryAsync(Scenario.LostResponse);
 
-    private static async Task CheckTimeoutAsync(bool afterSend)
+    [EdgeFact]
+    public Task WaitsForDelayedLoginBeforeSendingOnce() => CheckDeliveryAsync(Scenario.Success);
+
+    private enum Scenario { NoLoginForm, LostResponse, Success }
+
+    private static async Task CheckDeliveryAsync(Scenario scenario)
     {
+        var afterSend = scenario != Scenario.NoLoginForm;
         var submitted = 0;
+        var logins = 0;
+        var recipientPageRequests = 0;
+        var prematureNavigation = 0;
         var compose = """
             <ion-fab-button onclick="history.pushState({}, '', '/message-thread-target-users')">+</ion-fab-button>
             <input type="search">
             <div class="table-row"><div class="table-data-1"><div>試験 太郎</div></div>
               <div class="table-data-2">9999</div>
               <ion-button onclick="history.pushState({}, '', '/message-thread-members-and-title')">選択</ion-button></div>
-            <input type="file" onchange="fetch('/org/message-threads/messages/attached-files', {method:'POST'})">
-            <ion-textarea placeholder="メッセージを入力"><textarea></textarea></ion-textarea>
-            <ion-button class="send-message-button" onclick="fetch('/org/message-threads',{method:'POST'}).catch(()=>{})">送信</ion-button>
+            <div class="message-input-area">
+              <input type="file" class="add-attached-file-input">
+              <ion-textarea placeholder="メッセージを入力"><textarea></textarea></ion-textarea>
+              <ion-button class="send-message-button" onclick="fetch('/lms/v1.0/org/message-threads',{method:'POST'}).catch(()=>{})">送信</ion-button>
+            </div>
+            <script>
+              document.querySelector('input[type=file]').onchange = async e => {
+                const file = e.target.files[0];
+                const response = await fetch('/lms/v1.0/org/message-threads/messages/attached-files', {method:'POST', body:file});
+                if (!(await response.json()).id) return;
+                const row = document.createElement('div');
+                row.className = 'attached-file-table-row';
+                row.innerHTML = '<div class="attached-file-table-data-1"></div>';
+                row.firstChild.title = row.firstChild.textContent = file.name;
+                document.querySelector('.message-input-area').append(row);
+              };
+            </script>
             """ + GuardianForm(false) + """
             <script>document.querySelector('button').onclick=()=>history.pushState({}, '', '/message-thread-details/0/create')</script>
             """;
-        var error = await Assert.ThrowsAsync<SchoolManagerClientException>(() =>
+        Task<SchoolManagerDeliveryResult> DeliverAsync() =>
             PlaywrightSchoolManagerClient.DeliverInBrowserAsync(new(
                 new Uri("https://fsm.flens.jp/"), new("unused", "unused"), "9999", "試験 太郎",
                 "試験", "試験", "test.pdf", "%PDF-1.7"u8.ToArray(), false), async browser =>
@@ -36,25 +59,68 @@ public sealed class SchoolManagerBrowserContractTests
                 var context = await browser.NewContextAsync(new() { ServiceWorkers = ServiceWorkerPolicy.Block });
                 await context.RouteAsync("**/*", async route =>
                 {
-                    if (route.Request.Method == "POST" && new Uri(route.Request.Url).AbsolutePath == "/org/message-threads")
+                    var path = new Uri(route.Request.Url).AbsolutePath;
+                    if (route.Request.Method == "POST" && path == "/lms/v1.0/org/message-threads/messages/attached-files")
+                    {
+                        await route.FulfillAsync(new() { Json = new { id = 15 } });
+                        return;
+                    }
+                    if (route.Request.Method == "POST" && path == "/lms/v1.0/org/message-threads")
                     {
                         Interlocked.Increment(ref submitted);
-                        await route.AbortAsync();
+                        if (scenario == Scenario.LostResponse)
+                        {
+                            await route.AbortAsync();
+                        }
+                        else
+                        {
+                            await route.FulfillAsync(new() { Json = new { id = "test-thread" } });
+                        }
                         return;
                     }
 
+                    if (path == "/home") Interlocked.Increment(ref logins);
+                    if (path == "/message-threads")
+                    {
+                        Interlocked.Increment(ref recipientPageRequests);
+                        if (Volatile.Read(ref logins) == 0) Interlocked.Increment(ref prematureNavigation);
+                    }
+                    var body = path switch
+                    {
+                        "/" => "<script>setTimeout(()=>location.replace('/login'),250)</script>",
+                        "/login" when afterSend => """
+                            <div hidden id="form"><input id="user"><input id="pw" type="password">
+                            <button onclick="if(user.value==='unused' && pw.value==='unused')location.assign('/home')">ログイン</button></div>
+                            <script>setTimeout(()=>document.getElementById('form').hidden=false,300)</script>
+                            """,
+                        "/message-threads" when afterSend && Volatile.Read(ref logins) != 0 => compose,
+                        _ => "<p>Loading…</p>",
+                    };
                     await route.FulfillAsync(new()
                     {
                         ContentType = "text/html; charset=utf-8",
-                        Body = afterSend ? compose : "<p>Loading…</p>",
+                        Body = body,
                     });
                 });
                 return context;
-            }, default));
+            }, default);
 
-        Assert.IsType<TimeoutException>(error.InnerException);
-        Assert.Equal(afterSend, error.OutcomeUnknown);
-        Assert.Equal(afterSend ? "message_send_outcome_unknown" : "school_manager_browser_failed", error.Code);
+        if (scenario == Scenario.Success)
+        {
+            var result = await DeliverAsync();
+            Assert.False(result.DryRun);
+            Assert.Equal("test-thread", result.ThreadId);
+        }
+        else
+        {
+            var error = await Assert.ThrowsAsync<SchoolManagerClientException>(DeliverAsync);
+            Assert.IsType<TimeoutException>(error.InnerException);
+            Assert.Equal(afterSend, error.OutcomeUnknown);
+            Assert.Equal(afterSend ? "message_send_outcome_unknown" : "school_manager_login_page_failed", error.Code);
+        }
+        Assert.Equal(0, prematureNavigation);
+        Assert.Equal(afterSend ? 1 : 0, logins);
+        Assert.Equal(afterSend ? 1 : 0, recipientPageRequests);
         Assert.Equal(afterSend ? 1 : 0, submitted);
     }
 
@@ -90,6 +156,37 @@ public sealed class SchoolManagerBrowserContractTests
             "試験", "試験", "test.pdf", "%PDF-1.7"u8.ToArray(), true), default);
         Assert.EndsWith("/message-thread-members-and-title", page.Url);
         Assert.Equal("9999", await page.GetByRole(AriaRole.Searchbox).InputValueAsync());
+    }
+
+    [EdgeFact]
+    public async Task WaitsForTheActiveGuardianFormAndAcceptsTheUnselectedStudentValue()
+    {
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync(new() { Channel = "msedge" });
+        var page = await browser.NewPageAsync();
+        await page.RouteAsync("**/*", route => route.AbortAsync());
+        await page.SetContentAsync(GuardianForm(false));
+        await page.EvaluateAsync("""
+            () => {
+                const cached = document.createElement('div');
+                cached.className = 'ion-page-hidden';
+                cached.hidden = true;
+                cached.innerHTML = document.body.innerHTML;
+                document.body.append(cached);
+                const student = document.querySelector('[formarrayname=students] ion-checkbox');
+                student.checked = null;
+                const parents = document.querySelector('[formarrayname=parents]');
+                const guardian = parents.firstElementChild;
+                guardian.remove();
+                const next = document.querySelector('button');
+                next.disabled = true;
+                setTimeout(() => parents.append(guardian), 350);
+                document.querySelector('textarea').oninput = () => setTimeout(() => next.disabled = false, 250);
+            }
+            """);
+        await PlaywrightSchoolManagerClient.VerifyGuardianOnlyAndSetTitleAsync(page, "保護者用の結果");
+        Assert.Equal("保護者用の結果", await page.Locator("textarea:visible").InputValueAsync());
+        Assert.Equal("", await page.Locator(".ion-page-hidden textarea").InputValueAsync());
     }
 
     [EdgeFact]
@@ -140,13 +237,14 @@ public sealed class SchoolManagerBrowserContractTests
             <ion-button role="button" class="send-message-button" onclick="document.body.dataset.sent='true'">➤</ion-button>
             <ion-button role="button" class="send-and-resolve-button">送信後に解決済にする</ion-button>
             """);
-        var send = await PlaywrightSchoolManagerClient.GetSendControlAsync(page);
+        var compose = page.Locator("body");
+        var send = await PlaywrightSchoolManagerClient.GetSendControlAsync(compose);
         Assert.Equal("send-message-button", await send.GetAttributeAsync("class"));
         Assert.Null(await page.Locator("body").GetAttributeAsync("data-sent"));
         await page.EvaluateAsync("document.querySelector('.send-message-button').setAttribute('aria-disabled','true')");
-        await Assert.ThrowsAsync<SchoolManagerClientException>(() => PlaywrightSchoolManagerClient.GetSendControlAsync(page));
+        await Assert.ThrowsAsync<SchoolManagerClientException>(() => PlaywrightSchoolManagerClient.GetSendControlAsync(compose));
         await page.EvaluateAsync("document.querySelector('.send-message-button').removeAttribute('aria-disabled'); document.body.append(document.querySelector('.send-message-button').cloneNode(true))");
-        await Assert.ThrowsAsync<SchoolManagerClientException>(() => PlaywrightSchoolManagerClient.GetSendControlAsync(page));
+        await Assert.ThrowsAsync<SchoolManagerClientException>(() => PlaywrightSchoolManagerClient.GetSendControlAsync(compose));
         Assert.Null(await page.Locator("body").GetAttributeAsync("data-sent"));
     }
 
@@ -170,7 +268,7 @@ public sealed class SchoolManagerBrowserContractTests
     }
 }
 
-public sealed class EdgeFactAttribute : FactAttribute
+public class EdgeFactAttribute : FactAttribute
 {
     public EdgeFactAttribute()
     {

@@ -174,7 +174,7 @@ public sealed class GuardianDeliveryProcessor(
                         : exception.Code,
                     exception.OutcomeUnknown
                         ? UnknownSendDetail
-                        : "School Manager delivery stopped before a confirmed send.",
+                        : SafeBrowserFailureDetail(exception.Code),
                     cancellationToken)
                 .ConfigureAwait(false);
         }
@@ -478,6 +478,20 @@ public sealed class GuardianDeliveryProcessor(
     private static string BuildTitle(string kind) => kind == "result_pdf"
         ? "採点結果のお知らせ"
         : "合否表更新のお知らせ";
+
+    // Never copy browser errors into the API: they can contain URLs, field values or student data.
+    private static string SafeBrowserFailureDetail(string code) => code switch
+    {
+        "school_manager_browser_start_failed" => "自動配信用ブラウザーを起動できませんでした。",
+        "school_manager_login_page_failed" => "スクマネのログイン画面を読み込めませんでした。",
+        "school_manager_login_failed" => "スクマネのログインを完了できませんでした。",
+        "school_manager_recipient_page_failed" => "メッセージ一覧または宛先選択画面の操作中に停止しました。",
+        "school_manager_guardian_page_failed" => "保護者宛先の確認中に停止しました。",
+        "school_manager_compose_page_failed" => "メッセージ作成画面への移動中に停止しました。",
+        "school_manager_attachment_failed" => "PDFの添付中に停止しました。",
+        "school_manager_message_prepare_failed" => "本文または送信ボタンの準備中に停止しました。",
+        _ => "School Manager delivery stopped before a confirmed send.",
+    };
 
     private static string BuildBody(string kind) => kind == "result_pdf"
         ? "採点結果をお送りします。添付のPDFをご確認ください。"

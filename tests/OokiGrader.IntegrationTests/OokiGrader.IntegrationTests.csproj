@@ -25,6 +25,7 @@
 
   <ItemGroup>
     <Using Include="Xunit" />
+    <EmbeddedResource Include="Fixtures/SchoolManagerDelivery.html" />
   </ItemGroup>
 
 </Project>

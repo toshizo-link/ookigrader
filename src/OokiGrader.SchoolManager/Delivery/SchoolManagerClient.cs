@@ -57,6 +57,7 @@ public sealed class PlaywrightSchoolManagerClient : ISchoolManagerClient
         ValidateRequest(request);
         cancellationToken.ThrowIfCancellationRequested();
         var finalRequestStarted = false;
+        var browserErrorCode = "school_manager_browser_start_failed";
         try
         {
             using var playwright = await Playwright.CreateAsync().ConfigureAwait(false);
@@ -69,9 +70,14 @@ public sealed class PlaywrightSchoolManagerClient : ISchoolManagerClient
                 }).ConfigureAwait(false);
             var context = await openContext(browser).ConfigureAwait(false);
             var page = await context.NewPageAsync().ConfigureAwait(false);
-            await LoginAsync(page, request, cancellationToken).ConfigureAwait(false);
+            browserErrorCode = "school_manager_login_page_failed";
+            await OpenLoginPageAsync(page, request.BaseUri, cancellationToken).ConfigureAwait(false);
+            browserErrorCode = "school_manager_login_failed";
+            await SubmitLoginAsync(page, request, cancellationToken).ConfigureAwait(false);
+            browserErrorCode = "school_manager_recipient_page_failed";
             await SelectExactStudentAsync(page, request, cancellationToken)
                 .ConfigureAwait(false);
+            browserErrorCode = "school_manager_guardian_page_failed";
             await VerifyGuardianOnlyAndSetTitleAsync(page, request.Title)
                 .ConfigureAwait(false);
 
@@ -80,79 +86,35 @@ public sealed class PlaywrightSchoolManagerClient : ISchoolManagerClient
                 return new SchoolManagerDeliveryResult(true, null);
             }
 
+            browserErrorCode = "school_manager_compose_page_failed";
             await page.GetByRole(AriaRole.Button, new() { Name = "次へ" })
                 .ClickAsync(new LocatorClickOptions { Timeout = 15_000 })
                 .ConfigureAwait(false);
             await page.WaitForURLAsync(
-                    "**/message-thread-details/0/create",
+                    url => IsSchoolManagerOrigin(url, request.BaseUri)
+                        && new Uri(url).AbsolutePath.TrimEnd('/') == "/message-thread-details/0/create",
                     new PageWaitForURLOptions { Timeout = 15_000 })
                 .ConfigureAwait(false);
 
-            var fileInput = page.Locator("input[type='file']").First;
-            var uploadResponse = await page.RunAndWaitForResponseAsync(
-                    () => fileInput.SetInputFilesAsync(new FilePayload
-                    {
-                        Name = request.AttachmentName,
-                        MimeType = "application/pdf",
-                        Buffer = request.AttachmentBytes,
-                    }),
-                    response => response.Url.Contains(
-                            "/org/message-threads/messages/attached-files",
-                            StringComparison.Ordinal)
-                        && response.Request.Method == "POST",
-                    new PageRunAndWaitForResponseOptions { Timeout = 30_000 })
+            var compose = page.Locator(".message-input-area:visible");
+            await compose.WaitForAsync(new() { Timeout = 15_000 }).ConfigureAwait(false);
+            browserErrorCode = "school_manager_attachment_failed";
+            await AttachPdfAsync(page, compose, request, cancellationToken)
                 .ConfigureAwait(false);
-            if (!uploadResponse.Ok)
-            {
-                throw new SchoolManagerClientException(
-                    "attachment_upload_failed",
-                    "School Manager rejected the PDF attachment.");
-            }
 
-            var textareas = page.Locator("ion-textarea[placeholder='メッセージを入力'] textarea");
-            var textareaCount = await textareas.CountAsync().ConfigureAwait(false);
-            if (textareaCount != 1)
-            {
-                throw new SchoolManagerClientException(
-                    "message_body_missing",
-                    "The School Manager message body field was not found.");
-            }
-
-            await textareas.FillAsync(request.Body).ConfigureAwait(false);
+            browserErrorCode = "school_manager_message_prepare_failed";
+            await compose.Locator("ion-textarea[placeholder='メッセージを入力'] textarea:visible")
+                .FillAsync(request.Body, new() { Timeout = 15_000 }).ConfigureAwait(false);
             // The normal send control is icon-only; the labelled alternative also resolves the thread.
-            var send = await GetSendControlAsync(page).ConfigureAwait(false);
+            var send = await GetSendControlAsync(compose).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             finalRequestStarted = true;
             var sendResponse = await page.RunAndWaitForResponseAsync(
                     () => send.ClickAsync(new LocatorClickOptions { Timeout = 15_000 }),
-                    response => response.Url.TrimEnd('/')
-                            .EndsWith("/org/message-threads", StringComparison.Ordinal)
-                        && response.Request.Method == "POST",
+                    response => IsApiPost(response, request.BaseUri, "/org/message-threads"),
                     new PageRunAndWaitForResponseOptions { Timeout = 30_000 })
                 .ConfigureAwait(false);
-            if (!sendResponse.Ok)
-            {
-                throw new SchoolManagerClientException(
-                    "message_send_rejected",
-                    "School Manager rejected the guardian message.",
-                    outcomeUnknown: false);
-            }
-
-            var responseJson = await sendResponse.JsonAsync<JsonElement>()
-                .WaitAsync(TimeSpan.FromSeconds(30), cancellationToken)
-                .ConfigureAwait(false);
-            var threadId = responseJson.ValueKind == JsonValueKind.Object
-                && responseJson.TryGetProperty("id", out var id)
-                ? id.ToString()
-                : null;
-            if (string.IsNullOrWhiteSpace(threadId))
-            {
-                throw new SchoolManagerClientException(
-                    "message_send_response_invalid",
-                    "School Manager did not return a message thread identifier.",
-                    outcomeUnknown: true);
-            }
-
+            var threadId = await ReadSentThreadIdAsync(sendResponse, cancellationToken).ConfigureAwait(false);
             return new SchoolManagerDeliveryResult(false, threadId);
         }
         catch (SchoolManagerClientException)
@@ -167,20 +129,12 @@ public sealed class PlaywrightSchoolManagerClient : ISchoolManagerClient
                 outcomeUnknown: false,
                 exception);
         }
-        catch (JsonException exception) when (finalRequestStarted)
-        {
-            throw new SchoolManagerClientException(
-                "message_send_outcome_unknown",
-                "School Manager returned an unreadable response after sending.",
-                outcomeUnknown: true,
-                exception);
-        }
         catch (Exception exception) when (exception is PlaywrightException or TimeoutException)
         {
             throw new SchoolManagerClientException(
                 finalRequestStarted
                     ? "message_send_outcome_unknown"
-                    : "school_manager_browser_failed",
+                    : browserErrorCode,
                 finalRequestStarted
                     ? "The browser lost confirmation after starting the final send request."
                     : "The School Manager browser operation failed before sending.",
@@ -189,70 +143,162 @@ public sealed class PlaywrightSchoolManagerClient : ISchoolManagerClient
         }
     }
 
-    internal static async Task<ILocator> GetSendControlAsync(IPage page)
+    private static bool IsApiPost(IResponse response, Uri baseUri, string path) =>
+        response.Request.Method == "POST"
+        && IsSchoolManagerOrigin(response.Url, baseUri)
+        && new Uri(response.Url).AbsolutePath.TrimEnd('/') == "/lms/v1.0" + path;
+
+    internal static async Task AttachPdfAsync(
+        IPage page, ILocator compose, SchoolManagerDeliveryRequest request, CancellationToken cancellationToken)
     {
-        var send = page.Locator("ion-button.send-message-button");
-        if (await send.CountAsync().ConfigureAwait(false) != 1
-            || !await send.IsEnabledAsync().ConfigureAwait(false))
+        var rows = compose.Locator(".attached-file-table-row");
+        if (await rows.CountAsync().ConfigureAwait(false) != 0)
         {
+            throw new SchoolManagerClientException("attachment_upload_failed", "The compose form already contains an attachment.");
+        }
+
+        // The input itself is hidden. Its visible compose panel selects the active desktop or mobile form.
+        var fileInput = compose.Locator("input.add-attached-file-input[type='file']");
+        var upload = await page.RunAndWaitForResponseAsync(
+            () => fileInput.SetInputFilesAsync(new FilePayload
+            {
+                Name = request.AttachmentName,
+                MimeType = "application/pdf",
+                Buffer = request.AttachmentBytes,
+            }, new() { Timeout = 15_000 }),
+            response => IsApiPost(response, request.BaseUri, "/org/message-threads/messages/attached-files"),
+            new() { Timeout = 30_000 }).ConfigureAwait(false);
+        if (upload.Status != 200 || await ReadResponseIdAsync(upload, cancellationToken).ConfigureAwait(false) is null)
+        {
+            throw new SchoolManagerClientException("attachment_upload_failed", "School Manager did not confirm the PDF upload.");
+        }
+
+        // The SPA only adds the filename to this table after recording the returned attachment ID.
+        await rows.First.WaitForAsync(new() { Timeout = 15_000 }).ConfigureAwait(false);
+        if (await rows.CountAsync().ConfigureAwait(false) != 1 ||
+            await rows.Locator(".attached-file-table-data-1").GetAttributeAsync("title", new() { Timeout = 15_000 })
+                .ConfigureAwait(false) != request.AttachmentName)
+        {
+            throw new SchoolManagerClientException("attachment_upload_failed", "The compose form did not confirm the expected PDF.");
+        }
+    }
+
+    internal static async Task<string> ReadSentThreadIdAsync(IResponse response, CancellationToken cancellationToken)
+    {
+        if (response.Status != 200)
+        {
+            if (response.Status is 400 or 401 or 403 or 404 or 413 or 422)
+            {
+                throw new SchoolManagerClientException("message_send_rejected", "School Manager rejected the guardian message.");
+            }
             throw new SchoolManagerClientException(
-                "send_control_invalid",
-                "The School Manager send control was unavailable or ambiguous.");
+                "message_send_outcome_unknown", "School Manager did not confirm whether the message was sent.", outcomeUnknown: true);
+        }
+
+        return await ReadResponseIdAsync(response, cancellationToken).ConfigureAwait(false)
+            ?? throw new SchoolManagerClientException(
+                "message_send_response_invalid", "School Manager did not return a valid message thread identifier.", outcomeUnknown: true);
+    }
+
+    private static async Task<string?> ReadResponseIdAsync(IResponse response, CancellationToken cancellationToken)
+    {
+        JsonElement json;
+        try
+        {
+            json = await response.JsonAsync<JsonElement>().WaitAsync(TimeSpan.FromSeconds(30), cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+
+        if (json.ValueKind != JsonValueKind.Object || !json.TryGetProperty("id", out var id))
+        {
+            return null;
+        }
+        if (id.ValueKind == JsonValueKind.Number && id.TryGetInt64(out var number) && number > 0)
+        {
+            return number.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+        if (id.ValueKind != JsonValueKind.String)
+        {
+            return null;
+        }
+        var value = id.GetString();
+        return value is { Length: > 0 and <= 200 } && !value.Any(char.IsWhiteSpace) && !value.Any(char.IsControl)
+            ? value : null;
+    }
+
+    internal static async Task<ILocator> GetSendControlAsync(ILocator compose)
+    {
+        var send = compose.Locator("ion-button.send-message-button:visible");
+        // Ionic may still be enabling the button after the body and attachment have rendered.
+        try
+        {
+            await send.ClickAsync(new() { Trial = true, Timeout = 15_000 }).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is PlaywrightException or TimeoutException)
+        {
+            throw new SchoolManagerClientException("send_control_invalid",
+                "The School Manager send control was unavailable or ambiguous.", innerException: exception);
         }
 
         return send;
     }
 
-    private static async Task LoginAsync(
+    internal static async Task OpenLoginPageAsync(
         IPage page,
-        SchoolManagerDeliveryRequest request,
+        Uri baseUri,
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         await page.GotoAsync(
-                request.BaseUri.AbsoluteUri,
+                baseUri.AbsoluteUri,
                 new PageGotoOptions
                 {
                     WaitUntil = WaitUntilState.DOMContentLoaded,
                     Timeout = 30_000,
                 })
             .ConfigureAwait(false);
-        var password = page.Locator("input[type='password']").First;
-        if (await password.IsVisibleAsync().ConfigureAwait(false))
-        {
-            var username = page.Locator(
-                "input:not([type]), input[type='text'], input[type='email']").First;
-            await username.FillAsync(request.Credentials.Username).ConfigureAwait(false);
-            await password.FillAsync(request.Credentials.Password).ConfigureAwait(false);
-            var login = page.GetByRole(AriaRole.Button, new() { Name = "ログイン" });
-            if (await login.CountAsync().ConfigureAwait(false) != 1)
-            {
-                throw new SchoolManagerClientException(
-                    "login_control_invalid",
-                    "The School Manager login control was unavailable or ambiguous.");
-            }
+        // Every delivery starts in a fresh context. The SPA first serves a shell
+        // at /, then navigates to /login and renders its inputs asynchronously.
+        await page.WaitForURLAsync(url => IsSchoolManagerOrigin(url, baseUri)
+                && IsLoginRoute(url), new PageWaitForURLOptions { Timeout = 30_000 })
+            .ConfigureAwait(false);
+        await page.Locator("input[type='password']:visible").WaitForAsync(
+            new LocatorWaitForOptions { Timeout = 30_000 }).ConfigureAwait(false);
+    }
 
-            await login.ClickAsync(new LocatorClickOptions { Timeout = 15_000 })
-                .ConfigureAwait(false);
-            await page.WaitForURLAsync(
-                    url => Uri.TryCreate(url, UriKind.Absolute, out var current)
-                        && !current.AbsolutePath.Contains(
-                            "login",
-                            StringComparison.OrdinalIgnoreCase),
-                    new PageWaitForURLOptions { Timeout = 30_000 })
-                .ConfigureAwait(false);
-        }
-
-        if (!string.Equals(
-                new Uri(page.Url).Host,
-                request.BaseUri.Host,
-                StringComparison.OrdinalIgnoreCase))
+    private static async Task SubmitLoginAsync(
+        IPage page, SchoolManagerDeliveryRequest request, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!IsSchoolManagerOrigin(page.Url, request.BaseUri) || !IsLoginRoute(page.Url))
         {
             throw new SchoolManagerClientException(
                 "login_origin_changed",
                 "School Manager redirected to an unexpected origin.");
         }
+
+        var username = page.Locator("input:is(:not([type]), [type='text'], [type='email']):visible");
+        var password = page.Locator("input[type='password']:visible");
+        var login = page.GetByRole(AriaRole.Button, new() { Name = "ログイン", Exact = true });
+        await username.FillAsync(request.Credentials.Username).ConfigureAwait(false);
+        await password.FillAsync(request.Credentials.Password).ConfigureAwait(false);
+        await login.ClickAsync(new LocatorClickOptions { Timeout = 15_000 }).ConfigureAwait(false);
+        await page.WaitForURLAsync(url => IsSchoolManagerOrigin(url, request.BaseUri)
+                && !IsLoginRoute(url), new PageWaitForURLOptions { Timeout = 30_000 })
+            .ConfigureAwait(false);
     }
+
+    private static bool IsSchoolManagerOrigin(string url, Uri baseUri) =>
+        Uri.TryCreate(url, UriKind.Absolute, out var uri)
+        && uri.Scheme == Uri.UriSchemeHttps && uri.Port == baseUri.Port
+        && uri.UserInfo.Length == 0 && string.Equals(uri.Host, baseUri.Host, StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsLoginRoute(string url) =>
+        new Uri(url).AbsolutePath.TrimEnd('/').Equals("/login", StringComparison.OrdinalIgnoreCase);
 
     internal static async Task SelectExactStudentAsync(
         IPage page,
@@ -281,10 +327,12 @@ public sealed class PlaywrightSchoolManagerClient : ISchoolManagerClient
         }
 
         await add.ClickAsync().ConfigureAwait(false);
-        await page.WaitForURLAsync("**/message-thread-target-users",
+        await page.WaitForURLAsync(url => IsSchoolManagerOrigin(url, request.BaseUri)
+                && new Uri(url).AbsolutePath.TrimEnd('/') == "/message-thread-target-users",
                 new PageWaitForURLOptions { Timeout = 15_000 })
             .ConfigureAwait(false);
         var search = page.GetByRole(AriaRole.Searchbox);
+        await search.First.WaitForAsync(new() { Timeout = 15_000 }).ConfigureAwait(false);
         if (await search.CountAsync().ConfigureAwait(false) != 1)
         {
             throw new SchoolManagerClientException(
@@ -292,39 +340,83 @@ public sealed class PlaywrightSchoolManagerClient : ISchoolManagerClient
                 "The School Manager student search control was unavailable.");
         }
 
-        await search.FillAsync(request.StudentNumber).ConfigureAwait(false);
-        await search.PressAsync("Enter").ConfigureAwait(false);
-        await page.WaitForTimeoutAsync(700).ConfigureAwait(false);
-        var rows = page.Locator(".table-row");
-        var count = await rows.CountAsync().ConfigureAwait(false);
-        var candidates = new List<SchoolManagerStudentCandidate>(count);
-        for (var index = 0; index < count; index++)
+        if (string.IsNullOrWhiteSpace(request.StudentNumber)
+            || string.IsNullOrWhiteSpace(request.StudentDisplayName))
         {
-            var row = rows.Nth(index);
-            var identity = row.Locator(":scope > .table-data-1 > div");
-            var fullName = await identity.Nth(0).InnerTextAsync().ConfigureAwait(false);
-            var userCode = await row.Locator(":scope > .table-data-2")
-                .InnerTextAsync()
-                .ConfigureAwait(false);
-            candidates.Add(new SchoolManagerStudentCandidate(
-                index.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                string.Empty,
-                userCode,
-                fullName));
+            throw new SchoolManagerRecipientException("recipient_not_found",
+                "A student number and display name are required to select a recipient.");
         }
 
-        var match = SchoolManagerRecipientMatcher.Match(
-            request.StudentNumber,
-            request.StudentDisplayName,
-            candidates);
-        var rowIndex = int.Parse(
-            match.UserId,
-            System.Globalization.CultureInfo.InvariantCulture);
-        await rows.Nth(rowIndex).Locator("ion-button").ClickAsync(
-                new LocatorClickOptions { Timeout = 15_000 })
-            .ConfigureAwait(false);
+        await search.FillAsync(request.StudentNumber).ConfigureAwait(false);
+        await search.PressAsync("Enter").ConfigureAwait(false);
+        var rows = page.Locator(".table-row:visible");
+        const string readIdentities = """
+            rows => {
+                const pager = rows[0]?.closest('ion-content')?.querySelector('ion-infinite-scroll');
+                if (pager && pager.disabled !== true) {
+                    // School Manager progressively loads longer lists on scroll.
+                    // A match on a partial page cannot establish uniqueness.
+                    pager.scrollIntoView({ block: 'end' });
+                    return [];
+                }
+                return rows.map(row => [
+                    row.querySelector(':scope > .table-data-2')?.innerText ?? '',
+                    row.querySelector(':scope > .table-data-1 > div')?.innerText ?? ''
+                ]);
+            }
+            """;
+        // Ionic can replace or reorder rows after the search or reuse an existing
+        // node for a different student. Recheck the complete matched snapshot and
+        // select in the same browser event so an old index can never select a new row.
+        const string selectIfUnchanged = $$"""
+            (rows, { identities, index }) => {
+                const current = ({{readIdentities}})(rows);
+                if (current.length !== identities.length || current.some(([code, name], i) =>
+                    code !== identities[i][0] || name !== identities[i][1])) return false;
+                const buttons = rows[index].querySelectorAll('ion-button');
+                if (buttons.length !== 1) return false;
+                const button = buttons[0];
+                if (button.disabled || button.matches('[disabled], [aria-disabled="true"]')
+                    || button.closest('[inert]') || !button.checkVisibility({ checkVisibilityCSS: true })
+                    || getComputedStyle(button).pointerEvents === 'none') return false;
+                button.click();
+                return true;
+            }
+            """;
+        var elapsed = System.Diagnostics.Stopwatch.StartNew();
+        var timeout = TimeSpan.FromSeconds(15);
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var identities = await rows.EvaluateAllAsync<string[][]>(readIdentities).ConfigureAwait(false);
+            var candidates = identities.Select(identity => new SchoolManagerStudentCandidate(
+                string.Empty, string.Empty, identity[0], identity[1])).ToArray();
+            try
+            {
+                var match = SchoolManagerRecipientMatcher.Match(request.StudentNumber, request.StudentDisplayName, candidates);
+                cancellationToken.ThrowIfCancellationRequested();
+                if (await rows.EvaluateAllAsync<bool>(selectIfUnchanged,
+                    new { identities, index = Array.IndexOf(candidates, match) }).ConfigureAwait(false))
+                {
+                    break;
+                }
+                if (elapsed.Elapsed >= timeout)
+                {
+                    throw new SchoolManagerClientException("recipient_search_invalid",
+                        "The matched School Manager recipient could not be selected.");
+                }
+            }
+            catch (SchoolManagerRecipientException error) when (error.Code == "recipient_not_found"
+                && elapsed.Elapsed < timeout)
+            {
+                // The search result table is still loading.
+            }
+            await Task.Delay(125, cancellationToken).ConfigureAwait(false);
+        }
+
         await page.WaitForURLAsync(
-                "**/message-thread-members-and-title",
+                url => IsSchoolManagerOrigin(url, request.BaseUri)
+                    && new Uri(url).AbsolutePath.TrimEnd('/') == "/message-thread-members-and-title",
                 new PageWaitForURLOptions { Timeout = 15_000 })
             .ConfigureAwait(false);
     }
@@ -333,16 +425,32 @@ public sealed class PlaywrightSchoolManagerClient : ISchoolManagerClient
         IPage page,
         string title)
     {
-        var parentsAll = page.Locator(
+        // Ionic retains previous pages in the DOM. Inspect only controls on
+        // the current page, and allow the asynchronous recipient form to render.
+        ILocator Control(string selector) =>
+            page.Locator(selector + ":not(.ion-page-hidden *):not([hidden] *)");
+        var parentsAll = Control(
             "ion-checkbox[formcontrolname='parentsAll']");
-        var parents = page.Locator(
+        var parents = Control(
             "[formarrayname='parents'] ion-checkbox[formcontrolname='parent']");
         // With no student-app account, Ionic renders disabled placeholders without
         // formcontrolname. Still require both controls and verify they are unchecked.
-        var studentsAll = page.Locator(
+        var studentsAll = Control(
             ".captioned-checkbox:has(> .checkbox-caption:text-is('生徒')) > ion-checkbox");
-        var students = page.Locator(
+        var students = Control(
             "[formarrayname='students'] ion-checkbox");
+        var titleInput = Control("ion-textarea[formcontrolname='title'] textarea");
+        await titleInput.First.WaitForAsync(new() { Timeout = 15_000 }).ConfigureAwait(false);
+        try
+        {
+            await parents.First.WaitForAsync(new() { State = WaitForSelectorState.Attached, Timeout = 15_000 })
+                .ConfigureAwait(false);
+        }
+        catch (TimeoutException exception)
+        {
+            throw new SchoolManagerClientException("guardian_controls_missing",
+                "The selected student has no verifiable guardian recipients.", innerException: exception);
+        }
         var parentCount = await parents.CountAsync().ConfigureAwait(false);
         if (await parentsAll.CountAsync().ConfigureAwait(false) != 1
             || parentCount == 0
@@ -387,7 +495,6 @@ public sealed class PlaywrightSchoolManagerClient : ISchoolManagerClient
                 "School Manager did not present a guardian-only recipient selection.");
         }
 
-        var titleInput = page.Locator("ion-textarea[formcontrolname='title'] textarea");
         if (await titleInput.CountAsync().ConfigureAwait(false) != 1)
         {
             throw new SchoolManagerClientException(
@@ -396,13 +503,16 @@ public sealed class PlaywrightSchoolManagerClient : ISchoolManagerClient
         }
 
         await titleInput.FillAsync(title).ConfigureAwait(false);
-        var next = page.GetByRole(AriaRole.Button, new() { Name = "次へ" });
-        if (await next.CountAsync().ConfigureAwait(false) != 1
-            || !await next.IsEnabledAsync().ConfigureAwait(false))
+        var next = page.GetByRole(AriaRole.Button, new() { Name = "次へ", Exact = true });
+        try
+        {
+            await next.ClickAsync(new() { Trial = true, Timeout = 15_000 }).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is PlaywrightException or TimeoutException)
         {
             throw new SchoolManagerClientException(
                 "guardian_selection_not_ready",
-                "The guardian-only recipient selection could not be validated.");
+                "The guardian-only recipient selection could not be validated.", innerException: exception);
         }
     }
 
@@ -410,7 +520,12 @@ public sealed class PlaywrightSchoolManagerClient : ISchoolManagerClient
         control.EvaluateAsync<bool>("""
             element => {
                 const name = element.getAttribute('formcontrolname');
-                if (name === 'studentsAll' || name === 'student') return true;
+                if (name === 'studentsAll' || name === 'student') {
+                    // School Manager sets the individual Angular form value to
+                    // null for an unchecked student and an object for a selected one.
+                    return (element.checked === false || element.checked === null)
+                        && element.getAttribute('aria-checked') !== 'true';
+                }
                 return name === null
                     && element.getAttribute('aria-checked') === 'false'
                     && element.classList.contains('checkbox-disabled')

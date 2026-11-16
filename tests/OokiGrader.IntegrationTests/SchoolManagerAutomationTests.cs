@@ -6,17 +6,20 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using OokiGrader.Application.Abstractions;
 using OokiGrader.Application.Identifiers;
+using OokiGrader.Host.Jobs;
 using OokiGrader.Host.SchoolManager;
 using OokiGrader.Infrastructure.Persistence;
 using OokiGrader.Infrastructure.Persistence.Entities;
 using OokiGrader.Infrastructure.Security;
 using OokiGrader.Infrastructure.Storage;
+using OokiGrader.Reports.Pdf;
 using OokiGrader.SchoolManager.Delivery;
 using OokiGrader.SchoolManager.PassFail;
+using PdfSharp.Pdf;
 
 namespace OokiGrader.IntegrationTests;
 
-public sealed class SchoolManagerAutomationTests
+public sealed partial class SchoolManagerAutomationTests
 {
     [Fact]
     public async Task FinalizedResultQueuesOneCombinedPdfAndOneDelivery()
@@ -175,6 +178,26 @@ public sealed class SchoolManagerAutomationTests
         Assert.True(request.DryRun);
         Assert.Equal("10000001", request.StudentNumber);
         Assert.Equal("https://fsm.flens.jp/", request.BaseUri.AbsoluteUri);
+    }
+
+    [Fact]
+    public async Task BrowserFailureRecordsOnlyASafeStageAndDoesNotRetry()
+    {
+        await using var fixture = await AutomationFixture.CreateAsync();
+        await fixture.SeedStudentAsync("student-a", "10000001", "小6", "A");
+        await fixture.SeedReadyPassFailDeliveryAsync("student-a");
+        await fixture.ConfigureAsync(dryRun: false);
+        fixture.Client.FailAtLogin = true;
+
+        Assert.True(await fixture.DeliveryProcessor.ProcessNextAsync());
+        Assert.False(await fixture.DeliveryProcessor.ProcessNextAsync());
+        await using var db = await fixture.CreateDbContextAsync();
+        var row = await db.GuardianDeliveries.AsNoTracking().SingleAsync();
+        Assert.Equal("failed", row.State);
+        Assert.Equal("school_manager_login_failed", row.LastErrorCode);
+        Assert.Equal("スクマネのログインを完了できませんでした。", row.SafeErrorDetail);
+        Assert.Null(row.SentAt);
+        Assert.Single(fixture.Client.Requests);
     }
 
     [Fact]
@@ -364,17 +387,14 @@ public sealed class SchoolManagerAutomationTests
 
     private sealed class AutomationFixture : IAsyncDisposable
     {
-        private readonly SqliteConnection _connection;
         private readonly ServiceProvider _services;
         private readonly string _root;
 
         private AutomationFixture(
-            SqliteConnection connection,
             ServiceProvider services,
             string root,
             DateTimeOffset now)
         {
-            _connection = connection;
             _services = services;
             _root = root;
             Now = now;
@@ -391,17 +411,21 @@ public sealed class SchoolManagerAutomationTests
         public GuardianDeliveryProcessor DeliveryProcessor { get; }
         public SchoolManagerAutomationWorker Worker => _services.GetRequiredService<SchoolManagerAutomationWorker>();
         public AutomaticResultDeliveryPlanner ResultPlanner { get; }
+        public ResultPdfJobWorker PdfWorker => _services.GetRequiredService<ResultPdfJobWorker>();
         public FakeSchoolManagerClient Client { get; }
 
-        public static async Task<AutomationFixture> CreateAsync()
+        public static async Task<AutomationFixture> CreateAsync(ISchoolManagerClient? browserClient = null)
         {
             var root = Path.Combine(
                 Path.GetTempPath(),
                 "ooki-school-manager-tests",
                 Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(Path.Combine(root, "incoming"));
-            var connection = new SqliteConnection("Data Source=:memory:");
-            await connection.OpenAsync();
+            var database = new SqliteConnectionStringBuilder
+            {
+                DataSource = Path.Combine(root, "test.db"),
+                Pooling = false,
+            };
             var now = new DateTimeOffset(2026, 9, 15, 6, 0, 0, TimeSpan.Zero);
             var services = new ServiceCollection();
             services.AddLogging();
@@ -409,7 +433,7 @@ public sealed class SchoolManagerAutomationTests
             services.AddSingleton<IClock>(new FixedClock(now));
             services.AddSingleton<IWriteCoordinator, SemaphoreWriteCoordinator>();
             services.AddDbContextFactory<OokiGraderDbContext>(options =>
-                options.UseSqlite(connection));
+                options.UseSqlite(database.ToString()));
             services.AddSingleton<IContentStore>(new NtfsContentStore(
                 new ContentStoreOptions
                 {
@@ -423,7 +447,9 @@ public sealed class SchoolManagerAutomationTests
             }));
             services.AddSingleton<FakeSchoolManagerClient>();
             services.AddSingleton<ISchoolManagerClient>(provider =>
-                provider.GetRequiredService<FakeSchoolManagerClient>());
+                browserClient ?? provider.GetRequiredService<FakeSchoolManagerClient>());
+            services.AddSingleton<IResultPdfRenderer, ResultPdfRenderer>();
+            services.AddSingleton<ResultPdfJobWorker>();
             services.AddSingleton<PassFailImportProcessor>();
             services.AddSingleton<GuardianDeliveryProcessor>();
             services.AddSingleton<SchoolManagerAutomationWorker>();
@@ -433,7 +459,7 @@ public sealed class SchoolManagerAutomationTests
                 .GetRequiredService<IDbContextFactory<OokiGraderDbContext>>()
                 .CreateDbContextAsync();
             await db.Database.EnsureCreatedAsync();
-            return new AutomationFixture(connection, provider, root, now);
+            return new AutomationFixture(provider, root, now);
         }
 
         public Task<OokiGraderDbContext> CreateDbContextAsync() => _services
@@ -570,9 +596,12 @@ public sealed class SchoolManagerAutomationTests
             if (includeOriginalPdf)
             {
                 var store = _services.GetRequiredService<IContentStore>();
-                await using var original = new MemoryStream(
-                    "%PDF-1.4\n%%EOF\n"u8.ToArray(),
-                    writable: false);
+                using var document = new PdfDocument();
+                document.AddPage();
+                document.AddPage();
+                await using var original = new MemoryStream();
+                document.Save(original, closeStream: false);
+                original.Position = 0;
                 var stored = await store.PutAsync(
                     original,
                     ContentStorageClass.ManagedScanOriginal,
@@ -773,7 +802,6 @@ public sealed class SchoolManagerAutomationTests
         public async ValueTask DisposeAsync()
         {
             await _services.DisposeAsync();
-            await _connection.DisposeAsync();
             if (Directory.Exists(_root))
             {
                 Directory.Delete(_root, recursive: true);
@@ -786,6 +814,7 @@ public sealed class SchoolManagerAutomationTests
         public List<SchoolManagerDeliveryRequest> Requests { get; } = [];
         public bool FailWithUnknownOutcome { get; set; }
         public bool InterruptAttempt { get; set; }
+        public bool FailAtLogin { get; set; }
 
         public Task<SchoolManagerDeliveryResult> DeliverAsync(
             SchoolManagerDeliveryRequest request,
@@ -793,6 +822,11 @@ public sealed class SchoolManagerAutomationTests
         {
             cancellationToken.ThrowIfCancellationRequested();
             Requests.Add(request);
+            if (FailAtLogin)
+            {
+                throw new SchoolManagerClientException("school_manager_login_failed", "private browser detail");
+            }
+
             if (InterruptAttempt)
             {
                 throw new IOException("Connection interrupted.");

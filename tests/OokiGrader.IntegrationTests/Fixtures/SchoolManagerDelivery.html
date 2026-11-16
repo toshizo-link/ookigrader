@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<title>School Manager integration fixture</title>
+<main id="screen"></main>
+<script>
+const screenRoot = document.getElementById("screen");
+const path = location.pathname;
+if (path === "/") {
+    setTimeout(() => location.replace("/login"), 150);
+} else if (path === "/login") {
+    setTimeout(() => {
+        screenRoot.innerHTML = '<form><input id="user"><input id="password" type="password"><button>ログイン</button></form>';
+        screenRoot.querySelector("form").onsubmit = event => {
+            event.preventDefault();
+            if (document.getElementById("user").value === "test-user"
+                && document.getElementById("password").value === "test-password") {
+                sessionStorage.setItem("authenticated", "yes");
+                location.assign("/home");
+            }
+        };
+    }, 150);
+} else if (!sessionStorage.getItem("authenticated")) {
+    location.replace("/login");
+} else if (path === "/message-threads") {
+    screenRoot.innerHTML = '<ion-fab-button role="button">+</ion-fab-button>';
+    screenRoot.firstElementChild.onclick = () => location.assign("/message-thread-target-users");
+} else if (path === "/message-thread-target-users") {
+    screenRoot.innerHTML = '<input type="search"><section></section>';
+    const search = screenRoot.querySelector("input");
+    search.onkeydown = event => {
+        if (event.key !== "Enter" || search.value !== "10000001") return;
+        // The previous client sampled the table once, 700 ms after pressing Enter.
+        setTimeout(renderResults, 1200);
+    };
+    function renderResults() {
+        const results = screenRoot.querySelector("section");
+        results.replaceChildren();
+        for (const [number, student, guardian] of [
+            ["10000002", "other-student", "other-guardian"],
+            ["10000001", "matched-student", "matched-guardian"]
+        ]) {
+            const row = document.createElement("div");
+            row.className = "table-row";
+            row.innerHTML = '<div class="table-data-1"><div>山田 太郎</div></div><div class="table-data-2"></div><ion-button role="button">選択</ion-button>';
+            row.querySelector(".table-data-2").textContent = number;
+            row.querySelector("ion-button").onclick = () => {
+                sessionStorage.setItem("guardian", guardian);
+                sessionStorage.setItem("student", student);
+                location.assign("/message-thread-members-and-title");
+            };
+            results.append(row);
+        }
+    }
+} else if (path === "/message-thread-members-and-title") {
+    screenRoot.innerHTML = `
+        <ion-checkbox formcontrolname="parentsAll"></ion-checkbox>
+        <div formarrayname="parents"><ion-checkbox formcontrolname="parent"></ion-checkbox></div>
+        <div class="captioned-checkbox"><ion-checkbox formcontrolname="studentsAll"></ion-checkbox><div class="checkbox-caption">生徒</div></div>
+        <div formarrayname="students"><ion-checkbox formcontrolname="student"></ion-checkbox></div>
+        <ion-textarea formcontrolname="title"><textarea></textarea></ion-textarea><button>次へ</button>`;
+    screenRoot.querySelector("[formcontrolname=parentsAll]").checked = true;
+    const guardian = screenRoot.querySelector("[formcontrolname=parent]");
+    guardian.checked = true;
+    const student = screenRoot.querySelector("[formcontrolname=student]");
+    student.checked = false;
+    screenRoot.querySelector("[formcontrolname=studentsAll]").checked = false;
+    screenRoot.querySelector("button").onclick = () => {
+        const recipients = [{memberType: "orgDepartment", userId: null, departmentId: "class-a"}];
+        if (guardian.checked) recipients.push({memberType: "parent", userId: sessionStorage.getItem("guardian"), departmentId: null});
+        if (student.checked) recipients.push({memberType: "student", userId: sessionStorage.getItem("student"), departmentId: null});
+        sessionStorage.setItem("recipients", JSON.stringify(recipients));
+        sessionStorage.setItem("title", screenRoot.querySelector("textarea").value);
+        location.assign("/message-thread-details/0/create");
+    };
+} else if (path === "/message-thread-details/0/create") {
+    screenRoot.innerHTML = `
+        <div class="message-input-area">
+          <input class="add-attached-file-input" type="file">
+          <div class="attached-file-table"></div>
+          <ion-textarea placeholder="メッセージを入力"><textarea></textarea></ion-textarea>
+          <ion-button class="send-message-button" role="button" aria-disabled="true">送信</ion-button>
+        </div>`;
+    let upload;
+    const input = screenRoot.querySelector("input");
+    const send = screenRoot.querySelector("ion-button");
+    input.onchange = () => {
+        const file = input.files[0];
+        const params = new URLSearchParams({ fileName: file.name, mimeType: file.type });
+        upload = fetch("/lms/v1.0/org/message-threads/messages/attached-files?" + params, {
+            method: "POST", body: file, headers: { "Content-Type": file.type }
+        }).then(async response => {
+            if (!response.ok) return null;
+            const attachment = await response.json();
+            const row = document.createElement("div");
+            row.className = "attached-file-table-row";
+            row.innerHTML = '<div class="attached-file-table-data-1"></div>';
+            row.firstElementChild.title = file.name;
+            row.firstElementChild.textContent = file.name;
+            setTimeout(() => {
+                screenRoot.querySelector(".attached-file-table").append(row);
+                send.setAttribute("aria-disabled", "false");
+            }, 140);
+            return attachment;
+        });
+    };
+    send.onclick = async () => {
+        if (send.getAttribute("aria-disabled") === "true") return;
+        const attachment = await upload;
+        if (!attachment) return;
+        const thread = {
+            targetUser: {userId: sessionStorage.getItem("student"), departmentId: "class-a"},
+            members: JSON.parse(sessionStorage.getItem("recipients")),
+            title: sessionStorage.getItem("title"),
+            message: {
+                body: screenRoot.querySelector("textarea").value,
+                attachedFiles: [{fileName: input.files[0].name, id: attachment.id}]
+            }
+        };
+        await fetch("/lms/v1.0/org/message-threads", {
+            method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(thread)
+        }).catch(() => {});
+    };
+}
+</script>

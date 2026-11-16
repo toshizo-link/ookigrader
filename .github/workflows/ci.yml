@@ -123,6 +123,19 @@ jobs:
             throw 'Windows PowerShell 5.1 installer source parsing failed.'
           }
 
+      - name: Test offline School Manager browser contracts in Edge
+        shell: pwsh
+        run: |
+          $edge = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Microsoft/Edge/Application/msedge.exe'
+          if (-not (Test-Path -LiteralPath $edge -PathType Leaf)) {
+            throw 'Microsoft Edge is required to exercise the School Manager browser tests.'
+          }
+          dotnet test tests/OokiGrader.SchoolManager.Tests --configuration Release --filter 'FullyQualifiedName!~PublicLoginPageRendersTheControlsUsedByTheDeliveryClient'
+
+      - name: Test School Manager delivery from finalized result to simulated inbox
+        shell: pwsh
+        run: dotnet test tests/OokiGrader.IntegrationTests --configuration Release --filter 'FullyQualifiedName~SchoolManagerAutomationTests'
+
       - name: Build and verify release and host media
         shell: pwsh
         run: |

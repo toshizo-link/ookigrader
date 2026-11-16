@@ -56,3 +56,5 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
 未送信の候補は取り消されます。送信処理が始まっている候補は、School Managerの送信済みメッセージを確認してください。
 
 配信状況が `failed` でエラーが `message_send_outcome_unknown` の場合、実際には届いている可能性があります。自動再送はされません。新たな確定や再送を行う前に、School Managerの送信済みメッセージで宛先・時刻・添付を照合してください。
+
+0.9.19の `school_manager_browser_failed` は、送信ボタンを押す前にブラウザーの操作が失敗した記録です。このコードだけではログイン・宛先選択・添付のどこで止まったかは分かりません。同じ一覧に古い試行も表示されるので、今回のテストは作成日時と最終試行日時で区別して確認します。
