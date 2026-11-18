@@ -60,8 +60,12 @@ public sealed class RecipientSelectionBrowserTests
         {
             ContentType = "text/html; charset=utf-8",
             Body = $$$"""
-                <ion-fab-button onclick="history.pushState({}, '', '/message-thread-target-users')">+</ion-fab-button>
-                <ion-content><input id="search" type="search"><div id="results"></div></ion-content>
+                <app-message-threads>
+                  <ion-fab-button onclick="history.pushState({}, '', '/message-thread-target-users')">+</ion-fab-button>
+                </app-message-threads>
+                <app-message-thread-target-users>
+                  <ion-content><input id="search" type="search"><div id="results"></div></ion-content>
+                </app-message-thread-target-users>
                 <script>
                 const search = document.querySelector('#search');
                 const results = document.querySelector('#results');

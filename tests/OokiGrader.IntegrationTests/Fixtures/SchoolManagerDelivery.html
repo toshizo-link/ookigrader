@@ -23,10 +23,10 @@ if (path === "/") {
 } else if (!sessionStorage.getItem("authenticated")) {
     location.replace("/login");
 } else if (path === "/message-threads") {
-    screenRoot.innerHTML = '<ion-fab-button role="button">+</ion-fab-button>';
-    screenRoot.firstElementChild.onclick = () => location.assign("/message-thread-target-users");
+    screenRoot.innerHTML = '<app-message-threads><ion-fab-button role="button">+</ion-fab-button></app-message-threads>';
+    screenRoot.querySelector("ion-fab-button").onclick = () => location.assign("/message-thread-target-users");
 } else if (path === "/message-thread-target-users") {
-    screenRoot.innerHTML = '<input type="search"><section></section>';
+    screenRoot.innerHTML = '<app-message-thread-target-users><input type="search"><section></section></app-message-thread-target-users>';
     const search = screenRoot.querySelector("input");
     search.onkeydown = event => {
         if (event.key !== "Enter" || search.value !== "10000001") return;

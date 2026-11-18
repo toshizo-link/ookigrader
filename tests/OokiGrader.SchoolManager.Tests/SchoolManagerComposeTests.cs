@@ -11,7 +11,7 @@ public sealed class SchoolManagerComposeTests
         "数学 結果.pdf", "%PDF-1.4\nfixture"u8.ToArray(), false);
 
     [EdgeFact]
-    public async Task UploadWaitsForTheExpectedFileInTheActiveForm()
+    public async Task UploadWaitsForTheEnabledInputAndExpectedFileInTheActiveForm()
     {
         using var playwright = await Playwright.CreateAsync();
         await using var browser = await playwright.Chromium.LaunchAsync(new() { Channel = "msedge" });
@@ -56,8 +56,15 @@ public sealed class SchoolManagerComposeTests
             Task UploadAsync() => PlaywrightSchoolManagerClient.AttachPdfAsync(page, compose, Request, default);
             if (scenario == "delayed")
             {
+                await compose.Locator("input[type=file]").EvaluateAsync("""
+                    input => {
+                        input.disabled = true;
+                        setTimeout(() => input.disabled = false, 750);
+                    }
+                    """);
                 await UploadAsync();
                 Assert.Equal(Request.AttachmentName, await compose.Locator(".attached-file-table-data-1").TextContentAsync());
+                Assert.Null(await page.Locator("body").GetAttributeAsync("data-early-change"));
                 Assert.Null(await page.Locator("body").GetAttributeAsync("data-hidden-upload"));
             }
             else
@@ -129,6 +136,11 @@ public sealed class SchoolManagerComposeTests
         </div>
         <script>
         document.querySelector('div:not([hidden]) input[type=file]').onchange = async e => {
+          if (e.target.disabled) {
+            document.body.dataset.earlyChange = 'yes';
+            e.target.value = '';
+            return;
+          }
           const file = e.target.files[0], form = e.target.parentElement;
           const response = await fetch('/lms/v1.0/org/message-threads/messages/attached-files?' +
             new URLSearchParams({fileName:file.name, mimeType:file.type}), {method:'POST', body:file});

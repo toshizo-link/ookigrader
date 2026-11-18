@@ -22,15 +22,20 @@ public sealed class SchoolManagerBrowserContractTests
     {
         var afterSend = scenario != Scenario.NoLoginForm;
         var submitted = 0;
+        var shellLoads = 0;
         var logins = 0;
         var recipientPageRequests = 0;
         var prematureNavigation = 0;
         var compose = """
-            <ion-fab-button onclick="history.pushState({}, '', '/message-thread-target-users')">+</ion-fab-button>
-            <input type="search">
-            <div class="table-row"><div class="table-data-1"><div>試験 太郎</div></div>
-              <div class="table-data-2">9999</div>
-              <ion-button onclick="history.pushState({}, '', '/message-thread-members-and-title')">選択</ion-button></div>
+            <app-message-threads>
+              <ion-fab-button onclick="history.pushState({}, '', '/message-thread-target-users')">+</ion-fab-button>
+            </app-message-threads>
+            <app-message-thread-target-users>
+              <input type="search">
+              <div class="table-row"><div class="table-data-1"><div>試験 太郎</div></div>
+                <div class="table-data-2">9999</div>
+                <ion-button onclick="history.pushState({}, '', '/message-thread-members-and-title')">選択</ion-button></div>
+            </app-message-thread-target-users>
             <div class="message-input-area">
               <input type="file" class="add-attached-file-input">
               <ion-textarea placeholder="メッセージを入力"><textarea></textarea></ion-textarea>
@@ -79,6 +84,7 @@ public sealed class SchoolManagerBrowserContractTests
                         return;
                     }
 
+                    if (path == "/") Interlocked.Increment(ref shellLoads);
                     if (path == "/home") Interlocked.Increment(ref logins);
                     if (path == "/message-threads")
                     {
@@ -119,13 +125,14 @@ public sealed class SchoolManagerBrowserContractTests
             Assert.Equal(afterSend ? "message_send_outcome_unknown" : "school_manager_login_page_failed", error.Code);
         }
         Assert.Equal(0, prematureNavigation);
+        Assert.Equal(afterSend ? 1 : 2, shellLoads);
         Assert.Equal(afterSend ? 1 : 0, logins);
         Assert.Equal(afterSend ? 1 : 0, recipientPageRequests);
         Assert.Equal(afterSend ? 1 : 0, submitted);
     }
 
     [EdgeFact]
-    public async Task StartsFromAddActionBeforeSelectingAnExactStudent()
+    public async Task WaitsForRecipientPageToMountAndIgnoresVisibleThreadListDuringTransition()
     {
         using var playwright = await Playwright.CreateAsync();
         await using var browser = await playwright.Chromium.LaunchAsync(new() { Channel = "msedge" });
@@ -134,19 +141,28 @@ public sealed class SchoolManagerBrowserContractTests
         {
             ContentType = "text/html; charset=utf-8",
             Body = """
-                <ion-fab-button role="button" tabindex="0">+</ion-fab-button>
-                <input type="search">
-                <div class="table-row">
-                  <div class="table-data-1"><div>試験 太郎</div><div>9999</div></div>
-                  <div class="table-data-2">9999</div><ion-button role="button">選択</ion-button>
-                </div>
+                <app-message-threads>
+                  <ion-fab-button role="button" tabindex="0">+</ion-fab-button>
+                  <input type="search" value="thread filter">
+                  <div class="table-row">
+                    <div class="table-data-1"><div>試験 太郎</div></div><div class="table-data-2">9999</div>
+                    <ion-button onclick="document.body.dataset.threadClicked='yes'">スレッド</ion-button>
+                  </div>
+                </app-message-threads>
+                <template>
+                  <app-message-thread-target-users>
+                    <input type="search">
+                    <div class="table-row">
+                      <div class="table-data-1"><div>試験 太郎</div><div>9999</div></div>
+                      <div class="table-data-2">9999</div>
+                      <ion-button onclick="history.pushState({}, '', '/message-thread-members-and-title')">選択</ion-button>
+                    </div>
+                  </app-message-thread-target-users>
+                </template>
                 <script>
-                  let started = false;
                   document.querySelector('ion-fab-button').onclick = () => {
-                    started = true; history.pushState({}, '', '/message-thread-target-users');
-                  };
-                  document.querySelector('.table-row ion-button').onclick = () => {
-                    if (started) history.pushState({}, '', '/message-thread-members-and-title');
+                    history.pushState({}, '', '/message-thread-target-users');
+                    setTimeout(() => document.body.append(document.querySelector('template').content), 350);
                   };
                 </script>
                 """,
@@ -155,7 +171,9 @@ public sealed class SchoolManagerBrowserContractTests
             new Uri("https://fsm.flens.jp/"), new("unused", "unused"), "9999", "試験 太郎",
             "試験", "試験", "test.pdf", "%PDF-1.7"u8.ToArray(), true), default);
         Assert.EndsWith("/message-thread-members-and-title", page.Url);
-        Assert.Equal("9999", await page.GetByRole(AriaRole.Searchbox).InputValueAsync());
+        Assert.Equal("thread filter", await page.Locator("app-message-threads input").InputValueAsync());
+        Assert.Null(await page.Locator("body").GetAttributeAsync("data-thread-clicked"));
+        Assert.Equal("9999", await page.Locator("app-message-thread-target-users input").InputValueAsync());
     }
 
     [EdgeFact]

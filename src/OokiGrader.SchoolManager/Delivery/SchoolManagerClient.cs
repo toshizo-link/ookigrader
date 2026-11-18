@@ -157,8 +157,9 @@ public sealed class PlaywrightSchoolManagerClient : ISchoolManagerClient
             throw new SchoolManagerClientException("attachment_upload_failed", "The compose form already contains an attachment.");
         }
 
-        // The input itself is hidden. Its visible compose panel selects the active desktop or mobile form.
-        var fileInput = compose.Locator("input.add-attached-file-input[type='file']");
+        // The hidden input becomes enabled after the compose form initializes its attachment list.
+        // School Manager discards earlier change events without starting an upload.
+        var fileInput = compose.Locator("input.add-attached-file-input[type='file']:enabled");
         var upload = await page.RunAndWaitForResponseAsync(
             () => fileInput.SetInputFilesAsync(new FilePayload
             {
@@ -250,24 +251,33 @@ public sealed class PlaywrightSchoolManagerClient : ISchoolManagerClient
     internal static async Task OpenLoginPageAsync(
         IPage page,
         Uri baseUri,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        int timeoutMilliseconds = 30_000)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        await page.GotoAsync(
-                baseUri.AbsoluteUri,
-                new PageGotoOptions
-                {
-                    WaitUntil = WaitUntilState.DOMContentLoaded,
-                    Timeout = 30_000,
-                })
-            .ConfigureAwait(false);
-        // Every delivery starts in a fresh context. The SPA first serves a shell
-        // at /, then navigates to /login and renders its inputs asynchronously.
-        await page.WaitForURLAsync(url => IsSchoolManagerOrigin(url, baseUri)
-                && IsLoginRoute(url), new PageWaitForURLOptions { Timeout = 30_000 })
-            .ConfigureAwait(false);
-        await page.Locator("input[type='password']:visible").WaitForAsync(
-            new LocatorWaitForOptions { Timeout = 30_000 }).ConfigureAwait(false);
+        try
+        {
+            await LoadLoginFormAsync().ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            // A stalled SPA bootstrap can recover on a fresh navigation before credentials are entered.
+            await LoadLoginFormAsync().ConfigureAwait(false);
+        }
+
+        async Task LoadLoginFormAsync()
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await page.GotoAsync(baseUri.AbsoluteUri, new PageGotoOptions
+            {
+                WaitUntil = WaitUntilState.DOMContentLoaded,
+                Timeout = timeoutMilliseconds,
+            }).ConfigureAwait(false);
+            // The SPA serves a shell at /, navigates to /login, then renders its inputs.
+            await page.WaitForURLAsync(url => IsSchoolManagerOrigin(url, baseUri) && IsLoginRoute(url),
+                new PageWaitForURLOptions { Timeout = timeoutMilliseconds }).ConfigureAwait(false);
+            await page.Locator("input[type='password']:visible").WaitForAsync(
+                new LocatorWaitForOptions { Timeout = timeoutMilliseconds }).ConfigureAwait(false);
+        }
     }
 
     private static async Task SubmitLoginAsync(
@@ -316,8 +326,8 @@ public sealed class PlaywrightSchoolManagerClient : ISchoolManagerClient
             .ConfigureAwait(false);
         // The add action initializes the compose state. Direct navigation to the
         // recipient route renders the list but leaves selecting a student inert.
-        var add = page.Locator("ion-fab-button:visible");
-        await add.WaitForAsync(new LocatorWaitForOptions { Timeout = 15_000 })
+        var add = page.Locator("app-message-threads:not(.ion-page-hidden):not([hidden]) ion-fab-button:visible");
+        await add.First.WaitForAsync(new LocatorWaitForOptions { Timeout = 15_000 })
             .ConfigureAwait(false);
         if (await add.CountAsync().ConfigureAwait(false) != 1)
         {
@@ -331,7 +341,10 @@ public sealed class PlaywrightSchoolManagerClient : ISchoolManagerClient
                 && new Uri(url).AbsolutePath.TrimEnd('/') == "/message-thread-target-users",
                 new PageWaitForURLOptions { Timeout = 15_000 })
             .ConfigureAwait(false);
-        var search = page.GetByRole(AriaRole.Searchbox);
+        // Ionic updates the URL before mounting this page and hiding the thread list.
+        // Both pages have a search box and table rows during the transition.
+        var recipients = page.Locator("app-message-thread-target-users:not(.ion-page-hidden):not([hidden])");
+        var search = recipients.GetByRole(AriaRole.Searchbox);
         await search.First.WaitForAsync(new() { Timeout = 15_000 }).ConfigureAwait(false);
         if (await search.CountAsync().ConfigureAwait(false) != 1)
         {
@@ -349,7 +362,7 @@ public sealed class PlaywrightSchoolManagerClient : ISchoolManagerClient
 
         await search.FillAsync(request.StudentNumber).ConfigureAwait(false);
         await search.PressAsync("Enter").ConfigureAwait(false);
-        var rows = page.Locator(".table-row:visible");
+        var rows = recipients.Locator(".table-row:visible");
         const string readIdentities = """
             rows => {
                 const pager = rows[0]?.closest('ion-content')?.querySelector('ion-infinite-scroll');

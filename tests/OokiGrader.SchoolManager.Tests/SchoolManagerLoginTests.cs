@@ -6,6 +6,48 @@ namespace OokiGrader.SchoolManager.Tests;
 public sealed class SchoolManagerLoginTests
 {
     [EdgeFact]
+    public async Task ReloadsLoginPageOnceWhenFirstLoginFormNeverRenders()
+    {
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync(new() { Channel = "msedge" });
+        var page = await browser.NewPageAsync(new() { ServiceWorkers = ServiceWorkerPolicy.Block });
+        var shellLoads = 0;
+        var loginLoads = 0;
+        var otherRequests = 0;
+        await page.RouteAsync("**/*", async route =>
+        {
+            var path = new Uri(route.Request.Url).AbsolutePath;
+            if (route.Request.Method == "GET" && path == "/")
+            {
+                Interlocked.Increment(ref shellLoads);
+                await route.FulfillAsync(new() { ContentType = "text/html",
+                    Body = "<script>location.replace('/login')</script>" });
+            }
+            else if (route.Request.Method == "GET" && path == "/login")
+            {
+                var attempt = Interlocked.Increment(ref loginLoads);
+                await route.FulfillAsync(new() { ContentType = "text/html", Body = attempt == 1
+                    ? "<main>Loading</main>"
+                    : "<form><input type='text'><input type='password'><button>Login</button></form>" });
+            }
+            else
+            {
+                Interlocked.Increment(ref otherRequests);
+                await route.AbortAsync();
+            }
+        });
+
+        await PlaywrightSchoolManagerClient.OpenLoginPageAsync(
+            page, new Uri("https://fsm.flens.jp/"), default, timeoutMilliseconds: 2_000);
+
+        Assert.Equal(2, shellLoads);
+        Assert.Equal(2, loginLoads);
+        Assert.Equal(0, otherRequests);
+        Assert.Equal("", await page.Locator("input[type=text]").InputValueAsync());
+        Assert.Equal("", await page.Locator("input[type=password]").InputValueAsync());
+    }
+
+    [EdgeFact]
     public async Task RejectedLoginStaysOnLoginPageAndNeverOpensRecipientSearch()
     {
         var loginAttempts = 0;
