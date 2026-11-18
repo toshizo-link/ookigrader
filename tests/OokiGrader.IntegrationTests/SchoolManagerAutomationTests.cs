@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.IO.Compression;
 using System.Text;
 using Microsoft.Data.Sqlite;
@@ -42,6 +43,148 @@ public sealed partial class SchoolManagerAutomationTests
         Assert.Single(await db.BackgroundJobs
             .Where(item => item.Type == "result_pdf.render")
             .ToArrayAsync());
+    }
+
+    [Fact]
+    public async Task PlannerQueuesTheNextResultAfterFiftyEarlierDeliveries()
+    {
+        await using var fixture = await AutomationFixture.CreateAsync();
+        await fixture.ConfigureAsync(dryRun: true);
+        var submissionIds = await fixture.SeedFinalizedResultsAsync(51);
+
+        for (var index = 0; index < 50; index++)
+        {
+            Assert.True(await fixture.ResultPlanner.ProcessNextAsync());
+        }
+
+        await using var db = await fixture.CreateDbContextAsync();
+        var lastId = submissionIds[^1];
+        Assert.False(await db.GuardianDeliveries.AnyAsync(item => item.SubmissionId == lastId));
+        Assert.True(await fixture.ResultPlanner.ProcessNextAsync());
+        Assert.False(await fixture.ResultPlanner.ProcessNextAsync());
+        var queuedIds = await db.GuardianDeliveries.Select(item => item.SubmissionId).ToListAsync();
+        Assert.Equal(submissionIds.Order(), queuedIds.Order());
+        Assert.Equal(51, await db.ExportRecords.CountAsync());
+        Assert.Equal(51, await db.BackgroundJobs.CountAsync(item => item.Type == "result_pdf.render"));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task RefinalizedResultWithCorrectedSourceQueuesOneNewDelivery(bool pollWhileOpen)
+    {
+        await using var fixture = await AutomationFixture.CreateAsync();
+        await fixture.ConfigureAsync(dryRun: true);
+        var submissionId = await fixture.SeedFinalizedResultAsync();
+        Assert.True(await fixture.ResultPlanner.ProcessNextAsync());
+
+        await using var db = await fixture.CreateDbContextAsync();
+        var submission = await db.Submissions.SingleAsync();
+        var run = await db.GradingRuns.SingleAsync();
+        submission.FinalizedAt = run.FinalizedAt = null;
+        submission.State = run.State = "needs_grade_review";
+        await db.SaveChangesAsync();
+        if (pollWhileOpen)
+        {
+            Assert.True(await fixture.ResultPlanner.ProcessNextAsync());
+            Assert.False(await fixture.ResultPlanner.ProcessNextAsync());
+        }
+
+        run.ResultSourceRevision++;
+        submission.FinalizedAt = run.FinalizedAt = fixture.Now;
+        submission.State = run.State = "finalized";
+        await db.SaveChangesAsync();
+        if (!pollWhileOpen)
+        {
+            Assert.True(await fixture.ResultPlanner.ProcessNextAsync()); // Cancel the stale source.
+        }
+
+        Assert.True(await fixture.ResultPlanner.ProcessNextAsync());
+        Assert.False(await fixture.ResultPlanner.ProcessNextAsync());
+        var deliveries = await db.GuardianDeliveries.OrderBy(item => item.SourceKey).ToArrayAsync();
+        Assert.Collection(deliveries,
+            old =>
+            {
+                Assert.Equal($"{submissionId}:{run.Id}:1", old.SourceKey);
+                Assert.Equal("canceled", old.State);
+            },
+            current =>
+            {
+                Assert.Equal($"{submissionId}:{run.Id}:2", current.SourceKey);
+                Assert.Equal("pending", current.State);
+            });
+    }
+
+    [Fact]
+    public async Task ReassignedReadyResultIsCanceledAtClaimAndOnlyNewStudentReceivesPdf()
+    {
+        await using var fixture = await AutomationFixture.CreateAsync();
+        await fixture.ConfigureAsync(dryRun: false);
+        var submissionId = await fixture.SeedFinalizedResultAsync();
+        await fixture.SeedStudentAsync("new-student", "10000002", "小6", "A");
+        Assert.True(await fixture.ResultPlanner.ProcessNextAsync());
+        Assert.True(await fixture.PdfWorker.ProcessNextAsync());
+        Assert.True(await fixture.DeliveryProcessor.ProcessNextAsync()); // Verified PDF becomes ready.
+
+        await using var db = await fixture.CreateDbContextAsync();
+        var submission = await db.Submissions.SingleAsync(item => item.Id == submissionId);
+        var originalStudentId = submission.AssignedStudentId;
+        submission.AssignedStudentId = "new-student";
+        await db.SaveChangesAsync();
+
+        // A teacher changed the assignment after the last planner pass.
+        Assert.True(await fixture.DeliveryProcessor.ProcessNextAsync());
+        Assert.Empty(fixture.Client.Requests);
+        var obsolete = await db.GuardianDeliveries.AsNoTracking().SingleAsync();
+        Assert.Equal(originalStudentId, obsolete.StudentId);
+        Assert.Equal("canceled", obsolete.State);
+        Assert.Equal(0, obsolete.AttemptCount);
+
+        Assert.True(await fixture.ResultPlanner.ProcessNextAsync());
+        Assert.True(await fixture.PdfWorker.ProcessNextAsync());
+        Assert.True(await fixture.DeliveryProcessor.ProcessNextAsync());
+        Assert.True(await fixture.DeliveryProcessor.ProcessNextAsync());
+        Assert.False(await fixture.ResultPlanner.ProcessNextAsync());
+        Assert.False(await fixture.DeliveryProcessor.ProcessNextAsync());
+        var sent = await db.GuardianDeliveries.AsNoTracking().SingleAsync(item => item.State == "sent");
+        Assert.Equal("new-student", sent.StudentId);
+        Assert.NotEqual(obsolete.ExportRecordId, sent.ExportRecordId);
+        Assert.Equal("10000002", Assert.Single(fixture.Client.Requests).StudentNumber);
+    }
+
+    [Theory]
+    [InlineData("sent", null)]
+    [InlineData("sending", null)]
+    [InlineData("failed", "message_send_outcome_unknown")]
+    public async Task RevisedResultPreservesEarlierSendOutcome(string state, string? errorCode)
+    {
+        await using var fixture = await AutomationFixture.CreateAsync();
+        await fixture.ConfigureAsync(dryRun: false);
+        await fixture.SeedFinalizedResultAsync();
+        Assert.True(await fixture.ResultPlanner.ProcessNextAsync());
+        await using var db = await fixture.CreateDbContextAsync();
+        var earlier = await db.GuardianDeliveries.SingleAsync();
+        earlier.State = state;
+        earlier.LastErrorCode = errorCode;
+        earlier.LastAttemptAt = fixture.Now;
+        earlier.AttemptCount = 1;
+        if (state == "sent")
+        {
+            earlier.SentAt = fixture.Now;
+            earlier.SentLocalDate = GuardianDeliverySchedule.TokyoDate(fixture.Now);
+            earlier.SchoolManagerThreadId = "confirmed-thread";
+        }
+
+        var run = await db.GradingRuns.SingleAsync();
+        run.ResultSourceRevision++;
+        await db.SaveChangesAsync();
+
+        Assert.True(await fixture.ResultPlanner.ProcessNextAsync());
+        Assert.False(await fixture.ResultPlanner.ProcessNextAsync());
+        await db.Entry(earlier).ReloadAsync();
+        Assert.Equal(state, earlier.State);
+        Assert.Equal(errorCode, earlier.LastErrorCode);
+        Assert.Equal(2, await db.GuardianDeliveries.CountAsync());
     }
 
     [Fact]
@@ -154,6 +297,34 @@ public sealed partial class SchoolManagerAutomationTests
         await using var db = await fixture.CreateDbContextAsync();
         Assert.Empty(await db.GuardianDeliveries.AsNoTracking().ToArrayAsync());
         Assert.Empty(await db.ExportRecords.AsNoTracking().ToArrayAsync());
+    }
+
+    [Fact]
+    public async Task LiveDeliveryDefersWhenDryRunIsEnabledWhileReadingAttachment()
+    {
+        await using var fixture = await AutomationFixture.CreateAsync();
+        await fixture.SeedStudentAsync("student-a", "10000001", "小6", "A");
+        await fixture.SeedReadyPassFailDeliveryAsync("student-a");
+        await fixture.ConfigureAsync(dryRun: false);
+        var processor = fixture.CreateDeliveryProcessorWithReadCallback(async () =>
+        {
+            await using var db = await fixture.CreateDbContextAsync();
+            var settings = await db.SchoolManagerSettings.SingleAsync();
+            settings.DryRun = true;
+            await db.SaveChangesAsync();
+        });
+
+        Assert.True(await processor.ProcessNextAsync());
+        Assert.Empty(fixture.Client.Requests);
+        await using var verificationDb = await fixture.CreateDbContextAsync();
+        var deferred = await verificationDb.GuardianDeliveries.AsNoTracking().SingleAsync();
+        Assert.Equal("ready", deferred.State);
+        Assert.Equal(0, deferred.AttemptCount);
+        Assert.Null(deferred.LastErrorCode);
+
+        Assert.True(await fixture.DeliveryProcessor.ProcessNextAsync());
+        Assert.True(Assert.Single(fixture.Client.Requests).DryRun);
+        Assert.False(await fixture.DeliveryProcessor.ProcessNextAsync());
     }
 
     [Fact]
@@ -466,6 +637,10 @@ public sealed partial class SchoolManagerAutomationTests
             .GetRequiredService<IDbContextFactory<OokiGraderDbContext>>()
             .CreateDbContextAsync();
 
+        public GuardianDeliveryProcessor CreateDeliveryProcessorWithReadCallback(Func<Task> beforeRead) =>
+            ActivatorUtilities.CreateInstance<GuardianDeliveryProcessor>(_services,
+                new CallbackContentStore(_services.GetRequiredService<IContentStore>(), beforeRead));
+
         public async Task SeedStudentAsync(
             string id,
             string number,
@@ -492,18 +667,16 @@ public sealed partial class SchoolManagerAutomationTests
             await db.SaveChangesAsync();
         }
 
-        public async Task<string> SeedFinalizedResultAsync(bool includeOriginalPdf = true)
+        public async Task<string> SeedFinalizedResultAsync(bool includeOriginalPdf = true) =>
+            (await SeedFinalizedResultsAsync(1, includeOriginalPdf)).Single();
+
+        public async Task<List<string>> SeedFinalizedResultsAsync(int count, bool includeOriginalPdf = true)
         {
             var staffId = UlidId.New(Now);
-            var studentId = UlidId.New(Now.AddMilliseconds(1));
             var templateId = UlidId.New(Now.AddMilliseconds(2));
             var versionId = UlidId.New(Now.AddMilliseconds(3));
             var questionId = UlidId.New(Now.AddMilliseconds(4));
             var sessionId = UlidId.New(Now.AddMilliseconds(5));
-            var submissionId = UlidId.New(Now.AddMilliseconds(6));
-            var runId = UlidId.New(Now.AddMilliseconds(7));
-            var resultId = UlidId.New(Now.AddMilliseconds(8));
-            var revisionId = UlidId.New(Now.AddMilliseconds(9));
             var originalObjectId = UlidId.New(Now.AddMilliseconds(10));
             await using var db = await CreateDbContextAsync();
             db.SiteSettings.Add(new SiteSettingsEntity
@@ -525,22 +698,6 @@ public sealed partial class SchoolManagerAutomationTests
                 PasswordAlgorithmVersion = 1,
                 Status = "active",
                 CredentialChangedAt = Now,
-                CreatedAt = Now,
-                UpdatedAt = Now,
-            });
-            db.Students.Add(new StudentEntity
-            {
-                Id = studentId,
-                StudentNumber = "10000001",
-                StudentNumberNormalized = "10000001",
-                FamilyName = "山田",
-                GivenName = "太郎",
-                FamilyNameNormalized = "山田",
-                GivenNameNormalized = "太郎",
-                DisplayName = "山田 太郎",
-                GradeLabel = "小6",
-                SchoolClass = "A",
-                Status = "active",
                 CreatedAt = Now,
                 UpdatedAt = Now,
             });
@@ -624,22 +781,66 @@ public sealed partial class SchoolManagerAutomationTests
                 });
             }
 
+            var submissionIds = new List<string>(count);
+            for (var index = 0; index < count; index++)
+            {
+                var studentNumber = (10_000_001 + index).ToString(CultureInfo.InvariantCulture);
+                var finalizedAt = Now.AddMilliseconds(index + 1 - count);
+                submissionIds.Add(await AddFinalizedSubmissionAsync(
+                    db, studentNumber, staffId, sessionId, versionId, questionId,
+                    includeOriginalPdf ? originalObjectId : null, finalizedAt));
+            }
+
+            return submissionIds;
+        }
+
+        private async Task<string> AddFinalizedSubmissionAsync(
+            OokiGraderDbContext db,
+            string studentNumber,
+            string staffId,
+            string sessionId,
+            string versionId,
+            string questionId,
+            string? originalObjectId,
+            DateTimeOffset finalizedAt)
+        {
+            var studentId = UlidId.New(Now.AddMilliseconds(1));
+            var submissionId = UlidId.New(Now.AddMilliseconds(6));
+            var runId = UlidId.New(Now.AddMilliseconds(7));
+            var resultId = UlidId.New(Now.AddMilliseconds(8));
+            var revisionId = UlidId.New(Now.AddMilliseconds(9));
+            db.Students.Add(new StudentEntity
+            {
+                Id = studentId,
+                StudentNumber = studentNumber,
+                StudentNumberNormalized = studentNumber,
+                FamilyName = "山田",
+                GivenName = "太郎",
+                FamilyNameNormalized = "山田",
+                GivenNameNormalized = "太郎",
+                DisplayName = "山田 太郎",
+                GradeLabel = "小6",
+                SchoolClass = "A",
+                Status = "active",
+                CreatedAt = Now,
+                UpdatedAt = Now,
+            });
             var submission = new SubmissionEntity
             {
                 Id = submissionId,
                 TestSessionId = sessionId,
                 State = "finalized",
-                ScanPayloadState = includeOriginalPdf
+                ScanPayloadState = originalObjectId != null
                     ? "scan_available"
                     : "scan_deleted",
                 AssignedStudentId = studentId,
                 AssignmentMethod = "teacher",
                 CanonicalForSession = true,
                 UploadedByStaffUserId = staffId,
-                OriginalFileObjectId = includeOriginalPdf ? originalObjectId : null,
+                OriginalFileObjectId = originalObjectId,
                 CurrentGradingRunId = null,
                 FinalizedByStaffUserId = staffId,
-                FinalizedAt = Now,
+                FinalizedAt = finalizedAt,
                 CreatedAt = Now,
                 UpdatedAt = Now,
             };
@@ -659,7 +860,7 @@ public sealed partial class SchoolManagerAutomationTests
                 EarnedPointsMilli = 1_000,
                 PossiblePointsMilli = 1_000,
                 ResultSourceRevision = 1,
-                FinalizedAt = Now,
+                FinalizedAt = finalizedAt,
                 FinalizedByStaffUserId = staffId,
                 CreatedAt = Now,
             });
@@ -807,6 +1008,25 @@ public sealed partial class SchoolManagerAutomationTests
                 Directory.Delete(_root, recursive: true);
             }
         }
+    }
+
+    private sealed class CallbackContentStore(IContentStore inner, Func<Task> beforeRead) : IContentStore
+    {
+        public async Task<Stream> OpenReadAsync(ContentObjectLocator locator, CancellationToken cancellationToken)
+        {
+            await beforeRead();
+            return await inner.OpenReadAsync(locator, cancellationToken);
+        }
+
+        public Task<ContentWriteResult> PutAsync(Stream source, ContentStorageClass storageClass,
+            string verifiedExtension, CancellationToken cancellationToken) =>
+            inner.PutAsync(source, storageClass, verifiedExtension, cancellationToken);
+
+        public Task<bool> ExistsAsync(ContentObjectLocator locator, CancellationToken cancellationToken) =>
+            inner.ExistsAsync(locator, cancellationToken);
+
+        public Task DeleteAsync(ContentObjectLocator locator, CancellationToken cancellationToken) =>
+            inner.DeleteAsync(locator, cancellationToken);
     }
 
     private sealed class FakeSchoolManagerClient : ISchoolManagerClient

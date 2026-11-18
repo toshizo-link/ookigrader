@@ -40,58 +40,45 @@ public sealed class AutomaticResultDeliveryPlanner(
             return false;
         }
 
-        var obsolete = await db.GuardianDeliveries
-            .Where(delivery => delivery.Kind == "result_pdf"
-                && delivery.State != "sent"
-                && delivery.State != "canceled"
-                && delivery.State != "sending"
-                && delivery.LastErrorCode != "message_send_outcome_unknown"
-                && delivery.Submission != null
-                && (delivery.Submission.State != "finalized"
-                    || delivery.Submission.FinalizedAt == null))
+        // A grading request can change the recipient or result independently of the worker.
+        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken)
+            .ConfigureAwait(false);
+        var obsolete = await GuardianResultSource.ObsoleteDeliveries(db)
             .OrderBy(delivery => delivery.CreatedAt)
             .FirstOrDefaultAsync(cancellationToken)
             .ConfigureAwait(false);
         if (obsolete is not null)
         {
-            obsolete.State = "canceled";
-            obsolete.LastErrorCode = "result_reopened";
-            obsolete.SafeErrorDetail =
-                "The result was reopened before guardian delivery.";
-            obsolete.UpdatedAt = now;
+            GuardianResultSource.Cancel(obsolete, now);
             await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return true;
         }
 
-        var candidates = await db.Submissions
-            .AsNoTracking()
-            .Where(submission => submission.State == "finalized"
-                && submission.FinalizedAt != null
-                && submission.FinalizedAt >= activationStartedAt
-                && submission.ScanPayloadState == "scan_available"
-                && submission.OriginalFileObjectId != null
+        var candidates = await GuardianResultSource.Current(db)
+            .Where(source => source.Submission.FinalizedAt >= activationStartedAt
+                && source.Submission.FinalizedByStaffUserId != null
+                && source.Submission.ScanPayloadState == "scan_available"
+                && source.Submission.OriginalFileObjectId != null
                 && db.FileObjects.Any(file =>
-                    file.Id == submission.OriginalFileObjectId
+                    file.Id == source.Submission.OriginalFileObjectId
                     && file.State == "available"
                     && file.VerifiedMime == "application/pdf"
                     && file.Extension == "pdf"
                     && file.StorageClass
-                        == ContentStorageClass.ManagedScanOriginal.ToString())
-                && submission.AssignedStudentId != null
-                && submission.CurrentGradingRunId != null
-                && submission.FinalizedByStaffUserId != null)
-            .Select(submission => new
+                        == ContentStorageClass.ManagedScanOriginal.ToString()))
+            .Select(source => new
             {
-                submission.Id,
-                StudentId = submission.AssignedStudentId!,
-                ActorId = submission.FinalizedByStaffUserId!,
-                GradingRunId = submission.CurrentGradingRunId!,
-                ResultSourceRevision = submission.GradingRuns
-                    .Where(run => run.Id == submission.CurrentGradingRunId)
-                    .Select(run => run.ResultSourceRevision)
-                    .Single(),
-                submission.FinalizedAt,
+                source.Submission.Id,
+                StudentId = source.Submission.AssignedStudentId!,
+                ActorId = source.Submission.FinalizedByStaffUserId!,
+                source.SourceKey,
+                source.Submission.FinalizedAt,
             })
+            .Where(item => !db.GuardianDeliveries.Any(delivery =>
+                delivery.Kind == "result_pdf"
+                && delivery.StudentId == item.StudentId
+                && delivery.SourceKey == item.SourceKey))
             .OrderBy(item => item.FinalizedAt)
             .ThenBy(item => item.Id)
             .Take(50)
@@ -99,18 +86,6 @@ public sealed class AutomaticResultDeliveryPlanner(
             .ConfigureAwait(false);
         foreach (var candidate in candidates)
         {
-            var sourceKey = $"{candidate.Id}:{candidate.GradingRunId}:" +
-                candidate.ResultSourceRevision;
-            if (await db.GuardianDeliveries.AnyAsync(
-                    delivery => delivery.Kind == "result_pdf"
-                        && delivery.StudentId == candidate.StudentId
-                        && delivery.SourceKey == sourceKey,
-                    cancellationToken)
-                .ConfigureAwait(false))
-            {
-                continue;
-            }
-
             var exportId = UlidId.New(now);
             var source = await ResultReportSourceLoader.LoadAsync(
                     db,
@@ -153,7 +128,7 @@ public sealed class AutomaticResultDeliveryPlanner(
                 StudentId = candidate.StudentId,
                 SubmissionId = candidate.Id,
                 ExportRecordId = export.Id,
-                SourceKey = sourceKey,
+                SourceKey = candidate.SourceKey,
                 AttachmentName = BuildAttachmentName(source.Document.TestDate),
                 State = export.State == "verified" ? "ready" : "pending",
                 NotBeforeAt = now,
@@ -179,6 +154,7 @@ public sealed class AutomaticResultDeliveryPlanner(
                 }),
             });
             await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return true;
         }
 

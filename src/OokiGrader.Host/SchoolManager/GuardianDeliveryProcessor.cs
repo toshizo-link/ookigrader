@@ -125,12 +125,16 @@ public sealed class GuardianDeliveryProcessor(
         var clientInvoked = false;
         try
         {
-            await MarkAttemptStartedAsync(
+            if (!await TryStartAttemptAsync(
                     delivery.Id,
-                    settings.DryRun,
+                    settings,
                     now,
                     cancellationToken)
-                .ConfigureAwait(false);
+                .ConfigureAwait(false))
+            {
+                return true;
+            }
+
             using var secret = await secretStore.ReadAsync(
                     new AiSecretReference(settings.PasswordSecretReference),
                     cancellationToken)
@@ -321,24 +325,43 @@ public sealed class GuardianDeliveryProcessor(
         return bytes;
     }
 
-    private Task MarkAttemptStartedAsync(
+    private Task<bool> TryStartAttemptAsync(
         string deliveryId,
-        bool dryRun,
+        SchoolManagerSettingsEntity settings,
         DateTimeOffset now,
         CancellationToken cancellationToken) =>
-        UpdateAsync(deliveryId, delivery =>
+        writeCoordinator.ExecuteAsync(async token =>
         {
-            if (delivery.State != "ready")
+            await using var db = await dbContextFactory.CreateDbContextAsync(token)
+                .ConfigureAwait(false);
+            // Keep the recipient/source check and the claim atomic with concurrent grading writes.
+            await using var transaction = await db.Database.BeginTransactionAsync(token)
+                .ConfigureAwait(false);
+            var delivery = await db.GuardianDeliveries.SingleAsync(item => item.Id == deliveryId, token)
+                .ConfigureAwait(false);
+            if (delivery.State != "ready"
+                || !await db.SchoolManagerSettings.AnyAsync(item => item.Id == settings.Id
+                    && item.Enabled && item.Revision == settings.Revision, token).ConfigureAwait(false))
             {
-                throw new InvalidOperationException(
-                    "The guardian delivery is no longer ready.");
+                return false;
+            }
+
+            if (delivery.Kind == "result_pdf"
+                && await GuardianResultSource.ObsoleteDeliveries(db).AnyAsync(item => item.Id == deliveryId, token)
+                    .ConfigureAwait(false))
+            {
+                GuardianResultSource.Cancel(delivery, now);
+                await db.SaveChangesAsync(token).ConfigureAwait(false);
+                await transaction.CommitAsync(token).ConfigureAwait(false);
+                return false;
             }
 
             delivery.AttemptCount = checked(delivery.AttemptCount + 1);
             delivery.LastAttemptAt = now;
             delivery.LastErrorCode = null;
             delivery.SafeErrorDetail = null;
-            if (!dryRun)
+            delivery.UpdatedAt = now;
+            if (!settings.DryRun)
             {
                 delivery.State = "sending";
                 if (delivery.Kind == "pass_fail_table")
@@ -346,6 +369,10 @@ public sealed class GuardianDeliveryProcessor(
                     delivery.SentLocalDate = GuardianDeliverySchedule.TokyoDate(now);
                 }
             }
+
+            await db.SaveChangesAsync(token).ConfigureAwait(false);
+            await transaction.CommitAsync(token).ConfigureAwait(false);
+            return true;
         }, cancellationToken);
 
     private Task CompleteDryRunAsync(
