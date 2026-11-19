@@ -3,6 +3,7 @@ using OokiGrader.Application.Abstractions;
 using OokiGrader.Infrastructure.Persistence;
 using OokiGrader.Infrastructure.Persistence.Entities;
 using OokiGrader.Reports.Pdf;
+using OokiGrader.SchoolManager.Delivery;
 
 namespace OokiGrader.Host.Reports;
 
@@ -160,6 +161,7 @@ internal static class ResultReportSourceLoader
                 ?? submission.TestSession.TemplateTitleSnapshot
                 ?? version.TestTemplate.Title,
             submission.TestSession.TestDate,
+            GuardianDeliverySchedule.TokyoDate(submission.FinalizedAt.Value),
             version.VersionNumber,
             run.ResultSourceRevision,
             earned,
@@ -183,7 +185,8 @@ internal static class ResultReportSourceLoader
             version.Id,
             version.VersionNumber,
             originalPdf,
-            ResultReportSourceHasher.Compute(document));
+            ResultReportSourceHasher.Compute(document),
+            submission.TestSession.TemplateSubjectSnapshot ?? version.TestTemplate.Subject);
     }
 }
 
@@ -196,7 +199,8 @@ internal sealed record ResultReportSource(
     string TemplateVersionId,
     int TemplateVersionNumber,
     ResultReportScanSource? OriginalPdf,
-    string SourceHash);
+    string SourceHash,
+    string? Subject = null);
 
 internal sealed record ResultReportScanSource(ContentObjectLocator Locator);
 

@@ -91,8 +91,9 @@ internal sealed class BulkTranscriptArchiveWriter : IAsyncDisposable
 
         folder = folder with { ResultCount = folder.ResultCount + 1 };
         _studentFolders[frozen.StudentId] = folder;
+        var datePrefix = source.Document.TestDate is { } testDate ? $"{testDate:yyyy-MM-dd}_" : string.Empty;
         var fileName =
-            $"{folder.ResultCount:D3}_{source.Document.TestDate:yyyy-MM-dd}_" +
+            $"{folder.ResultCount:D3}_{datePrefix}" +
             $"{SanitizeSegment(source.Document.TestTitle, 80)}_結果.pdf";
         var entryName = $"{folder.Path}/{fileName}";
         EnsureSafeUniqueEntryName(entryName);
@@ -158,7 +159,7 @@ internal sealed class BulkTranscriptArchiveWriter : IAsyncDisposable
                 {
                     row.StudentNumber,
                     row.StudentName,
-                    row.TestDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+                    row.TestDate?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) ?? string.Empty,
                     row.TestTitle,
                     FormatPoints(row.EarnedPointsMilli),
                     FormatPoints(row.PossiblePointsMilli),
@@ -467,7 +468,7 @@ internal sealed class BulkTranscriptArchiveWriter : IAsyncDisposable
     private sealed record ManifestRow(
         string? StudentNumber,
         string StudentName,
-        DateOnly TestDate,
+        DateOnly? TestDate,
         string TestTitle,
         long EarnedPointsMilli,
         long PossiblePointsMilli,

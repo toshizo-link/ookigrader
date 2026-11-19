@@ -352,7 +352,7 @@ describe("TemplateEditorPage autosave and publish recovery", () => {
     expect(screen.getByText("問題用紙を確認してください。")).toBeVisible();
   });
 
-  it("publishes a draft and starts reception atomically with only date and class", async () => {
+  it.each(["2026-08-12", ""])("publishes and starts reception with the chosen optional date '%s'", async (testDate) => {
     const verifiedQuestions = state.editorData!.questions.map((question) => ({
       ...question,
       questionText: question.questionText || "説明しなさい。",
@@ -403,7 +403,7 @@ describe("TemplateEditorPage autosave and publish recovery", () => {
     expect(within(dialog).getByText("6年")).toBeVisible();
     expect(within(dialog).queryByLabelText("実施名")).not.toBeInTheDocument();
     fireEvent.change(within(dialog).getByLabelText(/^実施日/), {
-      target: { value: "2026-08-12" },
+      target: { value: testDate },
     });
     fireEvent.change(within(dialog).getByLabelText("対象クラス"), {
       target: { value: "6年A組" },
@@ -417,7 +417,7 @@ describe("TemplateEditorPage autosave and publish recovery", () => {
         "/templates/template-1/versions/version-1:publish",
         {
           revision: 7,
-          testDate: "2026-08-12",
+          testDate: testDate || null,
           classLabel: "6年A組",
         },
         expect.objectContaining({

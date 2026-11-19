@@ -367,7 +367,7 @@ export function ResultDetailPage() {
         open={exportOpen}
         onClose={() => !exportWorking && setExportOpen(false)}
         title="結果PDFを作成"
-        description="出力内容を確認してください。答案画像は含まれません。"
+        description="採点結果を先頭に、保存されている答案PDFをその後にまとめます。"
         size="medium"
         footer={
           exportStatus?.state === "verified" ? (
@@ -445,7 +445,7 @@ export function ResultDetailPage() {
             <ul className="export-field-list">
               <li>
                 <Icon name="check" size={17} />
-                学校名・生徒名・テスト名・実施日
+                学校名・生徒名・テスト名・採点日
               </li>
               <li>
                 <Icon name="check" size={17} />
@@ -457,7 +457,7 @@ export function ResultDetailPage() {
               </li>
               <li className="is-excluded">
                 <Icon name="close" size={17} />
-                答案画像・内部の確信度・職員向けメモ
+                内部の確信度・職員向けメモ
               </li>
             </ul>
             <InlineAlert tone="info">

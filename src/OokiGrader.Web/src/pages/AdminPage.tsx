@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useSearchParams } from "../router";
+import { SchoolManagerMessageTemplates } from "./SchoolManagerMessageTemplates";
 import { Icon } from "../components/Icon";
 import {
   Badge,
@@ -34,7 +35,7 @@ import type {
   StaffRole,
 } from "../types";
 
-type AdminTab = "health" | "ai" | "staff" | "storage" | "jobs";
+type AdminTab = "health" | "ai" | "staff" | "storage" | "jobs" | "school-manager";
 
 interface AiConnection {
   id: string;
@@ -254,7 +255,7 @@ const staffRoleLabels: Record<StaffRole, string> = {
 export function AdminPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const requested = searchParams.get("tab") as AdminTab | null;
-  const tab: AdminTab = ["health", "ai", "staff", "storage", "jobs"].includes(
+  const tab: AdminTab = ["health", "ai", "staff", "storage", "jobs", "school-manager"].includes(
     requested || "",
   )
     ? (requested as AdminTab)
@@ -353,6 +354,7 @@ export function AdminPage() {
         tabs={[
           { value: "health", label: "システム状態" },
           { value: "ai", label: "AI設定" },
+          { value: "school-manager", label: "スクマネ配信" },
           {
             value: "staff",
             label: "職員アカウント",
@@ -380,6 +382,7 @@ export function AdminPage() {
         />
       ) : null}
       {tab === "staff" ? <StaffView query={staff} roles={roles} /> : null}
+      {tab === "school-manager" ? <SchoolManagerMessageTemplates /> : null}
       {tab === "storage" ? <StorageView query={storage} /> : null}
       {tab === "jobs" ? <JobsView query={jobs} /> : null}
     </div>

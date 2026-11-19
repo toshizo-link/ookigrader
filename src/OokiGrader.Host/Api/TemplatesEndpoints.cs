@@ -2748,8 +2748,9 @@ public static class TemplatesEndpoints
                 exception.Errors.Select(ToProblemError).ToArray());
         }
 
-        var testDate = request?.TestDate
-            ?? await ResolveSiteLocalDateAsync(db, now, cancellationToken);
+        var testDate = request is { HasTestDate: true }
+            ? request.TestDate
+            : await ResolveSiteLocalDateAsync(db, now, cancellationToken);
         var published = domainVersion.Publish(ApiHelpers.StaffId(principal), now);
         var sessionId = UlidId.New(now.AddTicks(1));
         await using var transaction = await db.Database.BeginTransactionAsync(
@@ -5942,7 +5943,16 @@ public static class TemplatesEndpoints
     {
         public long? Revision { get; init; }
 
-        public DateOnly? TestDate { get; init; }
+        // Older clients omit the property to request today's date. An explicit null
+        // starts reception without assigning an exam date.
+        [System.Text.Json.Serialization.JsonIgnore]
+        public bool HasTestDate { get; private set; }
+
+        public DateOnly? TestDate
+        {
+            get;
+            init { field = value; HasTestDate = true; }
+        }
 
         public string? ClassLabel { get; init; }
     }
@@ -6102,7 +6112,7 @@ public static class TemplatesEndpoints
         int? ExpectedSubmissionPageCount,
         string? Course,
         string? TemplateCourse,
-        DateOnly TestDate,
+        DateOnly? TestDate,
         string? ClassLabel,
         string Priority,
         string State,

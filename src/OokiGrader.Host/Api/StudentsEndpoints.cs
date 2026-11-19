@@ -886,21 +886,26 @@ public static class StudentsEndpoints
             return Results.NotFound();
         }
 
-        var rangeEnd = to ?? DateOnly.FromDateTime(DateTime.UtcNow);
-        var rangeStart = from ?? rangeEnd.AddMonths(-6);
+        var tokyo = TimeZoneInfo.FindSystemTimeZoneById("Asia/Tokyo");
+        var rangeEnd = to ?? DateOnly.FromDateTime(TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, tokyo));
+        var rangeStart = from ?? (rangeEnd.Year == 1 && rangeEnd.Month <= 6
+            ? DateOnly.MinValue : rangeEnd.AddMonths(-6));
         if (rangeStart > rangeEnd)
         {
             return Results.UnprocessableEntity();
         }
 
+        var finalizedFrom = new DateTimeOffset(TimeZoneInfo.ConvertTimeToUtc(rangeStart.ToDateTime(TimeOnly.MinValue), tokyo));
+        var finalizedTo = new DateTimeOffset(TimeZoneInfo.ConvertTimeToUtc(rangeEnd.ToDateTime(TimeOnly.MaxValue), tokyo));
         var seriesQuery = db.Submissions
             .AsNoTracking()
             .Where(submission => submission.AssignedStudentId == studentId
                 && submission.FinalizedAt != null
                 && submission.VoidedAt == null
                 && submission.CanonicalForSession
-                && submission.TestSession.TestDate >= rangeStart
-                && submission.TestSession.TestDate <= rangeEnd
+                && ((submission.TestSession.TestDate >= rangeStart && submission.TestSession.TestDate <= rangeEnd)
+                    || (submission.TestSession.TestDate == null
+                        && submission.FinalizedAt >= finalizedFrom && submission.FinalizedAt <= finalizedTo))
                 && submission.CurrentGradingRunId != null);
         if (!string.IsNullOrWhiteSpace(subject))
         {
@@ -911,12 +916,11 @@ public static class StudentsEndpoints
         }
 
         var series = await seriesQuery
-            .OrderBy(submission => submission.TestSession.TestDate)
-            .ThenBy(submission => submission.Id)
             .Select(submission => new
             {
                 submissionId = submission.Id,
                 testDate = submission.TestSession.TestDate,
+                finalizedAt = submission.FinalizedAt!.Value,
                 testTitle = submission.TestSession.TitleOverride
                     ?? submission.TestSession.TemplateTitleSnapshot
                     ?? submission.TestSession.TemplateVersion.TestTemplate.Title,
@@ -971,6 +975,7 @@ public static class StudentsEndpoints
         {
             point.submissionId,
             point.testDate,
+            progressDate = point.testDate ?? DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(point.finalizedAt, tokyo).Date),
             point.testTitle,
             point.earnedPointsMilli,
             point.possiblePointsMilli,
@@ -984,7 +989,7 @@ public static class StudentsEndpoints
             point.incorrect,
             point.blank,
             point.resultRevision,
-        });
+        }).OrderBy(point => point.progressDate).ThenBy(point => point.submissionId, StringComparer.Ordinal);
         return Results.Ok(new
         {
             student = new { student.Id, student.DisplayName },

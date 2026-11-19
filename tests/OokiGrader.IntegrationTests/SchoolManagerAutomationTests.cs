@@ -187,6 +187,39 @@ public sealed partial class SchoolManagerAutomationTests
         Assert.Equal(2, await db.GuardianDeliveries.CountAsync());
     }
 
+    [Theory]
+    [InlineData("pending")]
+    [InlineData("ready")]
+    public async Task LayoutUpgradeReplacesUnsentAttachmentBeforeDelivery(string state)
+    {
+        await using var fixture = await AutomationFixture.CreateAsync();
+        await fixture.ConfigureAsync(dryRun: false);
+        await fixture.SeedFinalizedResultAsync();
+        Assert.True(await fixture.ResultPlanner.ProcessNextAsync());
+        Assert.True(await fixture.PdfWorker.ProcessNextAsync());
+        await using var db = await fixture.CreateDbContextAsync();
+        var original = await db.GuardianDeliveries.Include(item => item.ExportRecord).SingleAsync();
+        var previousExport = original.ExportRecord!;
+        previousExport.RendererVersion = "pdfsharp-6.2.4-layout-3";
+        original.State = state;
+        original.LastDryRunAt = fixture.Now;
+        await db.SaveChangesAsync();
+
+        Assert.False(await fixture.DeliveryProcessor.ProcessNextAsync());
+        Assert.True(await fixture.ResultPlanner.ProcessNextAsync());
+        var refreshed = await db.GuardianDeliveries.AsNoTracking().Include(item => item.ExportRecord).SingleAsync();
+        Assert.Equal(original.Id, refreshed.Id);
+        Assert.NotEqual(previousExport.Id, refreshed.ExportRecordId);
+        Assert.Null(refreshed.LastDryRunAt);
+        Assert.Equal("pending", refreshed.State);
+        Assert.Equal(ResultPdfRenderer.CurrentRendererVersion, refreshed.ExportRecord!.RendererVersion);
+        Assert.True(await fixture.PdfWorker.ProcessNextAsync());
+        Assert.True(await fixture.DeliveryProcessor.ProcessNextAsync());
+        Assert.True(await fixture.DeliveryProcessor.ProcessNextAsync());
+        Assert.False(await fixture.Worker.ProcessCycleAsync());
+        Assert.Single(fixture.Client.Requests);
+    }
+
     [Fact]
     public async Task FinalizedResultWithoutOriginalPdfIsNotQueued()
     {
@@ -1041,7 +1074,8 @@ public sealed partial class SchoolManagerAutomationTests
             CancellationToken cancellationToken = default)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            Requests.Add(request);
+            // Capture the bytes at send time; the caller clears its buffer on return.
+            Requests.Add(request with { AttachmentBytes = request.AttachmentBytes.ToArray() });
             if (FailAtLogin)
             {
                 throw new SchoolManagerClientException("school_manager_login_failed", "private browser detail");

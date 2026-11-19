@@ -11,7 +11,7 @@ namespace OokiGrader.Reports.Pdf;
 
 public sealed class ResultPdfRenderer : IResultPdfRenderer
 {
-    public const string CurrentRendererVersion = "pdfsharp-6.2.4-layout-3";
+    public const string CurrentRendererVersion = "pdfsharp-6.2.4-layout-4";
     private const double PageWidth = 595.28;
     private const double PageHeight = 841.89;
     private const double MarginLeft = 42;
@@ -183,7 +183,7 @@ public sealed class ResultPdfRenderer : IResultPdfRenderer
             new XSolidBrush(Ink),
             new XPoint(MarginLeft, canvas.Y + 12));
         canvas.Graphics.DrawString(
-            $"実施日　{report.TestDate:yyyy年M月d日}　　採点基準　第{report.TemplateVersionNumber}版",
+            $"採点日　{report.GradedDate:yyyy年M月d日}　　採点基準　第{report.TemplateVersionNumber}版",
             fonts.Body,
             new XSolidBrush(MutedInk),
             new XPoint(MarginLeft, canvas.Y + 32));

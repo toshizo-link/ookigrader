@@ -323,7 +323,7 @@ public sealed class TestSessionEntity : IRevisionedEntity, IUpdatedEntity
     public string? TemplateGradeLabelSnapshot { get; set; }
     public string? TemplateCategorySnapshot { get; set; }
     public string? TemplateCourseSnapshot { get; set; }
-    public DateOnly TestDate { get; set; }
+    public DateOnly? TestDate { get; set; }
     public string? Course { get; set; }
     public string? ClassLabel { get; set; }
     public string Priority { get; set; } = "economy";

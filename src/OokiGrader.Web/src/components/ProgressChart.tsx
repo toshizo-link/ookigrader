@@ -60,11 +60,12 @@ export function ProgressChart({ series }: { series: ProgressPoint[] }) {
         {series.map((point, index) => {
           const x = xFor(index);
           const y = yFor(point.percentageBasisPoints);
+          const date = point.progressDate ?? point.testDate;
           return (
             <a
               href={`/results/${encodeURIComponent(point.submissionId)}`}
               key={`${point.submissionId}-${point.resultRevision}`}
-              aria-label={`${formatDate(point.testDate)} ${point.testTitle} ${formatPercentageBasisPoints(point.percentageBasisPoints)}`}
+              aria-label={`${point.testDate ? "実施日" : "採点日"} ${formatDate(date)} ${point.testTitle} ${formatPercentageBasisPoints(point.percentageBasisPoints)}`}
             >
               <circle className="progress-chart__halo" cx={x} cy={y} r="10" />
               <circle className="progress-chart__point" cx={x} cy={y} r="5" />
@@ -77,11 +78,11 @@ export function ProgressChart({ series }: { series: ProgressPoint[] }) {
                   y={height - 20}
                   textAnchor="middle"
                 >
-                  {new Intl.DateTimeFormat("ja-JP", {
+                  {date ? new Intl.DateTimeFormat("ja-JP", {
                     timeZone: "Asia/Tokyo",
                     month: "numeric",
                     day: "numeric",
-                  }).format(new Date(`${point.testDate}T00:00:00+09:00`))}
+                  }).format(new Date(`${date}T00:00:00+09:00`)) : "—"}
                 </text>
               )}
               <title>

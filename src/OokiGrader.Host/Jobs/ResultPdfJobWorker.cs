@@ -175,7 +175,7 @@ public sealed partial class ResultPdfJobWorker(
                 source.OriginalPdf.Locator,
                 cancellationToken)
             .ConfigureAwait(false);
-        return ResultPdfComposer.PrependOriginal(
+        return ResultPdfComposer.AppendOriginal(
             original,
             transcript,
             source.Document);

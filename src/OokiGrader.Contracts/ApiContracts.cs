@@ -206,7 +206,7 @@ public sealed record TestSessionSummary(
     string TemplateId,
     string TemplateVersionId,
     string TemplateTitle,
-    DateOnly TestDate,
+    DateOnly? TestDate,
     string State,
     string Priority,
     int SubmissionCount,
@@ -218,7 +218,7 @@ public sealed record TestSessionSummary(
 public sealed record CreateTestSessionRequest(
     string Title,
     string TemplateVersionId,
-    DateOnly TestDate,
+    DateOnly? TestDate,
     string? GradeLabel,
     string? Course,
     string? Priority = null,
@@ -296,7 +296,7 @@ public sealed record FinalizeSubmissionRequest(long SourceRevision);
 public sealed record ResultSummary(
     string SubmissionId,
     string TestTitle,
-    DateOnly TestDate,
+    DateOnly? TestDate,
     long EarnedPointsMilli,
     long PossiblePointsMilli,
     int PercentageBasisPoints,
@@ -314,7 +314,7 @@ public sealed record DateRangeResponse(DateOnly From, DateOnly To, string TimeZo
 
 public sealed record ProgressPointResponse(
     string SubmissionId,
-    DateOnly TestDate,
+    DateOnly? TestDate,
     string TestTitle,
     long EarnedPointsMilli,
     long PossiblePointsMilli,

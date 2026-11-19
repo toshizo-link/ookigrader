@@ -5504,6 +5504,62 @@ export type paths = {
         readonly patch?: never;
         readonly trace?: never;
     };
+    readonly "/api/v1/admin/school-manager/message-templates": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get: {
+            readonly parameters: {
+                readonly query?: never;
+                readonly header?: never;
+                readonly path?: never;
+                readonly cookie?: never;
+            };
+            readonly requestBody?: never;
+            readonly responses: {
+                /** @description OK */
+                readonly 200: {
+                    headers: {
+                        readonly [name: string]: unknown;
+                    };
+                    content: {
+                        readonly "application/json": components["schemas"]["MessageTemplatesBody"];
+                    };
+                };
+            };
+        };
+        readonly put: {
+            readonly parameters: {
+                readonly query?: never;
+                readonly header?: never;
+                readonly path?: never;
+                readonly cookie?: never;
+            };
+            readonly requestBody: {
+                readonly content: {
+                    readonly "application/json": components["schemas"]["MessageTemplatesBody"];
+                };
+            };
+            readonly responses: {
+                /** @description OK */
+                readonly 200: {
+                    headers: {
+                        readonly [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
     readonly "/api/v1/admin/school-manager/deliveries": {
         readonly parameters: {
             readonly query?: never;
@@ -5649,7 +5705,7 @@ export type components = {
         readonly CreateSessionBody: {
             readonly templateVersionId: string;
             /** Format: date */
-            readonly testDate: string;
+            readonly testDate: null | string;
             readonly sessionName: null | string;
             readonly classLabel: null | string;
             readonly course: null | string;
@@ -5742,6 +5798,13 @@ export type components = {
             readonly sourceRevision: number | string;
             readonly status: string;
         };
+        readonly MessageTemplatesBody: {
+            readonly pass: string;
+            readonly fail: string;
+            readonly unconfigured: string;
+            /** Format: int64 */
+            readonly revision: number | string;
+        };
         readonly OrderedScanMutationRequest: {
             /** Format: int64 */
             readonly expectedRowVersion: null | number | string;
@@ -5774,7 +5837,7 @@ export type components = {
             readonly id: string;
             readonly title: string;
             /** Format: date */
-            readonly testDate: string;
+            readonly testDate: null | string;
             readonly classLabel: null | string;
             readonly gradeLabel: null | string;
             readonly subject: null | string;

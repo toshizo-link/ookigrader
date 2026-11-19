@@ -191,7 +191,7 @@ export function SessionDetailPage() {
   return (
     <div className="page session-detail-page">
       <PageHeader
-        eyebrow={`${formatDate(data.testDate)} 実施`}
+        eyebrow={data.testDate ? `${formatDate(data.testDate)} 実施` : "実施日未設定"}
         title={
           data.templateTitle ||
           data.title ||

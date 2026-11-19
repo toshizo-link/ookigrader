@@ -11,12 +11,13 @@ namespace OokiGrader.IntegrationTests;
 
 public sealed partial class SchoolManagerAutomationTests
 {
-    public enum InboxScenario { Acknowledged, AttachmentRejected, AcknowledgementLost }
+    public enum InboxScenario { Acknowledged, AttachmentRejected, AcknowledgementLost, StatusNotApplied }
 
     [WindowsEdgeTheory]
     [InlineData(InboxScenario.Acknowledged)]
     [InlineData(InboxScenario.AttachmentRejected)]
     [InlineData(InboxScenario.AcknowledgementLost)]
+    [InlineData(InboxScenario.StatusNotApplied)]
     public async Task FinalizedResultReachesOnlyItsGuardianAndIsNeverSentTwice(InboxScenario scenario)
     {
         var inbox = new OfflineSchoolManager(scenario);
@@ -51,6 +52,16 @@ public sealed partial class SchoolManagerAutomationTests
         Assert.False(await fixture.Worker.ProcessCycleAsync());
         var delivery = await db.GuardianDeliveries.AsNoTracking().SingleAsync();
         Assert.Equal(scenario == InboxScenario.Acknowledged ? 2 : 1, delivery.AttemptCount);
+        Assert.Empty(inbox.UnexpectedRequests);
+        if (scenario == InboxScenario.StatusNotApplied)
+        {
+            Assert.Equal("failed", delivery.State);
+            Assert.Equal("school_manager_thread_status_failed", delivery.LastErrorCode);
+            Assert.Null(delivery.SentAt);
+            Assert.Empty(inbox.Uploads);
+            Assert.Empty(inbox.Messages);
+            return;
+        }
         var upload = Assert.Single(inbox.Uploads);
         Assert.Equal("採点結果_20260915.pdf", upload.Name);
         Assert.Equal("application/pdf", upload.MediaType);
@@ -59,7 +70,6 @@ public sealed partial class SchoolManagerAutomationTests
         using var receivedStream = new MemoryStream(upload.Bytes);
         using var receivedPdf = PdfReader.Open(receivedStream, PdfDocumentOpenMode.Import);
         Assert.Equal(3, receivedPdf.PageCount);
-        Assert.Empty(inbox.UnexpectedRequests);
 
         if (scenario == InboxScenario.AttachmentRejected)
         {
@@ -72,12 +82,13 @@ public sealed partial class SchoolManagerAutomationTests
         }
 
         var thread = Assert.Single(inbox.Messages);
+        Assert.Equal("resolved", thread.IssueState);
         Assert.Equal(new TargetUser("matched-student", "class-a"), thread.TargetUser);
         Assert.Collection(thread.Members,
             sender => Assert.Equal(new Member("orgDepartment", null, "class-a"), sender),
             guardian => Assert.Equal(new Member("parent", "matched-guardian", null), guardian));
         Assert.Equal("採点結果のお知らせ", thread.Title);
-        Assert.Equal("採点結果をお送りします。添付のPDFをご確認ください。", thread.Message.Body);
+        Assert.Equal("教科　未設定\nテスト名　社会テスト\n判定　合否基準未設定\n\n採点結果をお送りします。添付のPDFをご確認ください。", thread.Message.Body);
         Assert.Equal(new Attachment(upload.Name, 21001), Assert.Single(thread.Message.AttachedFiles));
         if (scenario == InboxScenario.AcknowledgementLost)
         {
@@ -127,7 +138,10 @@ public sealed partial class SchoolManagerAutomationTests
                     using var resource = typeof(OfflineSchoolManager).Assembly.GetManifestResourceStream(
                         "OokiGrader.IntegrationTests.Fixtures.SchoolManagerDelivery.html")!;
                     using var reader = new StreamReader(resource);
-                    await route.FulfillAsync(new() { ContentType = "text/html; charset=utf-8", Body = await reader.ReadToEndAsync() });
+                    var html = await reader.ReadToEndAsync();
+                    if (scenario == InboxScenario.StatusNotApplied)
+                        html = html.Replace("<html lang=\"ja\">", "<html lang=\"ja\" data-status-unavailable=\"true\">", StringComparison.Ordinal);
+                    await route.FulfillAsync(new() { ContentType = "text/html; charset=utf-8", Body = html });
                     return;
                 }
 
@@ -162,7 +176,7 @@ public sealed partial class SchoolManagerAutomationTests
     }
 
     private sealed record Upload(string Name, string MediaType, string ContentType, byte[] Bytes);
-    private sealed record InboxThread(TargetUser TargetUser, Member[] Members, string Title, Message Message);
+    private sealed record InboxThread(string IssueState, TargetUser TargetUser, Member[] Members, string Title, Message Message);
     private sealed record TargetUser(string UserId, string DepartmentId);
     private sealed record Member(string MemberType, string? UserId, string? DepartmentId);
     private sealed record Message(string Body, Attachment[] AttachedFiles);

@@ -6,6 +6,7 @@ using OokiGrader.Application.Abstractions;
 using OokiGrader.Application.Identifiers;
 using OokiGrader.Infrastructure.Persistence;
 using OokiGrader.Infrastructure.Persistence.Entities;
+using OokiGrader.Reports.Pdf;
 using OokiGrader.SchoolManager.Delivery;
 
 namespace OokiGrader.Host.SchoolManager;
@@ -125,12 +126,13 @@ public sealed class GuardianDeliveryProcessor(
         var clientInvoked = false;
         try
         {
-            if (!await TryStartAttemptAsync(
+            var messageBody = await TryStartAttemptAsync(
                     delivery.Id,
                     settings,
                     now,
                     cancellationToken)
-                .ConfigureAwait(false))
+                .ConfigureAwait(false);
+            if (messageBody is null)
             {
                 return true;
             }
@@ -148,7 +150,7 @@ public sealed class GuardianDeliveryProcessor(
                         delivery.StudentNumber,
                         delivery.StudentDisplayName,
                         BuildTitle(delivery.Kind),
-                        BuildBody(delivery.Kind),
+                        messageBody,
                         delivery.AttachmentName,
                         attachment,
                         settings.DryRun),
@@ -211,7 +213,10 @@ public sealed class GuardianDeliveryProcessor(
                 .ConfigureAwait(false);
             var delivery = await db.GuardianDeliveries
                 .Include(item => item.ExportRecord)
-                .Where(item => item.Kind == "result_pdf" && item.State == "pending")
+                .Where(item => item.Kind == "result_pdf" && item.State == "pending"
+                    && item.ExportRecord!.RendererVersion == ResultPdfRenderer.CurrentRendererVersion
+                    && (item.ExportRecord.State == "verified" || item.ExportRecord.State == "failed"
+                        || item.ExportRecord.State == "superseded"))
                 .OrderBy(item => item.CreatedAt)
                 .ThenBy(item => item.Id)
                 .FirstOrDefaultAsync(token)
@@ -252,6 +257,7 @@ public sealed class GuardianDeliveryProcessor(
         return await db.GuardianDeliveries
             .AsNoTracking()
             .Where(item => item.State == "ready"
+                && (item.Kind != "result_pdf" || item.ExportRecord!.RendererVersion == ResultPdfRenderer.CurrentRendererVersion)
                 && item.NotBeforeAt <= now
                 && (!dryRun || item.LastDryRunAt == null))
             .OrderBy(item => item.NotBeforeAt)
@@ -325,12 +331,12 @@ public sealed class GuardianDeliveryProcessor(
         return bytes;
     }
 
-    private Task<bool> TryStartAttemptAsync(
+    private Task<string?> TryStartAttemptAsync(
         string deliveryId,
         SchoolManagerSettingsEntity settings,
         DateTimeOffset now,
         CancellationToken cancellationToken) =>
-        writeCoordinator.ExecuteAsync(async token =>
+        writeCoordinator.ExecuteAsync<string?>(async token =>
         {
             await using var db = await dbContextFactory.CreateDbContextAsync(token)
                 .ConfigureAwait(false);
@@ -343,7 +349,7 @@ public sealed class GuardianDeliveryProcessor(
                 || !await db.SchoolManagerSettings.AnyAsync(item => item.Id == settings.Id
                     && item.Enabled && item.Revision == settings.Revision, token).ConfigureAwait(false))
             {
-                return false;
+                return null;
             }
 
             if (delivery.Kind == "result_pdf"
@@ -353,9 +359,14 @@ public sealed class GuardianDeliveryProcessor(
                 GuardianResultSource.Cancel(delivery, now);
                 await db.SaveChangesAsync(token).ConfigureAwait(false);
                 await transaction.CommitAsync(token).ConfigureAwait(false);
-                return false;
+                return null;
             }
 
+            var body = delivery.Kind == "result_pdf"
+                ? GuardianResultMessage.Format(delivery,
+                    await db.GuardianMessageTemplates.AsNoTracking().SingleOrDefaultAsync(token).ConfigureAwait(false)
+                        ?? new GuardianMessageTemplatesEntity())
+                : "合否表を更新しました。氏名と生徒IDを除いた、同じクラスの範囲をお送りします。";
             delivery.AttemptCount = checked(delivery.AttemptCount + 1);
             delivery.LastAttemptAt = now;
             delivery.LastErrorCode = null;
@@ -372,7 +383,7 @@ public sealed class GuardianDeliveryProcessor(
 
             await db.SaveChangesAsync(token).ConfigureAwait(false);
             await transaction.CommitAsync(token).ConfigureAwait(false);
-            return true;
+            return body;
         }, cancellationToken);
 
     private Task CompleteDryRunAsync(
@@ -515,14 +526,11 @@ public sealed class GuardianDeliveryProcessor(
         "school_manager_recipient_page_failed" => "メッセージ一覧または宛先選択画面の操作中に停止しました。",
         "school_manager_guardian_page_failed" => "保護者宛先の確認中に停止しました。",
         "school_manager_compose_page_failed" => "メッセージ作成画面への移動中に停止しました。",
+        "school_manager_thread_status_failed" => "状況を「解決済」に設定できなかったため、送信を中止しました。",
         "school_manager_attachment_failed" => "PDFの添付中に停止しました。",
         "school_manager_message_prepare_failed" => "本文または送信ボタンの準備中に停止しました。",
         _ => "School Manager delivery stopped before a confirmed send.",
     };
-
-    private static string BuildBody(string kind) => kind == "result_pdf"
-        ? "採点結果をお送りします。添付のPDFをご確認ください。"
-        : "合否表を更新しました。氏名と生徒IDを除いた、同じクラスの範囲をお送りします。";
 
     private sealed record DeliveryMaterial(
         string Id,

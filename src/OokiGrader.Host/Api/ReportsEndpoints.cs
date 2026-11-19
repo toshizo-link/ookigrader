@@ -673,12 +673,12 @@ public static class ReportsEndpoints
     }
 
     private static string BuildDownloadFilename(
-        DateOnly testDate,
+        DateOnly? testDate,
         string testTitle,
         string studentName)
     {
-        var unsafeName =
-            $"{testDate:yyyy-MM-dd}_{testTitle}_{studentName}_結果.pdf";
+        var datePrefix = testDate is { } date ? $"{date:yyyy-MM-dd}_" : string.Empty;
+        var unsafeName = $"{datePrefix}{testTitle}_{studentName}_結果.pdf";
         var invalid = Path.GetInvalidFileNameChars()
             .Concat(['/', '\\', ':', '\r', '\n'])
             .ToHashSet();

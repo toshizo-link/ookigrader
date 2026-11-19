@@ -49,7 +49,7 @@ interface RoutingResponse {
   openSessions: Array<{
     id: string;
     title: string;
-    testDate: string;
+    testDate?: string | null;
     classLabel?: string | null;
     gradeLabel?: string | null;
     subject?: string | null;
@@ -446,7 +446,7 @@ export function CrossSessionScanIntake({
                     </select>
                     {destination ? (
                       <small>
-                        {destination.testDate}・1答案 {item.expectedPageCount}ページ
+                        {destination.testDate ? destination.testDate + "・" : ""}1答案 {item.expectedPageCount}ページ
                       </small>
                     ) : null}
                   </label>

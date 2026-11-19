@@ -19,6 +19,25 @@ namespace OokiGrader.IntegrationTests;
 public sealed class ResultPdfJobWorkerTests
 {
     [Fact]
+    public async Task ReportUsesTokyoFinalizationDateWhenTestDateIsOmitted()
+    {
+        await using var fixture = await ResultPdfWorkerFixture.CreateAsync();
+        var seeded = await fixture.SeedAsync();
+        await using var db = await fixture.CreateDbContextAsync();
+        var submission = await db.Submissions.Include(item => item.TestSession)
+            .SingleAsync(item => item.Id == seeded.SubmissionId);
+        submission.FinalizedAt = new DateTimeOffset(2026, 11, 19, 15, 1, 0, TimeSpan.Zero);
+        submission.TestSession.TestDate = null;
+        await db.SaveChangesAsync();
+
+        var generatedAt = submission.FinalizedAt.Value.AddDays(4);
+        var source = await ResultReportSourceLoader.LoadAsync(db, seeded.SubmissionId,
+            "finalized-at-midnight", generatedAt, false, CancellationToken.None);
+        Assert.Null(source.Document.TestDate);
+        Assert.Equal(new DateOnly(2026, 11, 20), source.Document.GradedDate);
+    }
+
+    [Fact]
     public async Task ReportUsesSavedSessionCriterionAndInvalidatesSourceWhenItChanges()
     {
         await using var fixture = await ResultPdfWorkerFixture.CreateAsync();

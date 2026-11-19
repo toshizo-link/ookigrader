@@ -98,6 +98,15 @@ public sealed class PlaywrightSchoolManagerClient : ISchoolManagerClient
 
             var compose = page.Locator(".message-input-area:visible");
             await compose.WaitForAsync(new() { Timeout = 15_000 }).ConfigureAwait(false);
+            browserErrorCode = "school_manager_thread_status_failed";
+            // Set the status before creating the thread. School Manager's send-and-resolve
+            // button otherwise starts a separate status update after the message is sent.
+            var status = page.Locator("app-message-thread-details .issue-state-select-container mat-select:visible");
+            await status.ClickAsync(new() { Timeout = 15_000 }).ConfigureAwait(false);
+            await page.GetByRole(AriaRole.Option, new() { Name = "解決済", Exact = true })
+                .ClickAsync(new() { Timeout = 15_000 }).ConfigureAwait(false);
+            await status.Filter(new() { HasText = "解決済" }).WaitForAsync(new() { Timeout = 15_000 })
+                .ConfigureAwait(false);
             browserErrorCode = "school_manager_attachment_failed";
             await AttachPdfAsync(page, compose, request, cancellationToken)
                 .ConfigureAwait(false);
@@ -105,7 +114,6 @@ public sealed class PlaywrightSchoolManagerClient : ISchoolManagerClient
             browserErrorCode = "school_manager_message_prepare_failed";
             await compose.Locator("ion-textarea[placeholder='メッセージを入力'] textarea:visible")
                 .FillAsync(request.Body, new() { Timeout = 15_000 }).ConfigureAwait(false);
-            // The normal send control is icon-only; the labelled alternative also resolves the thread.
             var send = await GetSendControlAsync(compose).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             finalRequestStarted = true;

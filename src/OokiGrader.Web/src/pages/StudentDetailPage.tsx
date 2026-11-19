@@ -716,7 +716,7 @@ function ProgressTable({ series }: { series: ProgressPoint[] }) {
       <table>
         <thead>
           <tr>
-            <th>実施日</th>
+            <th>日付</th>
             <th>テスト</th>
             <th>得点</th>
             <th>得点率</th>
@@ -729,7 +729,7 @@ function ProgressTable({ series }: { series: ProgressPoint[] }) {
         <tbody>
           {series.map((point) => (
             <tr key={`${point.submissionId}-${point.resultRevision}`}>
-              <td>{formatDate(point.testDate)}</td>
+              <td>{formatDate(point.progressDate ?? point.testDate)}{!point.testDate && "（採点日）"}</td>
               <td>
                 <Link to={`/results/${encodeURIComponent(point.submissionId)}`}>
                   {point.testTitle}

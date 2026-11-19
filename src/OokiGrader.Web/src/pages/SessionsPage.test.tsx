@@ -166,7 +166,7 @@ describe("SessionsPage list controls", () => {
     });
   });
 
-  it("starts reception with canonical template metadata and no duplicate name or course fields", async () => {
+  it.each(["2026-08-12", ""])("starts reception with the chosen optional date '%s' and canonical template metadata", async (testDate) => {
     window.history.replaceState(null, "", "/sessions");
     renderPage();
 
@@ -184,7 +184,7 @@ describe("SessionsPage list controls", () => {
     expect(within(dialog).queryByLabelText("コース")).not.toBeInTheDocument();
 
     fireEvent.change(within(dialog).getByLabelText(/^実施日/), {
-      target: { value: "2026-08-12" },
+      target: { value: testDate },
     });
     await waitFor(() =>
       expect(within(dialog).getByRole("button", { name: "閉じる" })).toHaveFocus(),
@@ -204,7 +204,7 @@ describe("SessionsPage list controls", () => {
         "/test-sessions",
         {
           templateVersionId: "version-1",
-          testDate: "2026-08-12",
+          testDate: testDate || null,
           classLabel: "4年A組",
           openImmediately: true,
         },

@@ -20,6 +20,8 @@ public static class SchoolManagerAdminEndpoints
             .RequireAuthorization("administrator");
         group.MapGet("/", GetSettingsAsync);
         group.MapPut("/", SaveSettingsAsync);
+        group.MapGet("/message-templates", GetMessageTemplatesAsync);
+        group.MapPut("/message-templates", SaveMessageTemplatesAsync);
         group.MapGet("/deliveries", ListDeliveriesAsync);
         return endpoints;
     }
@@ -197,6 +199,63 @@ public static class SchoolManagerAdminEndpoints
             settings.ActivationStartedAt,
             settingsRevision = settings.Revision,
         });
+    }
+
+    private static async Task<MessageTemplatesBody> GetMessageTemplatesAsync(
+        OokiGraderDbContext db, CancellationToken cancellationToken) =>
+        MessageTemplatesBody.From(await db.GuardianMessageTemplates.AsNoTracking().SingleOrDefaultAsync(cancellationToken)
+            ?? new GuardianMessageTemplatesEntity());
+
+    private static async Task<IResult> SaveMessageTemplatesAsync(
+        HttpContext context, ClaimsPrincipal principal, [FromBody] MessageTemplatesBody request,
+        OokiGraderDbContext db, TimeProvider timeProvider, CancellationToken cancellationToken)
+    {
+        if (!IsValidParagraph(request.Pass) || !IsValidParagraph(request.Fail) || !IsValidParagraph(request.Unconfigured))
+        {
+            return ApiHelpers.Problem(context, StatusCodes.Status422UnprocessableEntity,
+                "MESSAGE_TEMPLATE_INVALID", "文面を保存できませんでした", "各文面は1,000文字以内で入力してください。");
+        }
+
+        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
+        var templates = await db.GuardianMessageTemplates.SingleOrDefaultAsync(cancellationToken);
+        if (request.Revision != (templates?.Revision ?? 0))
+        {
+            return ApiHelpers.Problem(context, StatusCodes.Status412PreconditionFailed,
+                "REVISION_STALE", "配信文面が更新されています", "最新の文面を読み込み直してから保存してください。");
+        }
+
+        if (templates is null)
+        {
+            templates = new GuardianMessageTemplatesEntity();
+            db.GuardianMessageTemplates.Add(templates);
+        }
+        templates.Pass = request.Pass.ReplaceLineEndings("\n").Trim();
+        templates.Fail = request.Fail.ReplaceLineEndings("\n").Trim();
+        templates.Unconfigured = request.Unconfigured.ReplaceLineEndings("\n").Trim();
+        var now = timeProvider.GetUtcNow();
+        db.AuditEvents.Add(new AuditEventEntity
+        {
+            Id = Application.Identifiers.UlidId.New(now),
+            OccurredAt = now,
+            ActorStaffUserId = ApiHelpers.StaffId(principal),
+            EventType = "school_manager.message_templates_updated",
+            ObjectType = "guardian_message_templates",
+            ObjectId = templates.Id,
+            Outcome = "succeeded",
+            CorrelationId = context.TraceIdentifier,
+        });
+        await db.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        return Results.Ok(MessageTemplatesBody.From(templates));
+    }
+
+    private static bool IsValidParagraph(string? value) =>
+        value is { Length: <= 1_000 } && !value.Any(c => char.IsControl(c) && c is not ('\n' or '\r' or '\t'));
+
+    public sealed record MessageTemplatesBody(string Pass, string Fail, string Unconfigured, long Revision)
+    {
+        internal static MessageTemplatesBody From(GuardianMessageTemplatesEntity templates) =>
+            new(templates.Pass, templates.Fail, templates.Unconfigured, templates.Revision);
     }
 
     private static async Task<IResult> ListDeliveriesAsync(

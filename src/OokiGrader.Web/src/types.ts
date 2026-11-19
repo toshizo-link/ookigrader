@@ -124,7 +124,8 @@ export interface StudentDetail extends StudentSummary {
 
 export interface ProgressPoint {
   submissionId: string;
-  testDate: string;
+  testDate?: string | null;
+  progressDate?: string;
   testTitle: string;
   earnedPointsMilli: number;
   possiblePointsMilli: number;
@@ -290,7 +291,7 @@ export interface TestSessionSummary {
   subject?: string | null;
   gradeLabel?: string | null;
   category?: string | null;
-  testDate: string;
+  testDate?: string | null;
   classLabel?: string | null;
   course?: string | null;
   templateCourse?: string | null;
@@ -602,7 +603,7 @@ export interface GradeReviewItem {
   sourceResultRevision: number;
   studentDisplayName?: string;
   testTitle: string;
-  testDate?: string;
+  testDate?: string | null;
   questionId: string;
   questionLabel: string;
   questionText: string;
@@ -769,7 +770,7 @@ export interface ResultDetail {
   resultRevision: number;
   student?: Pick<StudentSummary, "id" | "displayName" | "studentNumber"> | null;
   testTitle: string;
-  testDate: string;
+  testDate?: string | null;
   templateVersionNumber?: number;
   earnedPointsMilli: number;
   possiblePointsMilli: number;

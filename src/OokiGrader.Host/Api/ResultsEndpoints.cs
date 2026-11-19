@@ -631,8 +631,8 @@ public static partial class ResultsEndpoints
         if (position is not null)
         {
             query = query.Where(submission =>
-                submission.TestSession.TestDate < position.TestDate
-                || (submission.TestSession.TestDate == position.TestDate
+                (submission.TestSession.TestDate ?? DateOnly.MinValue) < position.TestDate
+                || ((submission.TestSession.TestDate ?? DateOnly.MinValue) == position.TestDate
                     && (submission.FinalizedAt < position.FinalizedAt
                         || (submission.FinalizedAt == position.FinalizedAt
                             && string.Compare(
@@ -693,7 +693,7 @@ public static partial class ResultsEndpoints
                 filterBinding,
                 hasMore,
                 new StudentResultCursorPosition(
-                    submissions[^1].TestSession.TestDate,
+                    submissions[^1].TestSession.TestDate ?? DateOnly.MinValue,
                     submissions[^1].FinalizedAt!.Value,
                     submissions[^1].Id));
 

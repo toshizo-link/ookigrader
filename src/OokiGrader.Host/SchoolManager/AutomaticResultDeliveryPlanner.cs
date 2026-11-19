@@ -55,6 +55,48 @@ public sealed class AutomaticResultDeliveryPlanner(
             return true;
         }
 
+        // Rebind unsent work when the layout changes or the PDF worker saw newer
+        // grading criteria before rendering. Keep any completed export for audit.
+        var needsExport = await db.GuardianDeliveries
+            .Include(item => item.ExportRecord)
+            .Where(item => item.Kind == "result_pdf" && (item.State == "pending" || item.State == "ready"
+                || (item.State == "failed" && item.LastErrorCode == "result_pdf_unavailable")))
+            .Where(item => item.ExportRecord != null
+                && ((item.State != "failed" && item.ExportRecord.RendererVersion != ResultPdfRenderer.CurrentRendererVersion)
+                    || (item.ExportRecord.State == "failed" && item.ExportRecord.ErrorCode == "export_source_changed")))
+            .OrderBy(item => item.CreatedAt)
+            .ThenBy(item => item.Id)
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (needsExport is not null)
+        {
+            var exportId = UlidId.New(now);
+            var source = await ResultReportSourceLoader.LoadAsync(db, needsExport.SubmissionId!, exportId,
+                    now, includeTeacherComments: false, cancellationToken)
+                .ConfigureAwait(false);
+            if (source.OriginalPdf is null)
+            {
+                needsExport.State = "failed";
+                needsExport.LastErrorCode = "result_original_unavailable";
+                needsExport.SafeErrorDetail = "The original answer PDF is no longer available.";
+            }
+            else
+            {
+                var export = await GetOrQueueExportAsync(db, source, exportId,
+                        needsExport.ExportRecord!.CreatedByStaffUserId, now, cancellationToken)
+                    .ConfigureAwait(false);
+                BindExport(needsExport, export, source);
+                needsExport.LastDryRunAt = null;
+                needsExport.LastErrorCode = null;
+                needsExport.SafeErrorDetail = null;
+            }
+
+            needsExport.UpdatedAt = now;
+            await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+
         var candidates = await GuardianResultSource.Current(db)
             .Where(source => source.Submission.FinalizedAt >= activationStartedAt
                 && source.Submission.FinalizedByStaffUserId != null
@@ -100,42 +142,24 @@ public sealed class AutomaticResultDeliveryPlanner(
                 continue;
             }
 
-            var export = await db.ExportRecords
-                .Where(item => item.SubmissionId == candidate.Id
-                    && item.SourceHash == source.SourceHash
-                    && item.RendererVersion == ResultPdfRenderer.CurrentRendererVersion
-                    && item.State != "failed")
-                .OrderByDescending(item => item.ExportRevision)
-                .FirstOrDefaultAsync(cancellationToken)
+            var export = await GetOrQueueExportAsync(db, source, exportId, candidate.ActorId, now, cancellationToken)
                 .ConfigureAwait(false);
-            if (export is null)
-            {
-                export = await QueueExportAsync(
-                        db,
-                        source,
-                        exportId,
-                        candidate.ActorId,
-                        now,
-                        cancellationToken)
-                    .ConfigureAwait(false);
-            }
 
             var deliveryId = UlidId.New(now.AddMilliseconds(4));
-            db.GuardianDeliveries.Add(new GuardianDeliveryEntity
+            var delivery = new GuardianDeliveryEntity
             {
                 Id = deliveryId,
                 Kind = "result_pdf",
                 StudentId = candidate.StudentId,
                 SubmissionId = candidate.Id,
-                ExportRecordId = export.Id,
                 SourceKey = candidate.SourceKey,
-                AttachmentName = BuildAttachmentName(source.Document.TestDate),
-                State = export.State == "verified" ? "ready" : "pending",
                 NotBeforeAt = now,
                 MaxAttempts = 5,
                 CreatedAt = now,
                 UpdatedAt = now,
-            });
+            };
+            BindExport(delivery, export, source);
+            db.GuardianDeliveries.Add(delivery);
             db.AuditEvents.Add(new AuditEventEntity
             {
                 Id = UlidId.New(now.AddMilliseconds(5)),
@@ -161,7 +185,16 @@ public sealed class AutomaticResultDeliveryPlanner(
         return false;
     }
 
-    private static async Task<ExportRecordEntity> QueueExportAsync(
+    private static void BindExport(GuardianDeliveryEntity delivery, ExportRecordEntity export, ResultReportSource source)
+    {
+        delivery.ExportRecord = export;
+        delivery.ExportRecordId = export.Id;
+        delivery.AttachmentName = $"採点結果_{source.Document.GradedDate:yyyyMMdd}.pdf";
+        delivery.State = export.State == "verified" ? "ready" : "pending";
+        GuardianResultMessage.SetSnapshot(delivery, source);
+    }
+
+    private static async Task<ExportRecordEntity> GetOrQueueExportAsync(
         OokiGraderDbContext db,
         ResultReportSource source,
         string exportId,
@@ -169,6 +202,19 @@ public sealed class AutomaticResultDeliveryPlanner(
         DateTimeOffset now,
         CancellationToken cancellationToken)
     {
+        var existing = await db.ExportRecords
+            .Where(item => item.SubmissionId == source.SubmissionId
+                && item.SourceHash == source.SourceHash
+                && item.RendererVersion == ResultPdfRenderer.CurrentRendererVersion
+                && item.State != "failed" && item.State != "superseded")
+            .OrderByDescending(item => item.ExportRevision)
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (existing is not null)
+        {
+            return existing;
+        }
+
         var nextRevision = checked(
             (await db.ExportRecords
                 .Where(item => item.SubmissionId == source.SubmissionId)
@@ -215,6 +261,4 @@ public sealed class AutomaticResultDeliveryPlanner(
         return record;
     }
 
-    private static string BuildAttachmentName(DateOnly testDate) =>
-        $"採点結果_{testDate:yyyyMMdd}.pdf";
 }

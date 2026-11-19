@@ -922,7 +922,7 @@ interface FinalizationCheck {
 
 interface SubmissionForFinalize extends SubmissionSummary {
   testTitle?: string;
-  testDate?: string;
+  testDate?: string | null;
   finalizationChecks?: FinalizationCheck[];
 }
 

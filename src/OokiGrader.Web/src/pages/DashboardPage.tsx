@@ -1,3 +1,4 @@
+import { SessionDateBadge } from "../components/SessionDateBadge";
 import { Link } from "../router";
 import { useSession } from "../auth/SessionContext";
 import { Icon, type IconName } from "../components/Icon";
@@ -110,21 +111,7 @@ function ScanOperatorDashboardPage() {
                 className="session-mini-row"
                 key={session.id}
               >
-                <div className="session-date-block">
-                  <span>
-                    {new Intl.DateTimeFormat("ja-JP", {
-                      timeZone: "Asia/Tokyo",
-                      month: "numeric",
-                    }).format(new Date(`${session.testDate}T00:00:00+09:00`))}
-                    月
-                  </span>
-                  <strong>
-                    {new Intl.DateTimeFormat("ja-JP", {
-                      timeZone: "Asia/Tokyo",
-                      day: "numeric",
-                    }).format(new Date(`${session.testDate}T00:00:00+09:00`))}
-                  </strong>
-                </div>
+                <SessionDateBadge date={session.testDate} className="session-date-block" />
                 <div className="session-mini-row__copy">
                   <strong>
                     {session.templateTitle ||
@@ -320,25 +307,7 @@ function StaffDashboardPage() {
                     className="session-mini-row"
                     key={session.id}
                   >
-                    <div className="session-date-block">
-                      <span>
-                        {new Intl.DateTimeFormat("ja-JP", {
-                          timeZone: "Asia/Tokyo",
-                          month: "numeric",
-                        }).format(
-                          new Date(`${session.testDate}T00:00:00+09:00`),
-                        )}
-                        月
-                      </span>
-                      <strong>
-                        {new Intl.DateTimeFormat("ja-JP", {
-                          timeZone: "Asia/Tokyo",
-                          day: "numeric",
-                        }).format(
-                          new Date(`${session.testDate}T00:00:00+09:00`),
-                        )}
-                      </strong>
-                    </div>
+                    <SessionDateBadge date={session.testDate} className="session-date-block" />
                     <div className="session-mini-row__copy">
                       <strong>
                         {session.templateTitle ||

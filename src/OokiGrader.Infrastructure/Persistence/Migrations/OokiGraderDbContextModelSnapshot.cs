@@ -2652,6 +2652,18 @@ namespace OokiGrader.Infrastructure.Persistence.Migrations
 
             modelBuilder.Entity("OokiGrader.Infrastructure.Persistence.Entities.GuardianDeliveryEntity", b =>
                 {
+                    b.Property<string>("ResultSubject")
+                        .HasColumnType("TEXT")
+                        .HasColumnName("result_subject");
+
+                    b.Property<string>("ResultTitle")
+                        .HasColumnType("TEXT")
+                        .HasColumnName("result_title");
+
+                    b.Property<string>("ResultVerdict")
+                        .HasColumnType("TEXT")
+                        .HasColumnName("result_verdict");
+
                     b.Property<string>("Id")
                         .HasMaxLength(26)
                         .HasColumnType("TEXT")
@@ -3170,6 +3182,20 @@ namespace OokiGrader.Infrastructure.Persistence.Migrations
                     b.HasIndex("DeliveredAt", "OccurredAt", "Id");
 
                     b.ToTable("outbox_event", (string)null);
+                });
+
+            modelBuilder.Entity("OokiGrader.Infrastructure.Persistence.Entities.GuardianMessageTemplatesEntity", b =>
+                {
+                    b.Property<string>("Id")
+                        .HasColumnType("TEXT")
+                        .HasColumnName("id");
+                    b.Property<string>("Pass").IsRequired().HasColumnType("TEXT").HasColumnName("pass");
+                    b.Property<string>("Fail").IsRequired().HasColumnType("TEXT").HasColumnName("fail");
+                    b.Property<string>("Unconfigured").IsRequired().HasColumnType("TEXT").HasColumnName("unconfigured");
+                    b.Property<long>("Revision").IsConcurrencyToken().HasColumnType("INTEGER").HasColumnName("revision");
+                    b.HasKey("Id");
+                    b.ToTable("guardian_message_templates", t =>
+                        t.HasCheckConstraint("ck_guardian_message_templates_singleton", "id = 'school-manager'"));
                 });
 
             modelBuilder.Entity("OokiGrader.Infrastructure.Persistence.Entities.PassFailImportEntity", b =>
@@ -5705,7 +5731,7 @@ namespace OokiGrader.Infrastructure.Persistence.Migrations
                         .HasColumnName("template_version_id")
                         .IsFixedLength();
 
-                    b.Property<DateOnly>("TestDate")
+                    b.Property<DateOnly?>("TestDate")
                         .HasColumnType("TEXT")
                         .HasColumnName("test_date");
 

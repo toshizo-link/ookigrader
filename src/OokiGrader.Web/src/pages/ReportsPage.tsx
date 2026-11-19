@@ -37,7 +37,7 @@ import type { PagedResponse, SubmissionSummary } from "../types";
 
 interface FinalizedSubmission extends SubmissionSummary {
   testTitle?: string;
-  testDate?: string;
+  testDate?: string | null;
   finalizedAt?: string;
   percentageBasisPoints?: number;
   exportState?: string;
@@ -108,7 +108,7 @@ interface PassFailMatrix {
   tests: Array<{
     id: string;
     title: string;
-    testDate: string;
+    testDate?: string | null;
   }>;
   results: Array<{
     submissionId: string;

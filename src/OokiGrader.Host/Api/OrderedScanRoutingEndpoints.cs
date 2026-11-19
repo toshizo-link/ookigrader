@@ -656,7 +656,7 @@ public sealed record OrderedScanRoutingItem(
 public sealed record OrderedScanRoutingSession(
     string Id,
     string Title,
-    DateOnly TestDate,
+    DateOnly? TestDate,
     string? ClassLabel,
     string? GradeLabel,
     string? Subject,

@@ -282,16 +282,16 @@ public static class TestSessionsEndpoints
             query = normalizedSort switch
             {
                 "-testDate" => query.Where(session =>
-                    session.TestDate < position.TestDate
-                    || (session.TestDate == position.TestDate
+                    (session.TestDate ?? DateOnly.MinValue) < position.TestDate
+                    || ((session.TestDate ?? DateOnly.MinValue) == position.TestDate
                         && (session.CreatedAt < position.SecondaryAt
                             || (session.CreatedAt == position.SecondaryAt
                                 && string.Compare(
                                     session.Id,
                                     position.Id) > 0)))),
                 "testDate" => query.Where(session =>
-                    session.TestDate > position.TestDate
-                    || (session.TestDate == position.TestDate
+                    (session.TestDate ?? DateOnly.MinValue) > position.TestDate
+                    || ((session.TestDate ?? DateOnly.MinValue) == position.TestDate
                         && (session.CreatedAt > position.SecondaryAt
                             || (session.CreatedAt == position.SecondaryAt
                                 && string.Compare(
@@ -420,7 +420,7 @@ public static class TestSessionsEndpoints
                 .AsNoTracking()
                 .Where(session => session.Id == lastId)
                 .Select(session => new SessionCursorPosition(
-                    usesTestDate ? session.TestDate : null,
+                    usesTestDate ? session.TestDate ?? DateOnly.MinValue : null,
                     usesUpdatedAt ? session.UpdatedAt : null,
                     usesTestDate ? session.CreatedAt : null,
                     usesName
@@ -730,7 +730,7 @@ public static class TestSessionsEndpoints
         var classLabel = TrimOrNull(request.ClassLabel);
         var course = TrimOrNull(request.Course);
         if (string.IsNullOrWhiteSpace(request.TemplateVersionId)
-            || request.TestDate == default
+            || request.TestDate == DateOnly.MinValue
             || priority is not ("economy" or "expedite")
             || sessionName?.Length > 500
             || classLabel?.Length > 500)
@@ -1604,7 +1604,7 @@ public static class TestSessionsEndpoints
 
     private static string ComputeCreateSessionFingerprint(
         string templateVersionId,
-        DateOnly testDate,
+        DateOnly? testDate,
         string? sessionName,
         string? classLabel,
         string? course,
@@ -1614,7 +1614,7 @@ public static class TestSessionsEndpoints
         var canonical = string.Join(
             '\n',
             templateVersionId,
-            testDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+            testDate?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) ?? "<null>",
             sessionName ?? "<null>",
             classLabel ?? "<null>",
             course ?? "<null>",
@@ -1707,7 +1707,7 @@ public static class TestSessionsEndpoints
 
     private sealed record CreateSessionBody(
         string TemplateVersionId,
-        DateOnly TestDate,
+        DateOnly? TestDate,
         string? SessionName,
         string? ClassLabel,
         string? Course,
@@ -1733,7 +1733,7 @@ public static class TestSessionsEndpoints
         string? GradeLabel,
         string? Category,
         int? ExpectedSubmissionPageCount,
-        DateOnly TestDate,
+        DateOnly? TestDate,
         string? ClassLabel,
         string? Course,
         string? TemplateCourse,

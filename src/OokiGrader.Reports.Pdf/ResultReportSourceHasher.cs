@@ -20,7 +20,8 @@ public static class ResultReportSourceHasher
         Append(hash, report.TestTitle);
         Append(
             hash,
-            report.TestDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
+            report.TestDate?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
+        Append(hash, report.GradedDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
         Append(hash, report.TemplateVersionNumber);
         Append(hash, report.ResultRevision);
         Append(hash, report.EarnedPointsMilli);

@@ -75,12 +75,27 @@ if (path === "/") {
     };
 } else if (path === "/message-thread-details/0/create") {
     screenRoot.innerHTML = `
+        <app-message-thread-details>
+        <div class="issue-state-select-container">
+          <mat-select role="combobox">対応中</mat-select>
+        </div>
         <div class="message-input-area">
           <input class="add-attached-file-input" type="file">
           <div class="attached-file-table"></div>
           <ion-textarea placeholder="メッセージを入力"><textarea></textarea></ion-textarea>
           <ion-button class="send-message-button" role="button" aria-disabled="true">送信</ion-button>
-        </div>`;
+        </div></app-message-thread-details>
+        <div role="listbox" hidden><mat-option role="option">解決済</mat-option></div>`;
+    let issueState = "inProgress";
+    const status = screenRoot.querySelector("mat-select");
+    const options = screenRoot.querySelector("[role=listbox]");
+    status.onclick = () => options.hidden = false;
+    options.querySelector("mat-option").onclick = () => {
+        options.hidden = true;
+        if (document.documentElement.dataset.statusUnavailable) return;
+        issueState = "resolved";
+        status.textContent = "解決済";
+    };
     let upload;
     const input = screenRoot.querySelector("input");
     const send = screenRoot.querySelector("ion-button");
@@ -109,6 +124,7 @@ if (path === "/") {
         const attachment = await upload;
         if (!attachment) return;
         const thread = {
+            issueState,
             targetUser: {userId: sessionStorage.getItem("student"), departmentId: "class-a"},
             members: JSON.parse(sessionStorage.getItem("recipients")),
             title: sessionStorage.getItem("title"),

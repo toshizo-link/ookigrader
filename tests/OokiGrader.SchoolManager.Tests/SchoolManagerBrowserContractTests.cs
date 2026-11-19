@@ -36,11 +36,17 @@ public sealed class SchoolManagerBrowserContractTests
                 <div class="table-data-2">9999</div>
                 <ion-button onclick="history.pushState({}, '', '/message-thread-members-and-title')">選択</ion-button></div>
             </app-message-thread-target-users>
+            <app-message-thread-details>
+              <div class="issue-state-select-container">
+                <mat-select onclick="document.querySelector('mat-option').hidden=false">対応中</mat-select>
+              </div>
+              <mat-option hidden role="option" onclick="document.querySelector('mat-select').textContent='解決済'; this.hidden=true">解決済</mat-option>
             <div class="message-input-area">
               <input type="file" class="add-attached-file-input">
               <ion-textarea placeholder="メッセージを入力"><textarea></textarea></ion-textarea>
               <ion-button class="send-message-button" onclick="fetch('/lms/v1.0/org/message-threads',{method:'POST'}).catch(()=>{})">送信</ion-button>
             </div>
+            </app-message-thread-details>
             <script>
               document.querySelector('input[type=file]').onchange = async e => {
                 const file = e.target.files[0];

@@ -1,3 +1,4 @@
+import { SessionDateBadge } from "../components/SessionDateBadge";
 import { useRef, useState, type FormEvent } from "react";
 import { Link, useNavigate } from "../router";
 import { useSession } from "../auth/SessionContext";
@@ -28,7 +29,7 @@ import {
 import { useApiQuery } from "../hooks/useApiQuery";
 import { useListQueryState } from "../hooks/useListQueryState";
 import { ApiError, api, asPaged, newIdempotencyKey } from "../lib/api";
-import { formatDate, toDateInput } from "../lib/format";
+import { formatDate } from "../lib/format";
 import type {
   PagedResponse,
   TemplateSummary,
@@ -387,20 +388,7 @@ function SessionCard({
       className="session-card"
       to={`/sessions/${encodeURIComponent(session.id)}`}
     >
-      <div className="session-card__date">
-        <span>
-          {new Intl.DateTimeFormat("ja-JP", {
-            timeZone: "Asia/Tokyo",
-            month: "short",
-          }).format(new Date(`${session.testDate}T00:00:00+09:00`))}
-        </span>
-        <strong>
-          {new Intl.DateTimeFormat("ja-JP", {
-            timeZone: "Asia/Tokyo",
-            day: "numeric",
-          }).format(new Date(`${session.testDate}T00:00:00+09:00`))}
-        </strong>
-      </div>
+      <SessionDateBadge date={session.testDate} className="session-card__date" />
       <div className="session-card__body">
         <div className="session-card__meta">
           <StatusBadge status={session.state} />
@@ -465,7 +453,7 @@ function CreateSessionDialog({
   const [values, setValues] = useState({
     templateId: "",
     templateVersionId: "",
-    testDate: toDateInput(),
+    testDate: "",
     classLabel: "",
   });
   const [working, setWorking] = useState(false);
@@ -499,7 +487,7 @@ function CreateSessionDialog({
         "/test-sessions",
         {
           templateVersionId: values.templateVersionId,
-          testDate: values.testDate,
+          testDate: values.testDate || null,
           classLabel: values.classLabel || undefined,
           openImmediately: true,
         },
@@ -530,7 +518,7 @@ function CreateSessionDialog({
       open={open}
       onClose={() => !working && closeDialog()}
       title="答案受付を開始"
-      description="受付に使えるひな形を選び、実施日だけを入力します。必要な場合は対象クラスも指定できます。"
+      description="受付に使うひな形を選んでください。"
       size="large"
     >
       {templates.status === "loading" ? (
@@ -575,10 +563,10 @@ function CreateSessionDialog({
           ) : null}
           <div className="form-grid form-grid--2">
             <Field
-              label="実施日"
+              label="実施日（任意）"
               htmlFor="session-date"
-              required
-              hint="進捗グラフと帳票にはこの日付が使われます。"
+
+              hint="日付を記録するときだけ入力してください。"
             >
               <input
                 id="session-date"
@@ -588,7 +576,7 @@ function CreateSessionDialog({
                   idempotencyKeyRef.current = "";
                   setValues({ ...values, testDate: event.target.value });
                 }}
-                required
+
               />
             </Field>
             <Field label="クラス" htmlFor="session-class">
@@ -619,11 +607,7 @@ function CreateSessionDialog({
             </Button>
             <Button
               type="submit"
-              disabled={
-                working ||
-                !values.templateVersionId ||
-                !values.testDate
-              }
+              disabled={working || !values.templateVersionId}
             >
               {working ? "開始しています…" : "答案受付を開始"}
             </Button>

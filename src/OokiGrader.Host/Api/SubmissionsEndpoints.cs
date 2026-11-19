@@ -514,12 +514,12 @@ public static partial class SubmissionsEndpoints
                 query = normalizedSort switch
                 {
                     "-testDate" => query.Where(submission =>
-                        submission.TestSession.TestDate < position.Date
-                        || (submission.TestSession.TestDate == position.Date
+                        (submission.TestSession.TestDate ?? DateOnly.MinValue) < position.Date
+                        || ((submission.TestSession.TestDate ?? DateOnly.MinValue) == position.Date
                             && string.Compare(submission.Id, position.Id) > 0)),
                     "testDate" => query.Where(submission =>
-                        submission.TestSession.TestDate > position.Date
-                        || (submission.TestSession.TestDate == position.Date
+                        (submission.TestSession.TestDate ?? DateOnly.MinValue) > position.Date
+                        || ((submission.TestSession.TestDate ?? DateOnly.MinValue) == position.Date
                             && string.Compare(submission.Id, position.Id) > 0)),
                     "-finalizedAt" => query.Where(submission =>
                         submission.FinalizedAt < position.Timestamp
@@ -648,7 +648,7 @@ public static partial class SubmissionsEndpoints
                         _ => null,
                     },
                     normalizedSort is "-testDate" or "testDate"
-                        ? submissions[^1].TestSession.TestDate
+                        ? submissions[^1].TestSession.TestDate ?? DateOnly.MinValue
                         : null,
                     normalizedSort switch
                     {

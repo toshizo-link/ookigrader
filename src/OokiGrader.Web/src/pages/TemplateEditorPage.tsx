@@ -26,7 +26,6 @@ import {
   classNames,
   formatDateTime,
   formatPoints,
-  toDateInput,
 } from "../lib/format";
 import type {
   AnswerVariant,
@@ -68,7 +67,7 @@ interface PublishTestSessionResponse {
   expectedSubmissionPageCount: number | null;
   course: string | null;
   templateCourse: string | null;
-  testDate: string;
+  testDate?: string | null;
   classLabel: string | null;
   priority: "economy" | "expedite";
   state: string;
@@ -83,7 +82,7 @@ interface PublishAndStartReceptionResponse extends TemplateVersionDetail {
 interface PendingPublishReceptionRequest {
   body: {
     revision: number;
-    testDate: string;
+    testDate: string | null;
     classLabel?: string;
   };
   etag: string;
@@ -560,7 +559,7 @@ export function TemplateEditorPage() {
   const [receptionOpen, setReceptionOpen] = useState(false);
   const [startingReception, setStartingReception] = useState(false);
   const [receptionDetails, setReceptionDetails] = useState({
-    testDate: toDateInput(),
+    testDate: "",
     classLabel: "",
   });
   const [retryingGeneration, setRetryingGeneration] = useState(false);
@@ -990,7 +989,7 @@ export function TemplateEditorPage() {
           "/test-sessions",
           {
             templateVersionId: versionId,
-            testDate: receptionDetails.testDate,
+            testDate: receptionDetails.testDate || null,
             classLabel: receptionDetails.classLabel.trim() || undefined,
             openImmediately: true,
           },
@@ -1008,7 +1007,7 @@ export function TemplateEditorPage() {
           request = {
             body: {
               revision: latest.revision,
-              testDate: receptionDetails.testDate,
+              testDate: receptionDetails.testDate || null,
               classLabel: receptionDetails.classLabel.trim() || undefined,
             },
             etag: `"rev-${latest.revision}"`,
@@ -1593,7 +1592,7 @@ export function TemplateEditorPage() {
             </Button>
             <Button
               onClick={() => void startReception()}
-              disabled={startingReception || !receptionDetails.testDate}
+              disabled={startingReception}
             >
               {startingReception ? "開始しています…" : "受付を開始"}
             </Button>
@@ -1604,10 +1603,10 @@ export function TemplateEditorPage() {
           <TemplateSessionMetadata template={editor.data.template} />
           <div className="form-grid form-grid--2">
             <Field
-              label="実施日"
+              label="実施日（任意）"
               htmlFor="template-reception-date"
-              required
-              hint="答案用紙に記載された日付を選びます。"
+
+              hint="日付を記録するときだけ入力してください。"
             >
               <input
                 id="template-reception-date"
@@ -1621,7 +1620,7 @@ export function TemplateEditorPage() {
                     testDate: event.target.value,
                   });
                 }}
-                required
+
               />
             </Field>
             <Field

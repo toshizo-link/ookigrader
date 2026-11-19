@@ -89,6 +89,7 @@ public sealed class OokiGraderDbContext : DbContext, IUnitOfWork
         Set<BulkTranscriptExportEntity>();
     public DbSet<SchoolManagerSettingsEntity> SchoolManagerSettings =>
         Set<SchoolManagerSettingsEntity>();
+    public DbSet<GuardianMessageTemplatesEntity> GuardianMessageTemplates => Set<GuardianMessageTemplatesEntity>();
     public DbSet<PassFailImportEntity> PassFailImports => Set<PassFailImportEntity>();
     public DbSet<GuardianDeliveryEntity> GuardianDeliveries =>
         Set<GuardianDeliveryEntity>();
@@ -2526,6 +2527,14 @@ public sealed class OokiGraderDbContext : DbContext, IUnitOfWork
 
     private static void ConfigureSchoolManagerModel(ModelBuilder modelBuilder)
     {
+        modelBuilder.Entity<GuardianMessageTemplatesEntity>(builder =>
+        {
+            builder.ToTable("guardian_message_templates", table =>
+                table.HasCheckConstraint("ck_guardian_message_templates_singleton", "id = 'school-manager'"));
+            builder.HasKey(entity => entity.Id);
+            ConfigureRevision(builder);
+        });
+
         modelBuilder.Entity<SchoolManagerSettingsEntity>(builder =>
         {
             builder.ToTable("school_manager_settings", table =>

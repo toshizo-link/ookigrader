@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net;
 using System.Net.Http.Json;
 using System.Security.Claims;
@@ -1982,8 +1983,10 @@ public sealed class TemplateWorkflowTests
         });
     }
 
-    [Fact]
-    public async Task ExistingPublishedVersionCanStartAnotherOpenCanonicalSession()
+    [Theory]
+    [InlineData("2026-08-11", "2026-08-12")]
+    [InlineData(null, null)]
+    public async Task ExistingPublishedVersionCanStartAnotherOpenCanonicalSession(string? publishDate, string? sessionDate)
     {
         await using var application = await TemplateTestApplication.CreateAsync();
         var (templateId, versionId) = await CreateTemplateAndVersionAsync(application);
@@ -2003,14 +2006,14 @@ public sealed class TemplateWorkflowTests
                 HttpMethod.Post,
                 $"/api/v1/templates/{templateId}/versions/{versionId}:publish",
                 "teacher",
-                new { testDate = "2026-08-11" },
+                new { testDate = publishDate },
                 RequiredEtag(current))).StatusCode);
 
         var idempotencyKey = UlidId.New();
         var sessionRequest = new
         {
             templateVersionId = versionId,
-            testDate = "2026-08-12",
+            testDate = sessionDate,
             classLabel = "B組",
             openImmediately = true,
         };
@@ -2023,11 +2026,25 @@ public sealed class TemplateWorkflowTests
         Assert.Equal(HttpStatusCode.Created, createdSessionResponse.StatusCode);
         var session = await ReadJsonAsync(createdSessionResponse);
         var sessionId = RequiredString(session, "id");
+        Assert.Equal(sessionDate, session.TryGetProperty("testDate", out var date) ? date.GetString() : null);
         Assert.Equal("open", RequiredString(session, "state"));
         Assert.Equal("expedite", RequiredString(session, "priority"));
         Assert.Equal("漢字確認テスト", RequiredString(session, "title"));
         Assert.Equal("標準", RequiredString(session, "course"));
         Assert.Equal("manual", RequiredString(session, "creationSource"));
+
+        foreach (var order in new[] { "testDate", "-testDate" })
+        {
+            var path = $"/api/v1/test-sessions?pageSize=1&sort={order}";
+            var first = await ReadJsonAsync(await application.SendAsync(HttpMethod.Get, path, "teacher"));
+            var cursor = RequiredString(first, "nextCursor");
+            var second = await ReadJsonAsync(await application.SendAsync(
+                HttpMethod.Get, $"{path}&cursor={Uri.EscapeDataString(cursor)}", "teacher"));
+            var firstId = RequiredString(first.GetProperty("items")[0], "id");
+            var secondId = RequiredString(second.GetProperty("items")[0], "id");
+            Assert.NotEqual(firstId, secondId);
+            Assert.Contains(sessionId, new[] { firstId, secondId });
+        }
 
         // Simulate a committed endpoint response whose middleware replay row
         // was lost: the session row's actor/key fence returns the same resource.
@@ -2060,6 +2077,8 @@ public sealed class TemplateWorkflowTests
         await application.WithDatabaseAsync(async db =>
         {
             Assert.Equal(2, await db.TestSessions.CountAsync());
+            var published = await db.TestSessions.SingleAsync(item => item.CreationSource == "template_publish");
+            Assert.Equal(publishDate, published.TestDate?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
             Assert.Equal(
                 1,
                 await db.TestSessions.CountAsync(

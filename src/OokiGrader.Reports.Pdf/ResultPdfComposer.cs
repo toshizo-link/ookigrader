@@ -7,15 +7,15 @@ using PdfSharp.Pdf.IO;
 namespace OokiGrader.Reports.Pdf;
 
 /// <summary>
-/// Produces the teacher-facing handout: the retained scanned answer pages first,
-/// followed by the compact structured transcript. When scan retention has
+/// Produces a handout with the compact structured transcript first, followed
+/// by the retained scanned answer pages. When scan retention has
 /// expired callers continue to use the transcript renderer by itself.
 /// </summary>
 public static class ResultPdfComposer
 {
     public const int MaximumOriginalPages = 100;
 
-    public static ResultPdfRenderResult PrependOriginal(
+    public static ResultPdfRenderResult AppendOriginal(
         Stream originalPdf,
         ResultPdfRenderResult transcript,
         ResultReportDocument report)
@@ -56,13 +56,13 @@ public static class ResultPdfComposer
         combined.Info.ModificationDate = report.GeneratedAt.UtcDateTime;
         SetDocumentIdentifiers(combined, report, transcript.Sha256);
 
-        for (var index = 0; index < original.PageCount; index++)
-        {
-            combined.AddPage(original.Pages[index]);
-        }
         for (var index = 0; index < transcriptDocument.PageCount; index++)
         {
             combined.AddPage(transcriptDocument.Pages[index]);
+        }
+        for (var index = 0; index < original.PageCount; index++)
+        {
+            combined.AddPage(original.Pages[index]);
         }
 
         using var output = new MemoryStream();

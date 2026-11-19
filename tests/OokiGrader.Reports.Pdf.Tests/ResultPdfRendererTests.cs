@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Globalization;
 using OokiGrader.Reports.Pdf;
+using PdfSharp.Drawing;
 using PdfSharp.Pdf.IO;
 using PdfSharp.Pdf;
 
@@ -71,21 +72,21 @@ public sealed class ResultPdfRendererTests
     }
 
     [Fact]
-    public void OriginalAnswerPagesArePrependedToTheCompactTranscript()
+    public void AllTranscriptPagesPrecedeTheOriginalAnswerPagesInScanOrder()
     {
-        var report = CreateReport(questionCount: 3, longQuestions: false) with
+        var report = CreateReport(questionCount: 45, longQuestions: true) with
         {
             OriginalScanSha256 = new string('a', 64),
         };
         var transcript = new ResultPdfRenderer().Render(report);
         using var originalDocument = new PdfDocument();
-        originalDocument.AddPage();
-        originalDocument.AddPage();
+        originalDocument.AddPage().Width = XUnit.FromPoint(280);
+        originalDocument.AddPage().Width = XUnit.FromPoint(310);
         using var originalBytes = new MemoryStream();
         originalDocument.Save(originalBytes, closeStream: false);
         originalBytes.Position = 0;
 
-        var combined = ResultPdfComposer.PrependOriginal(
+        var combined = ResultPdfComposer.AppendOriginal(
             originalBytes,
             transcript,
             report);
@@ -97,7 +98,17 @@ public sealed class ResultPdfRendererTests
             combined.Sha256);
         using var parsed = PdfReader.Open(
             new MemoryStream(combined.PdfBytes, writable: false));
-        Assert.Equal(combined.PageCount, parsed.PageCount);
+        using var parsedTranscript = PdfReader.Open(
+            new MemoryStream(transcript.PdfBytes, writable: false));
+        Assert.True(parsedTranscript.PageCount > 1);
+        for (var page = 0; page < parsedTranscript.PageCount; page++)
+        {
+            Assert.Equal(parsedTranscript.Pages[page].Contents.CreateSingleContent().Stream.Value,
+                parsed.Pages[page].Contents.CreateSingleContent().Stream.Value);
+        }
+        Assert.Equal(280, parsed.Pages[transcript.PageCount].Width.Point);
+        Assert.Equal(310, parsed.Pages[transcript.PageCount + 1].Width.Point);
+        WriteDiagnosticPdf("transcript-before-originals.pdf", combined.PdfBytes);
     }
 
     [Fact]
@@ -126,6 +137,8 @@ public sealed class ResultPdfRendererTests
         Assert.NotEqual(
             ResultReportSourceHasher.Compute(report),
             ResultReportSourceHasher.Compute(correction));
+        Assert.NotEqual(ResultReportSourceHasher.Compute(report),
+            ResultReportSourceHasher.Compute(report with { GradedDate = report.GradedDate.AddDays(1) }));
         Assert.NotEqual(
             ResultReportSourceHasher.Compute(report),
             ResultReportSourceHasher.Compute(report with
@@ -189,12 +202,13 @@ public sealed class ResultPdfRendererTests
             "S-0042",
             "国語・漢字確認テスト 第4回",
             new DateOnly(2026, 7, 27),
+            new DateOnly(2026, 7, 30),
             3,
             7,
             questions.Sum(item => item.AwardedPointsMilli),
             questions.Sum(item => item.MaximumPointsMilli),
             questions,
-            new DateTimeOffset(2026, 7, 27, 8, 15, 0, TimeSpan.Zero),
+            new DateTimeOffset(2026, 8, 5, 8, 15, 0, TimeSpan.Zero),
             IsCorrectedGrade: questions.Any(item => item.IsCorrected));
     }
 
