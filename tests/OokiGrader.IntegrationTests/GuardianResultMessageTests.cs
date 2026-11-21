@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using OokiGrader.Application.Identifiers;
+using OokiGrader.Host.SchoolManager;
 using OokiGrader.Infrastructure.Persistence.Entities;
 
 namespace OokiGrader.IntegrationTests;
@@ -38,7 +39,7 @@ public sealed partial class SchoolManagerAutomationTests
         Assert.Equal("sent", sent.State);
         Assert.Equal(1, sent.AttemptCount);
         var request = Assert.Single(fixture.Client.Requests);
-        Assert.Contains("判定　合格", request.Body);
+        Assert.Contains("結果：合格", request.Body);
         var verified = await db.ExportRecords.AsNoTracking().SingleAsync(record => record.State == "verified");
         Assert.Equal(sent.ExportRecordId, verified.Id);
         Assert.Equal(verified.Sha256,
@@ -49,7 +50,7 @@ public sealed partial class SchoolManagerAutomationTests
     [InlineData(1, "合格", "よくできました。")]
     [InlineData(0, "不合格", "次回もう一度挑戦しましょう。")]
     [InlineData(null, "合否基準未設定", "お知らせです。")]
-    public async Task ResultMessageUsesFinalizedPdfAndMatchingParagraph(
+    public async Task ResultMessageUsesFinalizedPdfAndMatchingTemplate(
         int? maximumMistakes, string verdict, string expectedParagraph)
     {
         await using var fixture = await AutomationFixture.CreateAsync();
@@ -57,7 +58,7 @@ public sealed partial class SchoolManagerAutomationTests
         await fixture.SeedFinalizedResultAsync();
         await using var db = await fixture.CreateDbContextAsync();
         var session = await db.TestSessions.SingleAsync();
-        session.TitleOverride = "地理の小テスト";
+        session.TitleOverride = "地理＜結果＞";
         session.TemplateSubjectSnapshot = "社会";
         session.MaximumMistakesToPass = maximumMistakes;
         var result = await db.QuestionResults.Include(q => q.GradingRun).SingleAsync();
@@ -88,13 +89,31 @@ public sealed partial class SchoolManagerAutomationTests
         session.TitleOverride = "後日のテスト";
         db.GuardianMessageTemplates.Add(new GuardianMessageTemplatesEntity
         {
-            Pass = "よくできました。",
-            Fail = "次回もう一度挑戦しましょう。",
-            Unconfigured = "お知らせです。",
+            Title = "＜教科＞／＜タイトル＞　＜結果＞",
+            Pass = "よくできました。\n＜結果＞・＜結果＞",
+            Fail = "次回もう一度挑戦しましょう。\n＜結果＞・＜結果＞",
+            Unconfigured = "お知らせです。\n＜結果＞・＜結果＞",
         });
         await db.SaveChangesAsync();
         Assert.True(await fixture.DeliveryProcessor.ProcessNextAsync());
-        Assert.Equal($"教科　社会\nテスト名　地理の小テスト\n判定　{verdict}\n\n{expectedParagraph}",
-            Assert.Single(fixture.Client.Requests).Body);
+        var sent = Assert.Single(fixture.Client.Requests);
+        Assert.Equal($"社会／地理＜結果＞　{verdict}", sent.Title);
+        Assert.Equal($"{expectedParagraph}\n{verdict}・{verdict}", sent.Body);
+    }
+
+    [Theory]
+    [InlineData("pass", "合格", "\nよく準備して臨むことができました。この調子で、次の範囲にも取り組んでいきましょう。ご家庭でもぜひ声をかけてあげてください。")]
+    [InlineData("fail", "不合格", "\n次回の通塾時に、本人の都合のよいタイミングで再テストを受けることができます。それまでに該当範囲をもう一度見直しておくよう、ご家庭でもお声がけいただけますと幸いです。")]
+    [InlineData("unconfigured", "合否基準未設定", "")]
+    public void PresetsRenderTheRequestedGuardianCopy(string verdict, string label, string closing)
+    {
+        var result = GuardianResultMessage.Format(new GuardianDeliveryEntity
+        {
+            ResultSubject = "理科", ResultTitle = "てこ・滑車", ResultVerdict = verdict,
+        }, new GuardianMessageTemplatesEntity());
+        Assert.Equal("暗記テスト採点結果のお知らせ", result.Title);
+        Assert.Equal("いつも大変お世話になっております。\n先日実施いたしました暗記テストの結果をお知らせいたします。\n\n" +
+            $"教科：理科\n範囲：てこ・滑車\n結果：{label}\n\n" +
+            "答案をPDFで添付しておりますので、あわせてご確認ください。" + closing, result.Body);
     }
 }

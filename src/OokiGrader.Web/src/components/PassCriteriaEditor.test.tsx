@@ -30,4 +30,15 @@ describe("PassCriteriaEditor", () => {
     fireEvent.click(screen.getByRole("button", { name: "合格基準を保存" }));
     await waitFor(() => expect(put).toHaveBeenCalledWith("/test-sessions/s1/pass-criteria", { maximumMistakesToPass: null, revision: 7 }));
   });
+  it("saves the inclusive zero-mistake boundary on the template", async () => {
+    const onSaved = vi.fn();
+    const updated = { id: "t1", revision: 6, maximumMistakesToPass: 0 };
+    put.mockResolvedValueOnce(updated);
+    render(<PassCriteriaEditor template={{ id: "t1", revision: 5 }} readOnly={false} onSaved={onSaved} />);
+    fireEvent.change(screen.getByLabelText("合格にする最大ミス数"), { target: { value: "0" } });
+    expect(screen.getByText("0ミスまで合格")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "合格基準を保存" }));
+    await waitFor(() => expect(onSaved).toHaveBeenCalledWith(updated));
+    expect(put).toHaveBeenCalledWith("/templates/t1/pass-criteria", { maximumMistakesToPass: 0, revision: 5 });
+  });
 });

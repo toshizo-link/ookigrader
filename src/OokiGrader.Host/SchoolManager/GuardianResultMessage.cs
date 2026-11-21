@@ -1,11 +1,17 @@
+using System.Text.RegularExpressions;
 using OokiGrader.Domain.Grading;
 using OokiGrader.Host.Reports;
 using OokiGrader.Infrastructure.Persistence.Entities;
 
 namespace OokiGrader.Host.SchoolManager;
 
-internal static class GuardianResultMessage
+internal sealed record GuardianMessage(string Title, string Body);
+
+internal static partial class GuardianResultMessage
 {
+    [GeneratedRegex("＜(?:教科|タイトル|結果)＞")]
+    private static partial Regex Tokens();
+
     internal static void SetSnapshot(GuardianDeliveryEntity delivery, ResultReportSource source)
     {
         delivery.ResultSubject = source.Subject;
@@ -14,9 +20,9 @@ internal static class GuardianResultMessage
             source.Document.Questions.Select(question => question.Outcome));
     }
 
-    internal static string Format(GuardianDeliveryEntity delivery, GuardianMessageTemplatesEntity templates)
+    internal static GuardianMessage Format(GuardianDeliveryEntity delivery, GuardianMessageTemplatesEntity templates)
     {
-        var (label, paragraph) = delivery.ResultVerdict switch
+        var (label, body) = delivery.ResultVerdict switch
         {
             "pass" => ("合格", templates.Pass),
             "fail" => ("不合格", templates.Fail),
@@ -24,7 +30,13 @@ internal static class GuardianResultMessage
             _ => throw new InvalidOperationException("The result message has no verified verdict."),
         };
         var subject = string.IsNullOrWhiteSpace(delivery.ResultSubject) ? "未設定" : delivery.ResultSubject;
-        var header = $"教科　{subject}\nテスト名　{delivery.ResultTitle}\n判定　{label}";
-        return paragraph.Length == 0 ? header : $"{header}\n\n{paragraph}";
+        var title = string.IsNullOrWhiteSpace(delivery.ResultTitle) ? "未設定" : delivery.ResultTitle;
+        string Render(string template) => Tokens().Replace(template, match => match.Value switch
+        {
+            "＜教科＞" => subject,
+            "＜タイトル＞" => title,
+            _ => label,
+        });
+        return new GuardianMessage(Render(templates.Title), Render(body));
     }
 }

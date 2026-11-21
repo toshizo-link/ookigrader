@@ -8,6 +8,7 @@ import {
 import { Link, useNavigate, useParams } from "../router";
 import { Icon } from "../components/Icon";
 import { TemplateSessionMetadata } from "../components/TemplateSessionMetadata";
+import { PassCriteriaEditor, type PassCriteria } from "../components/PassCriteriaEditor";
 import {
   Badge,
   Button,
@@ -546,6 +547,8 @@ export function TemplateEditorPage() {
     Boolean(templateId && versionId),
   );
   const [questions, setQuestions] = useState<TemplateQuestion[]>([]);
+  const [criteriaOpen, setCriteriaOpen] = useState(false);
+  const [savedCriteria, setSavedCriteria] = useState<PassCriteria>();
   const [editorLoadGeneration, setEditorLoadGeneration] = useState(0);
   const [selectedId, setSelectedId] = useState("");
   const [draft, setDraft] = useState<TemplateQuestion>();
@@ -1066,6 +1069,10 @@ export function TemplateEditorPage() {
   }
 
   const isArchived = editor.data.template.lifecycleState === "archived";
+  const template = savedCriteria?.id === editor.data.template.id
+    && (savedCriteria.revision ?? 0) > (editor.data.template.revision ?? 0)
+    ? { ...editor.data.template, revision: savedCriteria.revision, maximumMistakesToPass: savedCriteria.maximumMistakesToPass ?? null }
+    : editor.data.template;
   const isDraftVersion = editor.data.version.state === "draft";
   const isPublishedVersion = editor.data.version.state === "published";
   const receptionLifecycleAvailable = !["archived", "retired"].includes(
@@ -1141,6 +1148,7 @@ export function TemplateEditorPage() {
           <span className="editor-total">
             合計 <strong>{formatPoints(totalPoints)}</strong>点
           </span>
+          <Button variant="secondary" onClick={() => setCriteriaOpen(true)}>合格基準</Button>
           {canStartReception ? (
             <Button
               onClick={() => void prepareReception()}
@@ -1153,6 +1161,11 @@ export function TemplateEditorPage() {
           ) : null}
         </div>
       </header>
+
+      <Modal open={criteriaOpen} onClose={() => setCriteriaOpen(false)} title="ひな形の合格基準"
+        description="このひな形で新しく始める答案受付に適用します。受付ごとに変更もできます。" size="medium">
+        <PassCriteriaEditor key={template.id} template={template} readOnly={isArchived} onSaved={setSavedCriteria} />
+      </Modal>
 
       {isArchived ? (
         <InlineAlert tone="info" title="このひな形はアーカイブされています">
@@ -1600,7 +1613,7 @@ export function TemplateEditorPage() {
         }
       >
         <div className="session-form">
-          <TemplateSessionMetadata template={editor.data.template} />
+          <TemplateSessionMetadata template={template} />
           <div className="form-grid form-grid--2">
             <Field
               label="実施日（任意）"

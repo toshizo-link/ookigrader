@@ -858,9 +858,79 @@ input[type="file"] {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.pass-criteria-form {
+  display: grid;
+  gap: 16px;
+}
+
+.pass-criteria-form p { margin: 0; }
+.pass-criteria-form input { max-width: 8rem; }
+.pass-criteria-form > button { justify-self: start; }
+.card > .pass-criteria-form { padding: 20px; }
+
 .guardian-message-form {
-  max-width: 52rem;
-  padding: 20px 22px;
+  padding: clamp(14px, 2vw, 22px);
+}
+
+.guardian-message-columns {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 21rem), 1fr));
+  align-items: start;
+  gap: 20px;
+}
+
+.guardian-message-columns > * {
+  min-width: 0;
+}
+
+.guardian-message-insert,
+.guardian-message-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.guardian-message-insert > span {
+  color: var(--color-muted);
+  font-size: 0.8rem;
+}
+
+.guardian-message-preview {
+  padding: clamp(14px, 2vw, 22px);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-soft);
+}
+
+.guardian-message-preview h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.guardian-message-sample {
+  margin: 4px 0 16px;
+  color: var(--color-muted);
+  font-size: 0.78rem;
+}
+
+.guardian-message-preview-title,
+.guardian-message-preview-body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.guardian-message-preview-title {
+  border-top: 1px solid var(--color-border);
+  padding-top: 16px;
+  margin: 0;
+  font-weight: 700;
+}
+
+.guardian-message-preview-body {
+  margin: 12px 0 0;
+  font-size: 0.9rem;
+  line-height: 1.8;
 }
 
 .form-grid--3 {

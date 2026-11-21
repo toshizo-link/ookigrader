@@ -163,6 +163,7 @@ export interface TemplateSummary {
   questionCount?: number;
   totalPointsMilli?: number;
   defaultPointsMilli?: number;
+  maximumMistakesToPass?: number | null;
   updatedAt?: string;
   revision?: number;
 }

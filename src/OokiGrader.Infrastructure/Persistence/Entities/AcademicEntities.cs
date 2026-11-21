@@ -54,6 +54,7 @@ public sealed class TestTemplateEntity : IRevisionedEntity, IUpdatedEntity
     public string? Source { get; set; }
     public string? Notes { get; set; }
     public long DefaultPointsMilli { get; set; } = 1_000;
+    public int? MaximumMistakesToPass { get; set; }
     public string State { get; set; } = "draft";
     public string? ActiveVersionId { get; set; }
     public string CreatedByStaffUserId { get; set; } = string.Empty;

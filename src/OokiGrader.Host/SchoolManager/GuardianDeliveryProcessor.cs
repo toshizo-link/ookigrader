@@ -126,13 +126,13 @@ public sealed class GuardianDeliveryProcessor(
         var clientInvoked = false;
         try
         {
-            var messageBody = await TryStartAttemptAsync(
+            var message = await TryStartAttemptAsync(
                     delivery.Id,
                     settings,
                     now,
                     cancellationToken)
                 .ConfigureAwait(false);
-            if (messageBody is null)
+            if (message is null)
             {
                 return true;
             }
@@ -149,8 +149,8 @@ public sealed class GuardianDeliveryProcessor(
                         new SchoolManagerCredentials(settings.Username, password),
                         delivery.StudentNumber,
                         delivery.StudentDisplayName,
-                        BuildTitle(delivery.Kind),
-                        messageBody,
+                        message.Title,
+                        message.Body,
                         delivery.AttachmentName,
                         attachment,
                         settings.DryRun),
@@ -331,12 +331,12 @@ public sealed class GuardianDeliveryProcessor(
         return bytes;
     }
 
-    private Task<string?> TryStartAttemptAsync(
+    private Task<GuardianMessage?> TryStartAttemptAsync(
         string deliveryId,
         SchoolManagerSettingsEntity settings,
         DateTimeOffset now,
         CancellationToken cancellationToken) =>
-        writeCoordinator.ExecuteAsync<string?>(async token =>
+        writeCoordinator.ExecuteAsync<GuardianMessage?>(async token =>
         {
             await using var db = await dbContextFactory.CreateDbContextAsync(token)
                 .ConfigureAwait(false);
@@ -362,11 +362,11 @@ public sealed class GuardianDeliveryProcessor(
                 return null;
             }
 
-            var body = delivery.Kind == "result_pdf"
+            var message = delivery.Kind == "result_pdf"
                 ? GuardianResultMessage.Format(delivery,
                     await db.GuardianMessageTemplates.AsNoTracking().SingleOrDefaultAsync(token).ConfigureAwait(false)
                         ?? new GuardianMessageTemplatesEntity())
-                : "合否表を更新しました。氏名と生徒IDを除いた、同じクラスの範囲をお送りします。";
+                : new GuardianMessage("合否表更新のお知らせ", "合否表を更新しました。氏名と生徒IDを除いた、同じクラスの範囲をお送りします。");
             delivery.AttemptCount = checked(delivery.AttemptCount + 1);
             delivery.LastAttemptAt = now;
             delivery.LastErrorCode = null;
@@ -383,7 +383,7 @@ public sealed class GuardianDeliveryProcessor(
 
             await db.SaveChangesAsync(token).ConfigureAwait(false);
             await transaction.CommitAsync(token).ConfigureAwait(false);
-            return body;
+            return message;
         }, cancellationToken);
 
     private Task CompleteDryRunAsync(
@@ -512,10 +512,6 @@ public sealed class GuardianDeliveryProcessor(
             ReasonCode = reasonCode,
             SafeMetadataJson = JsonSerializer.Serialize(new { delivery.Kind, delivery.AttemptCount }),
         };
-
-    private static string BuildTitle(string kind) => kind == "result_pdf"
-        ? "採点結果のお知らせ"
-        : "合否表更新のお知らせ";
 
     // Never copy browser errors into the API: they can contain URLs, field values or student data.
     private static string SafeBrowserFailureDetail(string code) => code switch

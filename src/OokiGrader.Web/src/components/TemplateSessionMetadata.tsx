@@ -9,7 +9,7 @@ export function TemplateSessionMetadata({
 }: {
   template: Pick<
     TemplateSummary,
-    "title" | "subject" | "gradeLabel" | "category" | "course"
+    "title" | "subject" | "gradeLabel" | "category" | "course" | "maximumMistakesToPass"
   >;
 }) {
   return (
@@ -33,6 +33,10 @@ export function TemplateSessionMetadata({
       <div>
         <dt>コース</dt>
         <dd>{displayValue(template.course)}</dd>
+      </div>
+      <div>
+        <dt>合格基準</dt>
+        <dd>{template.maximumMistakesToPass == null ? "未設定" : `${template.maximumMistakesToPass}ミスまで合格`}</dd>
       </div>
     </dl>
   );

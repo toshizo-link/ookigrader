@@ -3189,6 +3189,7 @@ namespace OokiGrader.Infrastructure.Persistence.Migrations
                     b.Property<string>("Id")
                         .HasColumnType("TEXT")
                         .HasColumnName("id");
+                    b.Property<string>("Title").IsRequired().HasColumnType("TEXT").HasColumnName("title");
                     b.Property<string>("Pass").IsRequired().HasColumnType("TEXT").HasColumnName("pass");
                     b.Property<string>("Fail").IsRequired().HasColumnType("TEXT").HasColumnName("fail");
                     b.Property<string>("Unconfigured").IsRequired().HasColumnType("TEXT").HasColumnName("unconfigured");
@@ -5809,6 +5810,10 @@ namespace OokiGrader.Infrastructure.Persistence.Migrations
                     b.Property<string>("GradeLabel")
                         .HasColumnType("TEXT")
                         .HasColumnName("grade_label");
+
+                    b.Property<int?>("MaximumMistakesToPass")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("maximum_mistakes_to_pass");
 
                     b.Property<string>("Notes")
                         .HasColumnType("TEXT")

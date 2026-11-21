@@ -87,8 +87,10 @@ public sealed partial class SchoolManagerAutomationTests
         Assert.Collection(thread.Members,
             sender => Assert.Equal(new Member("orgDepartment", null, "class-a"), sender),
             guardian => Assert.Equal(new Member("parent", "matched-guardian", null), guardian));
-        Assert.Equal("採点結果のお知らせ", thread.Title);
-        Assert.Equal("教科　未設定\nテスト名　社会テスト\n判定　合否基準未設定\n\n採点結果をお送りします。添付のPDFをご確認ください。", thread.Message.Body);
+        Assert.Equal("暗記テスト採点結果のお知らせ", thread.Title);
+        Assert.Equal("いつも大変お世話になっております。\n先日実施いたしました暗記テストの結果をお知らせいたします。\n\n" +
+            "教科：未設定\n範囲：社会テスト\n結果：合否基準未設定\n\n" +
+            "答案をPDFで添付しておりますので、あわせてご確認ください。", thread.Message.Body);
         Assert.Equal(new Attachment(upload.Name, 21001), Assert.Single(thread.Message.AttachedFiles));
         if (scenario == InboxScenario.AcknowledgementLost)
         {

@@ -92,6 +92,8 @@ public static class TemplatesEndpoints
         group.MapPost("/", CreateTemplate)
             .RequireAuthorization("teacher");
         group.MapGet("/{templateId}", GetTemplate);
+        group.MapPut("/{templateId}/pass-criteria", UpdateTemplatePassCriteria)
+            .RequireAuthorization("teacher");
         group.MapDelete("/{templateId}", ArchiveTemplate)
             .RequireAuthorization("teacher");
         group.MapPost("/{templateId}:restore", RestoreTemplate)
@@ -641,6 +643,56 @@ public static class TemplatesEndpoints
 
         ApiHelpers.SetRevisionEtag(context.Response, template.Revision);
         return Results.Ok(ToTemplateSummary(template));
+    }
+
+    private sealed record TemplatePassCriteriaBody(int? MaximumMistakesToPass, long? Revision);
+
+    private static async Task<IResult> UpdateTemplatePassCriteria(
+        string templateId,
+        [FromBody] TemplatePassCriteriaBody request,
+        HttpContext context,
+        ClaimsPrincipal principal,
+        OokiGraderDbContext db,
+        TimeProvider timeProvider,
+        CancellationToken cancellationToken)
+    {
+        if (request.MaximumMistakesToPass is < 0 or > 2000)
+        {
+            return ApiHelpers.Problem(context, StatusCodes.Status422UnprocessableEntity,
+                "PASS_CRITERIA_INVALID", "合格基準を確認してください",
+                "合格にする最大ミス数を0〜2000の整数で指定してください。");
+        }
+
+        var template = await db.TestTemplates.SingleOrDefaultAsync(
+            item => item.Id == templateId, cancellationToken);
+        if (template is null) return Results.NotFound();
+        if (template.State == "archived") return Archived(context);
+        if (!ApiHelpers.TryReadExpectedRevision(context.Request, request.Revision, out var expectedRevision))
+        {
+            return RevisionRequired(context);
+        }
+        if (template.Revision != expectedRevision) return Stale(context, template.Revision);
+
+        if (template.MaximumMistakesToPass != request.MaximumMistakesToPass)
+        {
+            template.MaximumMistakesToPass = request.MaximumMistakesToPass;
+            AddAudit(db, timeProvider.GetUtcNow(), principal, context,
+                "template.pass_criteria_updated", "template", template.Id,
+                new { template.MaximumMistakesToPass });
+            try
+            {
+                await db.SaveChangesAsync(cancellationToken);
+            }
+            catch (DbUpdateConcurrencyException)
+            {
+                var revision = await db.TestTemplates.Where(item => item.Id == templateId)
+                    .Select(item => (long?)item.Revision).SingleOrDefaultAsync(cancellationToken);
+                return Stale(context, revision ?? template.Revision);
+            }
+        }
+
+        ApiHelpers.SetRevisionEtag(context.Response, template.Revision);
+        return Results.Ok(new { template.Id, template.MaximumMistakesToPass, template.Revision });
     }
 
     private static async Task<IResult> ArchiveTemplate(
@@ -2846,6 +2898,7 @@ public static class TemplatesEndpoints
                 CreationSource = "template_publish",
                 TitleOverride = null,
                 TemplateTitleSnapshot = template.Title,
+                MaximumMistakesToPass = template.MaximumMistakesToPass,
                 TemplateSubjectSnapshot = template.Subject,
                 TemplateGradeLabelSnapshot = template.GradeLabel,
                 TemplateCategorySnapshot = template.Category,
@@ -3136,7 +3189,8 @@ public static class TemplatesEndpoints
             template.DefaultPointsMilli,
             template.Versions.Count,
             template.UpdatedAt,
-            template.Revision);
+            template.Revision,
+            template.MaximumMistakesToPass);
     }
 
     private static TemplateVersionResponse ToVersionDetail(
@@ -6075,7 +6129,8 @@ public static class TemplatesEndpoints
         long DefaultPointsMilli,
         int VersionCount,
         DateTimeOffset UpdatedAt,
-        long Revision);
+        long Revision,
+        int? MaximumMistakesToPass);
 
     private sealed record TemplateVersionResponse(
         string Id,

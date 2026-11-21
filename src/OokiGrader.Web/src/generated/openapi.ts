@@ -1777,6 +1777,45 @@ export type paths = {
         readonly patch?: never;
         readonly trace?: never;
     };
+    readonly "/api/v1/templates/{templateId}/pass-criteria": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put: {
+            readonly parameters: {
+                readonly query?: never;
+                readonly header?: never;
+                readonly path: {
+                    readonly templateId: string;
+                };
+                readonly cookie?: never;
+            };
+            readonly requestBody: {
+                readonly content: {
+                    readonly "application/json": components["schemas"]["TemplatePassCriteriaBody"];
+                };
+            };
+            readonly responses: {
+                /** @description OK */
+                readonly 200: {
+                    headers: {
+                        readonly [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
     readonly "/api/v1/templates/{templateId}:restore": {
         readonly parameters: {
             readonly query?: never;
@@ -5526,7 +5565,7 @@ export type paths = {
                         readonly [name: string]: unknown;
                     };
                     content: {
-                        readonly "application/json": components["schemas"]["MessageTemplatesBody"];
+                        readonly "application/json": components["schemas"]["MessageTemplatesResponse"];
                     };
                 };
             };
@@ -5549,7 +5588,9 @@ export type paths = {
                     headers: {
                         readonly [name: string]: unknown;
                     };
-                    content?: never;
+                    content: {
+                        readonly "application/json": components["schemas"]["MessageTemplatesResponse"];
+                    };
                 };
             };
         };
@@ -5798,12 +5839,28 @@ export type components = {
             readonly sourceRevision: number | string;
             readonly status: string;
         };
+        readonly MessageTemplateDefaults: {
+            readonly title: string;
+            readonly pass: string;
+            readonly fail: string;
+            readonly unconfigured: string;
+        };
         readonly MessageTemplatesBody: {
+            readonly title: string;
             readonly pass: string;
             readonly fail: string;
             readonly unconfigured: string;
             /** Format: int64 */
             readonly revision: number | string;
+        };
+        readonly MessageTemplatesResponse: {
+            readonly title: string;
+            readonly pass: string;
+            readonly fail: string;
+            readonly unconfigured: string;
+            /** Format: int64 */
+            readonly revision: number | string;
+            readonly defaults: components["schemas"]["MessageTemplateDefaults"];
         };
         readonly OrderedScanMutationRequest: {
             /** Format: int64 */
@@ -6047,6 +6104,12 @@ export type components = {
         readonly TemplateLifecycleApiRequest: {
             /** Format: int64 */
             readonly revision?: null | number | string;
+        };
+        readonly TemplatePassCriteriaBody: {
+            /** Format: int32 */
+            readonly maximumMistakesToPass: null | number | string;
+            /** Format: int64 */
+            readonly revision: null | number | string;
         };
         /** @enum {unknown} */
         readonly TestType: "hop" | "step" | "classPlacement" | "other";

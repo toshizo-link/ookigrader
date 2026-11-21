@@ -2,10 +2,18 @@ namespace OokiGrader.Infrastructure.Persistence.Entities;
 
 public sealed class GuardianMessageTemplatesEntity : IRevisionedEntity
 {
+    private const string Introduction =
+        "いつも大変お世話になっております。\n先日実施いたしました暗記テストの結果をお知らせいたします。\n\n" +
+        "教科：＜教科＞\n範囲：＜タイトル＞\n結果：＜結果＞\n\n" +
+        "答案をPDFで添付しておりますので、あわせてご確認ください。";
+
     public string Id { get; set; } = "school-manager";
-    public string Pass { get; set; } = "合格おめでとうございます。詳しい採点結果は添付のPDFをご覧ください。";
-    public string Fail { get; set; } = "添付のPDFで間違えた問題を確認し、次のテストに向けて復習しましょう。";
-    public string Unconfigured { get; set; } = "採点結果をお送りします。添付のPDFをご確認ください。";
+    public string Title { get; set; } = "暗記テスト採点結果のお知らせ";
+    public string Pass { get; set; } = Introduction +
+        "\nよく準備して臨むことができました。この調子で、次の範囲にも取り組んでいきましょう。ご家庭でもぜひ声をかけてあげてください。";
+    public string Fail { get; set; } = Introduction +
+        "\n次回の通塾時に、本人の都合のよいタイミングで再テストを受けることができます。それまでに該当範囲をもう一度見直しておくよう、ご家庭でもお声がけいただけますと幸いです。";
+    public string Unconfigured { get; set; } = Introduction;
     public long Revision { get; set; }
 }
 

@@ -806,6 +806,7 @@ public static class TestSessionsEndpoints
             RequestFingerprint = requestKey is null ? null : requestFingerprint,
             TitleOverride = sessionName,
             TemplateTitleSnapshot = version.TestTemplate.Title,
+            MaximumMistakesToPass = version.TestTemplate.MaximumMistakesToPass,
             TemplateSubjectSnapshot = version.TestTemplate.Subject,
             TemplateGradeLabelSnapshot = version.TestTemplate.GradeLabel,
             TemplateCategorySnapshot = version.TestTemplate.Category,

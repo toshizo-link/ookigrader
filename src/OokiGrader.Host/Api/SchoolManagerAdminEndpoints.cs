@@ -21,7 +21,7 @@ public static class SchoolManagerAdminEndpoints
         group.MapGet("/", GetSettingsAsync);
         group.MapPut("/", SaveSettingsAsync);
         group.MapGet("/message-templates", GetMessageTemplatesAsync);
-        group.MapPut("/message-templates", SaveMessageTemplatesAsync);
+        group.MapPut("/message-templates", SaveMessageTemplatesAsync).Produces<MessageTemplatesResponse>();
         group.MapGet("/deliveries", ListDeliveriesAsync);
         return endpoints;
     }
@@ -201,19 +201,21 @@ public static class SchoolManagerAdminEndpoints
         });
     }
 
-    private static async Task<MessageTemplatesBody> GetMessageTemplatesAsync(
+    private static async Task<MessageTemplatesResponse> GetMessageTemplatesAsync(
         OokiGraderDbContext db, CancellationToken cancellationToken) =>
-        MessageTemplatesBody.From(await db.GuardianMessageTemplates.AsNoTracking().SingleOrDefaultAsync(cancellationToken)
+        MessageTemplatesResponse.From(await db.GuardianMessageTemplates.AsNoTracking().SingleOrDefaultAsync(cancellationToken)
             ?? new GuardianMessageTemplatesEntity());
 
     private static async Task<IResult> SaveMessageTemplatesAsync(
         HttpContext context, ClaimsPrincipal principal, [FromBody] MessageTemplatesBody request,
         OokiGraderDbContext db, TimeProvider timeProvider, CancellationToken cancellationToken)
     {
-        if (!IsValidParagraph(request.Pass) || !IsValidParagraph(request.Fail) || !IsValidParagraph(request.Unconfigured))
+        if (string.IsNullOrWhiteSpace(request.Title) || request.Title.Length > 100
+            || request.Title.Any(c => char.IsControl(c) || c is '\u2028' or '\u2029')
+            || !IsValidBody(request.Pass) || !IsValidBody(request.Fail) || !IsValidBody(request.Unconfigured))
         {
             return ApiHelpers.Problem(context, StatusCodes.Status422UnprocessableEntity,
-                "MESSAGE_TEMPLATE_INVALID", "文面を保存できませんでした", "各文面は1,000文字以内で入力してください。");
+                "MESSAGE_TEMPLATE_INVALID", "文面を保存できませんでした", "件名は1行100文字以内、各本文は2,000文字以内で入力してください。");
         }
 
         await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
@@ -229,9 +231,10 @@ public static class SchoolManagerAdminEndpoints
             templates = new GuardianMessageTemplatesEntity();
             db.GuardianMessageTemplates.Add(templates);
         }
-        templates.Pass = request.Pass.ReplaceLineEndings("\n").Trim();
-        templates.Fail = request.Fail.ReplaceLineEndings("\n").Trim();
-        templates.Unconfigured = request.Unconfigured.ReplaceLineEndings("\n").Trim();
+        templates.Title = request.Title.Trim();
+        templates.Pass = request.Pass.ReplaceLineEndings("\n");
+        templates.Fail = request.Fail.ReplaceLineEndings("\n");
+        templates.Unconfigured = request.Unconfigured.ReplaceLineEndings("\n");
         var now = timeProvider.GetUtcNow();
         db.AuditEvents.Add(new AuditEventEntity
         {
@@ -246,16 +249,26 @@ public static class SchoolManagerAdminEndpoints
         });
         await db.SaveChangesAsync(cancellationToken);
         await transaction.CommitAsync(cancellationToken);
-        return Results.Ok(MessageTemplatesBody.From(templates));
+        return Results.Ok(MessageTemplatesResponse.From(templates));
     }
 
-    private static bool IsValidParagraph(string? value) =>
-        value is { Length: <= 1_000 } && !value.Any(c => char.IsControl(c) && c is not ('\n' or '\r' or '\t'));
+    private static bool IsValidBody(string? value) =>
+        !string.IsNullOrWhiteSpace(value) && value.ReplaceLineEndings("\n").Length <= 2_000
+        && !value.Any(c => char.IsControl(c) && c is not ('\n' or '\r' or '\t'));
 
-    public sealed record MessageTemplatesBody(string Pass, string Fail, string Unconfigured, long Revision)
+    public sealed record MessageTemplatesBody(string Title, string Pass, string Fail, string Unconfigured, long Revision);
+
+    public sealed record MessageTemplateDefaults(string Title, string Pass, string Fail, string Unconfigured);
+
+    public sealed record MessageTemplatesResponse(
+        string Title, string Pass, string Fail, string Unconfigured, long Revision, MessageTemplateDefaults Defaults)
     {
-        internal static MessageTemplatesBody From(GuardianMessageTemplatesEntity templates) =>
-            new(templates.Pass, templates.Fail, templates.Unconfigured, templates.Revision);
+        internal static MessageTemplatesResponse From(GuardianMessageTemplatesEntity templates)
+        {
+            var defaults = new GuardianMessageTemplatesEntity();
+            return new(templates.Title, templates.Pass, templates.Fail, templates.Unconfigured, templates.Revision,
+                new(defaults.Title, defaults.Pass, defaults.Fail, defaults.Unconfigured));
+        }
     }
 
     private static async Task<IResult> ListDeliveriesAsync(

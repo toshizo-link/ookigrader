@@ -83,6 +83,61 @@ public sealed class TemplateWorkflowTests
             (await application.SendAsync(HttpMethod.Put, url, "teacher", update)).StatusCode);
     }
 
+    [Fact]
+    public async Task TemplatePassCriteriaAppliesToNewReceptionsAndKeepsEarlierCriteria()
+    {
+        await using var application = await TemplateTestApplication.CreateAsync();
+        var (templateId, versionId) = await CreateTemplateAndVersionAsync(application);
+        var url = $"/api/v1/templates/{templateId}";
+        var versionUrl = $"{url}/versions/{versionId}";
+        var draft = await application.SendAsync(HttpMethod.Get, url, "teacher");
+        var update = new { maximumMistakesToPass = 4 };
+        var originalEtag = RequiredEtag(draft);
+        Assert.Equal(HttpStatusCode.Forbidden, (await application.SendAsync(
+            HttpMethod.Put, $"{url}/pass-criteria", "scanOperator", update, originalEtag)).StatusCode);
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, (await application.SendAsync(
+            HttpMethod.Put, $"{url}/pass-criteria", "teacher", new { maximumMistakesToPass = -1 }, originalEtag)).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await application.SendAsync(
+            HttpMethod.Put, $"{url}/pass-criteria", "teacher", update, originalEtag)).StatusCode);
+        Assert.Equal(HttpStatusCode.PreconditionFailed, (await application.SendAsync(
+            HttpMethod.Put, $"{url}/pass-criteria", "teacher", update, originalEtag)).StatusCode);
+        var template = await ReadJsonAsync(await application.SendAsync(HttpMethod.Get, url, "teacher"));
+        Assert.Equal(4, template.GetProperty("maximumMistakesToPass").GetInt32());
+
+        Assert.Equal(HttpStatusCode.Created, (await application.SendAsync(HttpMethod.Post,
+            $"{versionUrl}/questions", "teacher", ExactQuestionRequest("次の語を漢字で書きなさい。", 1_000))).StatusCode);
+        var version = await application.SendAsync(HttpMethod.Get, versionUrl, "teacher");
+        var published = await application.SendAsync(HttpMethod.Post, $"{versionUrl}:publish",
+            "teacher", new { testDate = (string?)null }, RequiredEtag(version));
+        Assert.Equal(HttpStatusCode.OK, published.StatusCode);
+        var originalSession = RequiredString((await ReadJsonAsync(published)).GetProperty("testSession"), "id");
+
+        var afterPublish = await application.SendAsync(HttpMethod.Get, url, "teacher");
+        var saved = await application.SendAsync(HttpMethod.Put, $"{url}/pass-criteria", "teacher",
+            new { maximumMistakesToPass = 0 }, RequiredEtag(afterPublish));
+        Assert.Equal(HttpStatusCode.OK, saved.StatusCode);
+        var create = new { templateVersionId = versionId, openImmediately = true };
+        var second = await application.SendAsync(HttpMethod.Post, "/api/v1/test-sessions",
+            "teacher", create, idempotencyKey: UlidId.New());
+        Assert.Equal(HttpStatusCode.Created, second.StatusCode);
+        var secondId = RequiredString(await ReadJsonAsync(second), "id");
+        Assert.Equal(HttpStatusCode.OK, (await application.SendAsync(HttpMethod.Put, $"{url}/pass-criteria",
+            "teacher", new { maximumMistakesToPass = (int?)null }, RequiredEtag(saved))).StatusCode);
+        var third = await application.SendAsync(HttpMethod.Post, "/api/v1/test-sessions",
+            "teacher", create, idempotencyKey: UlidId.New());
+        Assert.Equal(HttpStatusCode.Created, third.StatusCode);
+        var thirdId = RequiredString(await ReadJsonAsync(third), "id");
+
+        await application.WithDatabaseAsync(async db =>
+        {
+            var sessions = await db.TestSessions.ToDictionaryAsync(item => item.Id);
+            Assert.Equal(4, sessions[originalSession].MaximumMistakesToPass);
+            Assert.Equal(0, sessions[secondId].MaximumMistakesToPass);
+            Assert.Null(sessions[thirdId].MaximumMistakesToPass);
+            Assert.Null((await db.TestTemplates.SingleAsync(item => item.Id == templateId)).MaximumMistakesToPass);
+        });
+    }
+
     [Theory]
     [InlineData("中1社会_問題用紙.pdf", "blank_test", 9_000)]
     [InlineData("中1社会_模範解答.pdf", "separate_answer_key", 9_500)]
