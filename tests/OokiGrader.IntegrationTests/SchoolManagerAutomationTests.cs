@@ -200,7 +200,7 @@ public sealed partial class SchoolManagerAutomationTests
         await using var db = await fixture.CreateDbContextAsync();
         var original = await db.GuardianDeliveries.Include(item => item.ExportRecord).SingleAsync();
         var previousExport = original.ExportRecord!;
-        previousExport.RendererVersion = "pdfsharp-6.2.4-layout-3";
+        previousExport.RendererVersion = "pdfsharp-6.2.4-layout-4";
         original.State = state;
         original.LastDryRunAt = fixture.Now;
         await db.SaveChangesAsync();

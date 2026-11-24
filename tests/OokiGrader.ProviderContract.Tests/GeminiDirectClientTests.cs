@@ -32,6 +32,9 @@ public sealed class GeminiDirectClientTests
 
     [Theory]
     [InlineData(503, 3)]
+    [InlineData(500, 1)]
+    [InlineData(502, 1)]
+    [InlineData(504, 1)]
     [InlineData(429, 1)]
     [InlineData(403, 1)]
     [InlineData(400, 1)]
@@ -47,6 +50,46 @@ public sealed class GeminiDirectClientTests
             Connection(), Encoding.UTF8.GetBytes("test-key"), RetryRequest()));
         Assert.Equal(expectedCalls, calls);
         if (status == 503) Assert.Equal(503, exception.HttpStatusCode);
+    }
+
+    [Theory]
+    [InlineData("""{"error":{"code":500,"status":"INTERNAL"}}""", 3)]
+    [InlineData("""{"error":{"code":503,"status":"INTERNAL"}}""", 1)]
+    [InlineData("""{"error":"INTERNAL"}""", 1)]
+    [InlineData("<html>Internal error</html>", 1)]
+    public async Task InternalErrorsRetryOnlyWhenGeminiConfirmsRejection(string envelope, int expectedCalls)
+    {
+        var calls = 0;
+        var client = new GeminiDirectClient(new HttpClient(new DelegateHandler((_, _) =>
+        {
+            calls++;
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.InternalServerError)
+                { Content = new StringContent(envelope) });
+        })), (_, _) => Task.CompletedTask);
+        var error = await Assert.ThrowsAsync<AiProviderException>(() => client.GenerateAsync(
+            Connection(), Encoding.UTF8.GetBytes("test-key"), RetryRequest()));
+        Assert.Equal(expectedCalls, calls);
+        Assert.Equal(expectedCalls == 3 ? "gemini_internal_error" : "gemini_provider_unavailable", error.SafeErrorCode);
+        Assert.Equal(500, error.HttpStatusCode);
+    }
+
+    [Fact]
+    public async Task ServiceRetryDelayIsHonoredOrReturnsTheExplicitFailureIfItExceedsDeadline()
+    {
+        var delays = new List<TimeSpan>();
+        var calls = 0;
+        var client = new GeminiDirectClient(new HttpClient(new DelegateHandler((_, _) =>
+        {
+            calls++;
+            var response = new HttpResponseMessage(HttpStatusCode.ServiceUnavailable);
+            response.Headers.RetryAfter = new(TimeSpan.FromSeconds(calls == 1 ? 9 : 75));
+            return Task.FromResult(response);
+        })), (delay, _) => { delays.Add(delay); return Task.CompletedTask; });
+        var error = await Assert.ThrowsAsync<AiProviderException>(() =>
+            client.GenerateAsync(Connection(), Encoding.UTF8.GetBytes("test-key"), RetryRequest()));
+        Assert.Equal(503, error.HttpStatusCode);
+        Assert.Equal(2, calls);
+        Assert.InRange(Assert.Single(delays).TotalSeconds, 9, 9.25);
     }
 
     [Fact]

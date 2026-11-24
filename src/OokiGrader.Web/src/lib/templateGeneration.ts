@@ -458,7 +458,12 @@ export function deterministicPlanMessage(
 }
 
 const aiFailureMessages: Record<string, string> = {
+  AI_PROFILE_MISSING: "ひな形作成に使用できるAI設定がありません。管理者が「管理」→「AI設定」で接続を確認してから再試行してください。",
   AI_PROVIDER_UNAVAILABLE: "AIサービスを利用できませんでした。時間を置いて失敗した項目だけ再試行してください。",
+  AI_SERVICE_BUSY: "AIサービス側で処理を完了できませんでした。少し時間を置いて再試行してください。",
+  AI_CONNECTION_INTERRUPTED: "AIサービスとの通信が途中で切れました。ホストPCのインターネット接続を確認して再試行してください。",
+  AI_QUOTA_FALLBACK_UNAVAILABLE: "使用モデルが利用上限に達し、予備モデルでも処理を完了できませんでした。時間を置いて再試行してください。",
+  AI_GENERATION_INTERRUPTED: "前回の生成が中断されました。元のPDFのまま再試行できます。",
   AI_AUTHENTICATION_FAILED: "AI接続の認証に失敗しました。「管理」→「AI設定」で接続を再確認してください。",
   AI_MODEL_UNAVAILABLE: "設定されたAIモデルを利用できません。「管理」→「AI設定」でモデル名と接続を確認してください。",
   AI_CONFIGURATION_INVALID: "AI接続設定を確認できませんでした。「管理」→「AI設定」で接続を再確認してください。",

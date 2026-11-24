@@ -403,6 +403,14 @@ describe("AdminPage AI configuration", () => {
     expect(queryState.profilesReload).toHaveBeenCalledOnce();
   });
 
+  it("keeps a temporary service error distinct from hitting the project's usage limit", async () => {
+    queryState.connections = [configuredGeminiConnection()];
+    apiState.post.mockResolvedValue({ state: "failed", safeErrorCode: "gemini_provider_unavailable", previousConfigurationRetained: true });
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: "再確認" }));
+    expect(await screen.findByText("Gemini側の一時エラーで接続を確認できませんでした。前回確認できた接続設定を引き続き使います。")).toBeVisible();
+  });
+
   it("does not claim that OpenRouter recheck enables Gemini AI profiles", async () => {
     queryState.connections = [configuredOpenRouterConnection()];
     apiState.post.mockResolvedValue({

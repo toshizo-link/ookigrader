@@ -9,7 +9,7 @@ namespace OokiGrader.Host.Jobs;
 /// <summary>
 /// Code-owned task routing for the default Gemini connection. RequestedModel
 /// remains the preferred model; ActualModel records the dispatched model.
-/// Explicit quota rejection or repeated HTTP 503 permits completing work on Lite.
+/// Explicit quota rejection or repeated service failure permits completing work on Lite.
 /// </summary>
 internal sealed class GeminiTaskRoutingClient(
     IAiProviderClient direct, GeminiQuotaCooldownStore cooldowns) : IAiProviderClient
@@ -44,15 +44,24 @@ internal sealed class GeminiTaskRoutingClient(
         // quota rejection before spending another request on the same model.
         var gate = _gates.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
         var fallbackReason = QuotaReason;
+        var primaryServiceRejected = false;
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            if (!await cooldowns.IsCoolingDownAsync(key, cancellationToken))
+            var quotaLimited = await cooldowns.IsCoolingDownAsync(key, cancellationToken);
+            if (!quotaLimited && cooldowns.PrefersAvailableLite(key))
+                fallbackReason = ServiceReason;
+            else if (!quotaLimited)
             {
                 try
                 {
+                    // A dense extraction can spend most of the timeout on the
+                    // first 503. Give the alternate its own attempt as soon as
+                    // the preferred model explicitly rejects the full document.
+                    var primaryRequest = request.TaskType == AiTaskTypes.TemplateExtraction
+                        ? request with { RetryServiceFailures = false } : request;
                     return await direct.GenerateAsync(connection, credentialUtf8,
-                        request, cancellationToken).ConfigureAwait(false);
+                        primaryRequest, cancellationToken).ConfigureAwait(false);
                 }
                 catch (AiProviderException exception)
                     when (exception.Kind == AiFailureKind.RateLimited)
@@ -62,20 +71,34 @@ internal sealed class GeminiTaskRoutingClient(
                 }
                 catch (AiProviderException exception)
                     when (exception.Kind == AiFailureKind.TransientProvider
-                        && exception.HttpStatusCode == 503)
+                        && GeminiDirectClient.IsExplicitServiceFailure(exception.HttpStatusCode, exception.SafeErrorCode))
                 {
-                    // The direct client already exhausted its bounded retries.
                     // Only explicit rejected responses permit resending work;
                     // network/timeouts have unknown outcomes and still surface.
-                    // No quota cooldown: the next job tries the preferred model.
                     fallbackReason = ServiceReason;
+                    primaryServiceRejected = true;
                 }
             }
         }
         finally { gate.Release(); }
 
-        return await GenerateLightAsync(connection, credentialUtf8, request,
-            fallbackReason, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var fallback = await GenerateLightAsync(connection, credentialUtf8, request,
+                fallbackReason, cancellationToken).ConfigureAwait(false);
+            if (primaryServiceRejected) cooldowns.PreferAvailableLite(key);
+            return fallback;
+        }
+        catch (AiProviderException exception) when (fallbackReason == ServiceReason && !primaryServiceRejected)
+        {
+            cooldowns.ClearAvailableLite(key);
+            // If the recently healthy fallback explicitly rejected this work, the
+            // preferred model may have recovered. Never resend on an ambiguous reply.
+            if (exception.Kind != AiFailureKind.RateLimited
+                && !GeminiDirectClient.IsExplicitServiceFailure(exception.HttpStatusCode, exception.SafeErrorCode))
+                throw;
+            return await direct.GenerateAsync(connection, credentialUtf8, request, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     public async Task<AiCapabilityProbeResult> ProbeAsync(
@@ -89,6 +112,7 @@ internal sealed class GeminiTaskRoutingClient(
 
         var key = CredentialScope(credentialUtf8);
         var coolingDown = await cooldowns.IsCoolingDownAsync(key, cancellationToken);
+        var primaryUnavailable = false;
         if (!coolingDown)
         {
             var primary = await direct.ProbeAsync(connection, credentialUtf8,
@@ -98,14 +122,22 @@ internal sealed class GeminiTaskRoutingClient(
                 if (primary.SafeErrorCode == "gemini_rate_limited")
                     await cooldowns.RecordAsync(key, primary.RetryAfter,
                         cancellationToken).ConfigureAwait(false);
-                else if (primary.HttpStatusCode != 503) return primary;
+                else if (!GeminiDirectClient.IsExplicitServiceFailure(primary.HttpStatusCode, primary.SafeErrorCode))
+                    return primary;
+                else primaryUnavailable = true;
             }
+            else cooldowns.ClearAvailableLite(key);
         }
         // Lite must pass the same image/JSON capability check. The default
         // connection can remain usable while its preferred model is throttled.
-        return await direct.ProbeAsync(connection with
+        var lite = await direct.ProbeAsync(connection with
         { ModelId = AiProviderCatalog.GeminiLightModelId }, credentialUtf8,
             cancellationToken).ConfigureAwait(false);
+        if (primaryUnavailable && lite is { State: "passed", Authentication: true, ModelAvailable: true,
+                ImageInput: true, StructuredOutput: true, UsageMetadata: true })
+            cooldowns.PreferAvailableLite(key);
+        else if (lite.State != "passed") cooldowns.ClearAvailableLite(key);
+        return lite;
     }
 
     private async Task<AiProviderResponse> GenerateLightAsync(
@@ -118,8 +150,18 @@ internal sealed class GeminiTaskRoutingClient(
         // supported reasoning level without splitting the page request.
         if (request.TaskType == AiTaskTypes.TemplateExtraction)
             request = request with { ThinkingLevel = "HIGH" };
-        var response = await direct.GenerateAsync(settings, credential, request, token)
-            .ConfigureAwait(false);
+        AiProviderResponse response;
+        try
+        {
+            response = await direct.GenerateAsync(settings, credential, request, token).ConfigureAwait(false);
+        }
+        catch (AiProviderException exception) when (reason == QuotaReason)
+        {
+            // Keep the fallback's classification and billing uncertainty while recording
+            // that a known quota rejection (possibly an active cooldown) led us here.
+            throw new AiProviderException(exception.Kind, exception.SafeErrorCode, exception.IsTransient,
+                exception.RetryAfter, exception, exception.HttpStatusCode, modelRoutingReason: reason);
+        }
         AiResponseMetadataValidator.Validate(response, Provider, settings.ModelId);
         return response with
         {
@@ -140,6 +182,17 @@ internal sealed class GeminiTaskRoutingClient(
 /// </summary>
 internal sealed class GeminiQuotaCooldownStore(string directory, TimeProvider clock)
 {
+    // Capacity is short-lived and is independent of the durable quota cooldown.
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _availableLiteUntil = new();
+
+    internal bool PrefersAvailableLite(string key) =>
+        _availableLiteUntil.TryGetValue(key, out var until) && clock.GetUtcNow() < until;
+
+    internal void PreferAvailableLite(string key) =>
+        _availableLiteUntil[key] = clock.GetUtcNow().AddMinutes(5);
+
+    internal void ClearAvailableLite(string key) => _availableLiteUntil.TryRemove(key, out _);
+
     public async Task<bool> IsCoolingDownAsync(string key, CancellationToken token)
     {
         try

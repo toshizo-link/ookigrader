@@ -58,6 +58,7 @@ interface AiConnection {
 
 interface AiCapabilityProbeResult {
   state: string;
+  previousConfigurationRetained?: boolean;
   authentication: boolean;
   modelAvailable: boolean;
   imageInput: boolean;
@@ -69,6 +70,13 @@ interface AiCapabilityProbeResult {
 
 const geminiDefaultModel = "gemini-3.7-flash";
 const deepSeekV4FlashModel = "deepseek/deepseek-v4-flash";
+const temporaryGeminiProbeErrors: Record<string, string> = {
+  gemini_rate_limited: "Gemini APIの利用上限に達しました。",
+  gemini_provider_unavailable: "Gemini側の一時エラーで接続を確認できませんでした。",
+  gemini_internal_error: "Gemini側の一時エラーで接続を確認できませんでした。",
+  gemini_timeout: "Geminiの応答が確認時間内に届きませんでした。",
+  gemini_network_error: "Geminiとの通信が途切れました。",
+};
 
 interface AiTaskProfile {
   id: string;
@@ -1037,12 +1045,13 @@ function AiConfigurationView({
           "DeepSeek V4 Flash / 0731 はテキスト専用です。画像入力を使うOoki Graderでは、接続確認により利用不可としてブロックされました。",
         );
       } else {
+        const temporary = result.safeErrorCode && temporaryGeminiProbeErrors[result.safeErrorCode];
         const code = result.safeErrorCode
           ? `（${result.safeErrorCode}）`
           : "";
-        setError(
-          `${aiProviderLabel(connection.provider)}には接続しましたが、認証・モデル・画像入力・構造化出力・使用量情報をすべて確認できないため利用できません${code}。`,
-        );
+        setError(temporary
+          ? temporary + (result.previousConfigurationRetained ? "前回確認できた接続設定を引き続き使います。" : "時間を置いて再確認してください。")
+          : `${aiProviderLabel(connection.provider)}の認証・モデル・画像入力・構造化出力・使用量情報をすべて確認できないため利用できません${code}。`);
       }
       connections.reload();
       profiles.reload();

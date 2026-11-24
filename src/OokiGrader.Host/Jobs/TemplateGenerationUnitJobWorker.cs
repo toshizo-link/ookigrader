@@ -131,7 +131,7 @@ public sealed partial class TemplateGenerationUnitJobWorker : BackgroundService
         {
             if (lease.RecoveryOnly)
             {
-                throw new UnitJobException("AI_PROVIDER_UNAVAILABLE");
+                throw new UnitJobException("AI_GENERATION_INTERRUPTED");
             }
 
             claim = await PrepareAsync(lease, cancellationToken)
@@ -143,7 +143,7 @@ public sealed partial class TemplateGenerationUnitJobWorker : BackgroundService
 
             if (!_providerFeaturePolicy.IsEnabled(claim.Connection.Provider))
             {
-                throw new UnitJobException("AI_PROVIDER_UNAVAILABLE");
+                throw new UnitJobException("AI_PROFILE_MISSING");
             }
 
             currentMedia = await ExtractDerivedAsync(
@@ -156,7 +156,8 @@ public sealed partial class TemplateGenerationUnitJobWorker : BackgroundService
                     cancellationToken)
                 .ConfigureAwait(false);
 
-            var first = await ExecuteAttemptAsync(
+            var first = await TryResumeBeforeAuditAsync(claim, currentMedia, cancellationToken)
+                .ConfigureAwait(false) ?? await ExecuteAttemptAsync(
                     claim,
                     currentMedia,
                     attemptNumber: 1,
@@ -231,7 +232,7 @@ public sealed partial class TemplateGenerationUnitJobWorker : BackgroundService
                 const string auditInstruction = "INDEPENDENT INVENTORY AUDIT. Re-read the original page pixels from the beginning. Independently tally physical curricular answer slots by printed section, then extract every slot in order. Do not reuse or assume any prior count. Check all returned target placeholders, filled_answer_removed flags and exact visible model-answer text. Return the complete schema, not a patch.";
                 var audit = await ExecuteAttemptAsync(claim, currentMedia,
                     attemptNumber: 3, rotationsWereApplied: orientationRetryStarted,
-                    retryOfRequestId: selected.RequestId, credential.Utf8Bytes,
+                    retryOfRequestId: selected.PreviousAuditId ?? selected.RequestId, credential.Utf8Bytes,
                     cancellationToken, auditInstruction).ConfigureAwait(false);
                 if (audit.ProviderCallMade) providerCallCount++;
                 if (audit.Extraction.Action != TemplateExtractionAction.Extract
@@ -595,6 +596,7 @@ public sealed partial class TemplateGenerationUnitJobWorker : BackgroundService
             var file = sourceReference.FileObject;
             return new UnitClaim(
                 lease.Id,
+                payload.PreviousFailedJobId,
                 lease.CorrelationId,
                 unit.Id,
                 unit.BatchId,
@@ -614,6 +616,8 @@ public sealed partial class TemplateGenerationUnitJobWorker : BackgroundService
                 ToMediaResolution(taskProfile.MediaResolution),
                 ToThinkingLevel(taskProfile.ThinkingLevel),
                 taskProfile.AiConnection.SecretReference,
+                taskProfile.AiConnection.CredentialRevision,
+                taskProfile.AiConnection.UpdatedAt,
                 new AiConnectionSettings(
                     taskProfile.AiConnection.Id,
                     taskProfile.AiConnection.Provider,
@@ -716,6 +720,79 @@ public sealed partial class TemplateGenerationUnitJobWorker : BackgroundService
             }),
         }),
     };
+
+    // An explicit retry may continue at the independent audit. The original request
+    // key stays attached to its accepted response and its original cost reservation.
+    private async Task<AttemptResult?> TryResumeBeforeAuditAsync(UnitClaim claim, DerivedPdfResult media,
+        CancellationToken cancellationToken)
+    {
+        if (claim.PreviousFailedJobId is null) return null;
+        var previousPrefix = GetGenerationRunRequestKeyPrefix(claim.PreviousFailedJobId);
+        await using var db = await _dbContextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var audit = await db.AiRequests.AsNoTracking()
+            .Where(request => request.EntityType == "template_generation_unit" && request.EntityId == claim.UnitId
+                && request.Purpose == AiTaskTypes.TemplateExtraction && request.RequestKey.StartsWith(previousPrefix))
+            .OrderByDescending(request => request.AttemptNumber)
+            .Select(request => new { request.Id, request.AttemptNumber, request.State, request.ErrorCode, request.SafeErrorDetail, request.RetryOfAiRequestId })
+            .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        if (audit is not { AttemptNumber: 3, State: "failed", RetryOfAiRequestId: not null }
+            || !CanRetryAudit(audit.ErrorCode, audit.SafeErrorDetail))
+        {
+            return null;
+        }
+
+        var parentId = audit.RetryOfAiRequestId;
+        AiRequestEntity? original = null;
+        // A teacher can retry more than once during an outage. Follow only failed
+        // audits in this unit's linear provenance chain, with a bounded lookup.
+        for (var depth = 0; depth < 16 && parentId is not null; depth++)
+        {
+            var parent = await db.AiRequests.AsNoTracking().SingleOrDefaultAsync(request =>
+                request.Id == parentId && request.EntityType == "template_generation_unit" && request.EntityId == claim.UnitId
+                && request.Purpose == AiTaskTypes.TemplateExtraction && request.AiTaskProfileId == claim.TaskProfileId
+                && request.TaskProfileRevision == claim.TaskProfileRevision, cancellationToken).ConfigureAwait(false);
+            if (parent is { AttemptNumber: 1, State: "succeeded" })
+            {
+                original = parent;
+                break;
+            }
+            if (parent is not { AttemptNumber: 3, State: "failed" } || !CanRetryAudit(parent.ErrorCode, parent.SafeErrorDetail)) return null;
+            parentId = parent.RetryOfAiRequestId;
+        }
+        if (original?.ValidatedResponseJson is not { } json || json.Length > _options.MaximumStoredResponseCharacters
+            || !string.Equals(original.AcceptedResponseHash, Sha256(json), StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        var instruction = TemplateExtractionInstructionBuilder.Build(original.RequestKey, claim.UnitId, claim.Profile, false);
+        if (!MatchesUnitInput(original, claim, media, instruction))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            var response = ValidateEnvelope(document.RootElement, original.RequestKey, instruction, claim.Profile);
+            if (response.Extraction is not { } candidate || NeedsRepair(candidate)
+                || !TemplateExtractionResponseValidator.RequiresIndependentSlotAudit(candidate))
+            {
+                return null;
+            }
+            return new AttemptResult(original.Id, instruction, response, ProviderCallMade: false, PreviousAuditId: audit.Id);
+        }
+        catch (Exception error) when (error is InvalidDataException or JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static bool CanRetryAudit(string? errorCode, string? safeDetail) => errorCode is
+        "AI_TIMEOUT" or "AI_SERVICE_BUSY" or "AI_RATE_LIMITED" or "AI_CONNECTION_INTERRUPTED" or "AI_QUOTA_FALLBACK_UNAVAILABLE"
+        // Version 0.9.24 used this code for transient provider failures and recovered
+        // uncertain dispatches. Only the former were recorded without a safe detail.
+        || (errorCode == "AI_PROVIDER_UNAVAILABLE" && safeDetail is null);
 
     private async Task<AttemptResult> ExecuteAttemptAsync(
         UnitClaim claim,
@@ -904,42 +981,32 @@ public sealed partial class TemplateGenerationUnitJobWorker : BackgroundService
                 .ConfigureAwait(false);
             if (existing is not null)
             {
+                if (existing.State != "succeeded" || existing.ValidatedResponseJson is null)
+                {
+                    throw new UnitJobException(
+                        existing.State == "dispatching"
+                            ? "AI_GENERATION_INTERRUPTED"
+                            : existing.ErrorCode ?? "TEMPLATE_EXTRACTION_FAILED");
+                }
                 var existingInstruction = TemplateExtractionInstructionBuilder.Build(
                     existing.RequestKey,
                     claim.UnitId,
                     claim.Profile,
                     rotationsWereApplied,
                     qualityControlInstruction);
-                var expectedHash = ComputeUnitInputHash(
-                    claim,
-                    media,
-                    existingInstruction,
-                    attemptNumber);
-                if (!string.Equals(
-                        existing.InputManifestHash,
-                        expectedHash,
-                        StringComparison.Ordinal))
+                if (!MatchesUnitInput(existing, claim, media, existingInstruction))
                 {
                     throw new UnitJobException("SOURCE_CHANGED");
                 }
 
-                if (existing.State == "succeeded"
-                    && existing.ValidatedResponseJson is not null)
-                {
-                    await transaction.CommitAsync(token).ConfigureAwait(false);
-                    return new AttemptPreparation(
-                        existing.Id,
-                        existing.RequestKey,
-                        existingInstruction,
-                        Pricing: null,
-                        UsdToJpyMicros: 150_000_000,
-                        existing.ValidatedResponseJson);
-                }
-
-                throw new UnitJobException(
-                    existing.State == "dispatching"
-                        ? "AI_PROVIDER_UNAVAILABLE"
-                        : existing.ErrorCode ?? "TEMPLATE_EXTRACTION_FAILED");
+                await transaction.CommitAsync(token).ConfigureAwait(false);
+                return new AttemptPreparation(
+                    existing.Id,
+                    existing.RequestKey,
+                    existingInstruction,
+                    Pricing: null,
+                    UsdToJpyMicros: 150_000_000,
+                    existing.ValidatedResponseJson);
             }
 
             var requestId = _ids.NewId();
@@ -1881,7 +1948,7 @@ public sealed partial class TemplateGenerationUnitJobWorker : BackgroundService
         {
             request.State = "failed";
             request.PossibleDuplicate = true;
-            request.ErrorCode = "AI_PROVIDER_UNAVAILABLE";
+            request.ErrorCode = "AI_GENERATION_INTERRUPTED";
             request.SafeErrorDetail = "recovered_dispatching_request";
             request.CompletedAt ??= now;
             request.UpdatedAt = now;
@@ -2113,12 +2180,18 @@ public sealed partial class TemplateGenerationUnitJobWorker : BackgroundService
     private static string ProviderFailureCode(AiProviderException exception) =>
         exception.SafeErrorCode switch
         {
+            _ when exception.ModelRoutingReason == GeminiTaskRoutingClient.QuotaReason
+                && exception.Kind is AiFailureKind.TransientProvider or AiFailureKind.Timeout =>
+                "AI_QUOTA_FALLBACK_UNAVAILABLE",
             "gemini_model_not_found" => "AI_MODEL_UNAVAILABLE",
             "gemini_response_schema_invalid" => "AI_RESPONSE_SCHEMA_REJECTED",
             "gemini_thinking_config_invalid" => "AI_THINKING_CONFIG_INVALID",
             "gemini_media_invalid" or "gemini_inline_request_too_large" =>
                 "AI_MEDIA_INVALID",
             "gemini_output_limit_exceeded" => "AI_OUTPUT_LIMIT_EXCEEDED",
+            "gemini_network_error" or "openrouter_network_error" => "AI_CONNECTION_INTERRUPTED",
+            "gemini_internal_error" or "gemini_provider_unavailable" or "openrouter_provider_unavailable" =>
+                "AI_SERVICE_BUSY",
             _ => exception.Kind switch
             {
                 AiFailureKind.Authentication => "AI_AUTHENTICATION_FAILED",
@@ -2143,6 +2216,9 @@ public sealed partial class TemplateGenerationUnitJobWorker : BackgroundService
         "SOURCE_CHANGED" => "元PDFまたは生成設定が変更されました。",
         "DERIVED_SOURCE_FAILED" => "PDFの分割または向き補正に失敗しました。",
         "AI_PROVIDER_UNAVAILABLE" => "AIサービスを利用できませんでした。",
+        "AI_SERVICE_BUSY" => "AIサービスでサーバーエラーが発生しました。時間を置いて失敗した項目を再試行してください。",
+        "AI_CONNECTION_INTERRUPTED" => "AIサービスとの通信が途切れ、生成結果を受け取れませんでした。ホストPCの通信を確認して再試行してください。",
+        "AI_GENERATION_INTERRUPTED" => "生成処理が中断しました。ホストPCでOoki Graderが起動していることを確認して再試行してください。",
         "AI_AUTHENTICATION_FAILED" =>
             "AI接続の認証に失敗しました。管理のAI設定で接続を再確認してください。",
         "AI_MODEL_UNAVAILABLE" =>
@@ -2151,6 +2227,7 @@ public sealed partial class TemplateGenerationUnitJobWorker : BackgroundService
             "AI接続設定を確認できませんでした。管理のAI設定で接続を再確認してください。",
         "AI_RATE_LIMITED" =>
             "AIの利用上限に達しました。時間を置いて失敗した項目だけ再試行してください。",
+        "AI_QUOTA_FALLBACK_UNAVAILABLE" => "通常のAIモデルが利用上限に達し、予備のモデルからも生成結果を受け取れませんでした。時間を置いて再試行してください。",
         "AI_TIMEOUT" =>
             "AIの応答が時間内に完了しませんでした。時間を置いて失敗した項目だけ再試行してください。",
         "AI_BUDGET_BLOCKED" =>
@@ -2348,6 +2425,25 @@ public sealed partial class TemplateGenerationUnitJobWorker : BackgroundService
     }
 
     private static string ComputeUnitInputHash(
+        UnitClaim claim, DerivedPdfResult media, BuiltTemplateExtractionInstruction instruction, int attemptNumber) =>
+        BindInputToConnection(ComputeUnitContentHash(claim, media, instruction, attemptNumber), claim);
+
+    private static bool MatchesUnitInput(AiRequestEntity request, UnitClaim claim, DerivedPdfResult media,
+        BuiltTemplateExtractionInstruction instruction)
+    {
+        var contentHash = ComputeUnitContentHash(claim, media, instruction, request.AttemptNumber);
+        if (request.InputManifestHash == BindInputToConnection(contentHash, claim)) return true;
+        // Older manifests contain only the content hash. They can be reused if the
+        // selected profile is the original revision and the connection predates the call.
+        return request.InputManifestHash == contentHash && request.AiTaskProfileId == claim.TaskProfileId
+            && request.TaskProfileRevision == claim.TaskProfileRevision && claim.ConnectionUpdatedAt < request.CreatedAt;
+    }
+
+    private static string BindInputToConnection(string contentHash, UnitClaim claim) => Sha256(JsonSerializer.Serialize(
+        new { contentHash, claim.Connection.ConnectionId, claim.CredentialRevision, claim.TaskProfileId,
+            claim.TaskProfileRevision, claim.MaxOutputTokens, claim.MediaResolution, claim.ThinkingLevel }, JsonOptions));
+
+    private static string ComputeUnitContentHash(
         UnitClaim claim,
         DerivedPdfResult media,
         BuiltTemplateExtractionInstruction instruction,
@@ -2603,7 +2699,8 @@ public sealed partial class TemplateGenerationUnitJobWorker : BackgroundService
     private sealed record UnitJobPayload(
         string UnitId,
         string BatchId,
-        string GenerationProfileHash);
+        string GenerationProfileHash,
+        string? PreviousFailedJobId = null);
 
     private sealed record SourceFileSnapshot(
         string Id,
@@ -2614,6 +2711,7 @@ public sealed partial class TemplateGenerationUnitJobWorker : BackgroundService
 
     private sealed record UnitClaim(
         string JobId,
+        string? PreviousFailedJobId,
         string? CorrelationId,
         string UnitId,
         string BatchId,
@@ -2628,6 +2726,8 @@ public sealed partial class TemplateGenerationUnitJobWorker : BackgroundService
         string MediaResolution,
         string ThinkingLevel,
         string SecretReference,
+        int CredentialRevision,
+        DateTimeOffset ConnectionUpdatedAt,
         AiConnectionSettings Connection,
         AiPromptBundle Bundle);
 
@@ -2649,7 +2749,8 @@ public sealed partial class TemplateGenerationUnitJobWorker : BackgroundService
         string RequestId,
         BuiltTemplateExtractionInstruction Instruction,
         OrientationGatedTemplateExtraction Extraction,
-        bool ProviderCallMade);
+        bool ProviderCallMade,
+        string? PreviousAuditId = null);
 
     private sealed record UsageWindow(DateOnly Day, string Month);
 

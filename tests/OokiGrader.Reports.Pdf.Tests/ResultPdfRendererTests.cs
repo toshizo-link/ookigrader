@@ -11,6 +11,69 @@ namespace OokiGrader.Reports.Pdf.Tests;
 public sealed class ResultPdfRendererTests
 {
     [Fact]
+    public void UniformQuizUsesVerdictsAndRetainsPointsForWeightedPartialOrOverriddenScores()
+    {
+        var questions = new[]
+        {
+            Answer("1", "徳川家康", "徳川家康", "correct", 1_000),
+            Answer("2", "大阪", "江戸", "incorrect", 0),
+            Answer("3", "参勤交代", "参勤交代", "correct", 1_000) with { IsCorrected = true },
+            Answer("4", null, "出島", "blank", 0),
+            Answer("5", null, "蘭学", "unreadable", 0),
+        };
+        var report = CreateReport(questionCount: 0, longQuestions: false) with
+        {
+            SchoolName = "採点結果サンプル",
+            StudentDisplayName = "見本 太郎",
+            StudentNumber = null,
+            TestTitle = "社会 暗記テスト（江戸時代）",
+            StudentGradeLabel = "小6",
+            GradedDate = new DateOnly(2026, 11, 24),
+            GeneratedAt = new DateTimeOffset(2026, 11, 24, 8, 15, 0, TimeSpan.Zero),
+            Questions = questions, PossiblePointsMilli = 5_000, EarnedPointsMilli = 2_000,
+            IsCorrectedGrade = true, MaximumMistakesToPass = 2,
+        };
+        Assert.False(report.ShowQuestionPoints);
+        var renderer = new ResultPdfRenderer();
+        var marked = renderer.Render(report);
+        WriteDiagnosticPdf("uniform-verdicts.pdf", marked.PdfBytes);
+        Assert.Equal(1, marked.PageCount);
+        var marks = UsedFontMappings(marked.PdfBytes);
+        Assert.Contains("<25CB>", marks, StringComparison.Ordinal); // ○
+        Assert.Contains("<00D7>", marks, StringComparison.Ordinal); // ×
+        Assert.Contains("<FF1F>", marks, StringComparison.Ordinal); // ？
+
+        var weighted = report with
+        {
+            Questions = [.. questions, Answer("6", "米", "米・塩", "partial", 500) with { MaximumPointsMilli = 2_000 }],
+            EarnedPointsMilli = 2_500, PossiblePointsMilli = 7_000,
+        };
+        Assert.True(weighted.ShowQuestionPoints);
+        var scored = renderer.Render(weighted);
+        WriteDiagnosticPdf("weighted-verdicts.pdf", scored.PdfBytes);
+        Assert.Equal(1, scored.PageCount);
+        Assert.Contains("<25B3>", UsedFontMappings(scored.PdfBytes), StringComparison.Ordinal); // △
+        Assert.True((report with { Questions = [questions[0], questions[1] with { MaximumPointsMilli = 2_000 }] }).ShowQuestionPoints);
+        Assert.True((report with { Questions = [questions[0] with { Outcome = "partial", AwardedPointsMilli = 500 }] }).ShowQuestionPoints);
+        Assert.True((report with { Questions = [questions[0] with { Outcome = "incorrect" }] }).ShowQuestionPoints);
+        var pointsRequired = report with { AlwaysShowQuestionPoints = true };
+        Assert.True(pointsRequired.ShowQuestionPoints);
+        Assert.NotEqual(ResultReportSourceHasher.Compute(report), ResultReportSourceHasher.Compute(pointsRequired));
+
+        static ResultReportQuestion Answer(string label, string? answer, string model, string outcome, long points) =>
+            new(label, $"設問{label}", answer, points, 1_000, outcome, false, null, [model]);
+
+        static string UsedFontMappings(byte[] bytes)
+        {
+            using var pdf = PdfReader.Open(new MemoryStream(bytes, writable: false));
+            return string.Join('\n', pdf.Internals.GetAllObjects().OfType<PdfDictionary>()
+                .Select(dict => dict.Elements.GetDictionary("/ToUnicode")?.Stream)
+                .OfType<PdfDictionary.PdfStream>()
+                .Select(stream => Encoding.ASCII.GetString(stream.UnfilteredValue)));
+        }
+    }
+
+    [Fact]
     public void PassCriteriaChangesReportIdentityAndRendersInSummary()
     {
         var report = CreateReport(questionCount: 6, longQuestions: false);

@@ -149,7 +149,10 @@ public sealed class GeminiTaskRoutingTests : IDisposable
         Assert.True(AiResponseMetadataValidator.IsAccepted(response));
         Assert.False(Directory.Exists(_directory));
         await client.GenerateAsync(Connection, Credential, Request(AiTaskTypes.Adjudication));
-        Assert.Equal(AiProviderCatalog.GeminiDefaultModelId, _sent[4].Model);
+        Assert.Equal(AiProviderCatalog.GeminiLightModelId, _sent[4].Model);
+        _clock.Now = _clock.Now.AddMinutes(5);
+        await client.GenerateAsync(Connection, Credential, Request(AiTaskTypes.Adjudication));
+        Assert.Equal(AiProviderCatalog.GeminiDefaultModelId, _sent[5].Model);
     }
 
     [Fact]
@@ -164,13 +167,89 @@ public sealed class GeminiTaskRoutingTests : IDisposable
     }
 
     [Fact]
+    public async Task TemplateInternalErrorOnPreferredModelCompletesOnLite()
+    {
+        var client = Client(model => model == AiProviderCatalog.GeminiDefaultModelId
+            ? new HttpResponseMessage(HttpStatusCode.InternalServerError)
+                { Content = new StringContent("""{"error":{"code":500,"status":"INTERNAL"}}""") }
+            : Success());
+        var response = await client.GenerateAsync(Connection, Credential, Request(AiTaskTypes.TemplateExtraction));
+        Assert.Equal(2, _sent.Count);
+        Assert.Equal(AiProviderCatalog.GeminiLightModelId, _sent[1].Model);
+        Assert.Equal(GeminiTaskRoutingClient.ServiceReason, response.ModelRoutingReason);
+    }
+
+    [Fact]
+    public async Task FirstTemplateServiceRejectionSwitchesBeforeASecondPreferredCallCouldTimeOut()
+    {
+        var preferredCalls = 0;
+        var client = Client(model => model != AiProviderCatalog.GeminiDefaultModelId ? Success()
+            : ++preferredCalls == 1 ? new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+            : throw new TaskCanceledException("The overloaded primary did not finish its second attempt."));
+        var result = await client.GenerateAsync(Connection, Credential, Request(AiTaskTypes.TemplateExtraction));
+        Assert.Equal(1, preferredCalls);
+        Assert.Equal([AiProviderCatalog.GeminiDefaultModelId, AiProviderCatalog.GeminiLightModelId],
+            _sent.Select(sent => sent.Model));
+        Assert.Equal(GeminiTaskRoutingClient.ServiceReason, result.ModelRoutingReason);
+    }
+
+    [Fact]
+    public async Task FirstTemplateConnectionLossDoesNotDispatchToLite()
+    {
+        var client = Client(_ => throw new HttpRequestException("The original request outcome is unknown."));
+        var failure = await Assert.ThrowsAsync<AiProviderException>(() =>
+            client.GenerateAsync(Connection, Credential, Request(AiTaskTypes.TemplateExtraction)));
+        Assert.Equal("gemini_network_error", failure.SafeErrorCode);
+        Assert.Single(_sent);
+    }
+
+    [Theory]
+    [InlineData(503, AiFailureKind.TransientProvider, "gemini_provider_unavailable")]
+    [InlineData(429, AiFailureKind.RateLimited, "gemini_rate_limited")]
+    public async Task PreferredQuotaAndFallbackFailureAreBothRetained(
+        int fallbackStatus, AiFailureKind fallbackKind, string fallbackCode)
+    {
+        var client = Client(model => model == AiProviderCatalog.GeminiDefaultModelId ? Quota("60s")
+            : new HttpResponseMessage((HttpStatusCode)fallbackStatus));
+        var failure = await Assert.ThrowsAsync<AiProviderException>(() =>
+            client.GenerateAsync(Connection, Credential, Request(AiTaskTypes.TemplateExtraction)));
+        Assert.Equal(fallbackKind, failure.Kind);
+        Assert.Equal(fallbackCode, failure.SafeErrorCode);
+        Assert.Equal(GeminiTaskRoutingClient.QuotaReason, failure.ModelRoutingReason);
+    }
+
+    [Fact]
     public async Task RepeatedServiceFailureCanProbeLiteButLiteMustActuallyPass()
     {
-        var probe = await Client(model => model == AiProviderCatalog.GeminiDefaultModelId
-            ? new HttpResponseMessage(HttpStatusCode.ServiceUnavailable) : Success()).ProbeAsync(Connection, Credential);
+        var client = Client(model => model == AiProviderCatalog.GeminiDefaultModelId
+            ? new HttpResponseMessage(HttpStatusCode.ServiceUnavailable) : Success());
+        var probe = await client.ProbeAsync(Connection, Credential);
         Assert.Equal("passed", probe.State);
         Assert.Equal(4, _sent.Count);
         Assert.False(Directory.Exists(_directory));
+        var result = await client.GenerateAsync(Connection, Credential, Request(AiTaskTypes.TemplateExtraction));
+        Assert.Equal(5, _sent.Count);
+        Assert.Equal(AiProviderCatalog.GeminiLightModelId, _sent[4].Model);
+        Assert.Equal(GeminiTaskRoutingClient.ServiceReason, result.ModelRoutingReason);
+        await client.GenerateAsync(Connection, Encoding.UTF8.GetBytes("another-synthetic-key"),
+            Request(AiTaskTypes.TemplateExtraction));
+        Assert.Equal(AiProviderCatalog.GeminiDefaultModelId, _sent[5].Model);
+    }
+
+    [Fact]
+    public async Task IfRecentlyAvailableLiteIsRejectedItTriesPreferredOnceAndClearsThePreference()
+    {
+        var primaryDown = true;
+        var client = Client(model => (model == AiProviderCatalog.GeminiDefaultModelId) == primaryDown
+            ? new HttpResponseMessage(HttpStatusCode.ServiceUnavailable) : Success());
+        await client.GenerateAsync(Connection, Credential, Request(AiTaskTypes.TemplateExtraction));
+        primaryDown = false;
+        var response = await client.GenerateAsync(Connection, Credential, Request(AiTaskTypes.TemplateExtraction));
+        Assert.Null(response.ModelRoutingReason);
+        Assert.All(_sent.Skip(2).Take(3), item => Assert.Equal(AiProviderCatalog.GeminiLightModelId, item.Model));
+        Assert.Equal(AiProviderCatalog.GeminiDefaultModelId, _sent[5].Model);
+        await client.GenerateAsync(Connection, Credential, Request(AiTaskTypes.TemplateExtraction));
+        Assert.Equal(AiProviderCatalog.GeminiDefaultModelId, _sent[6].Model);
     }
 
     [Fact]

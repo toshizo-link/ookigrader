@@ -153,7 +153,12 @@ public sealed record AiProviderRequest(
     IReadOnlyList<AiMediaPart> Media,
     int MaxOutputTokens = 8_192,
     string MediaResolution = "MEDIA_RESOLUTION_HIGH",
-    string ThinkingLevel = "MINIMAL");
+    string ThinkingLevel = "MINIMAL")
+{
+    // A router can handle an explicit service rejection on a different model.
+    // This transport setting is never included in the provider's payload.
+    public bool RetryServiceFailures { get; init; } = true;
+}
 
 /// <summary>
 /// Normalized provider usage. <see cref="OutputTokens"/> excludes

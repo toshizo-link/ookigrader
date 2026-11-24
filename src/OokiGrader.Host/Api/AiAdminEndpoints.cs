@@ -85,8 +85,11 @@ public static class AiAdminEndpoints
                 .Where(probe =>
                     probe.AiConnectionId == connection.Id
                     && probe.ConnectionRevision
-                        == connection.CredentialRevision)
+                        == connection.CredentialRevision
+                    && probe.State == connection.LastCapabilityProbeState
+                    && probe.CompletedAt == connection.LastCapabilityProbeAt)
                 .OrderByDescending(probe => probe.CreatedAt)
+                .ThenByDescending(probe => probe.Id)
                 .FirstOrDefaultAsync(cancellationToken);
             items[index] = ToConnectionResponse(connection, latestProbe);
         }
@@ -819,7 +822,12 @@ public static class AiAdminEndpoints
         var now = timeProvider.GetUtcNow();
         var probe = BuildProbe(connection, result, now);
         db.AiCapabilityProbes.Add(probe);
-        ApplyProbeResult(connection, result, now);
+        var previousConfigurationRetained = connection.State == "active" && connection.LastCapabilityProbeState == "passed"
+            && IsTransientGeminiProbeFailure(connection, result);
+        if (!previousConfigurationRetained)
+        {
+            ApplyProbeResult(connection, result, now);
+        }
         var imageTasksReady = IsSuccessfulImageProbe(connection, result);
         await using var transaction = imageTasksReady
             && connection.Provider == AiProviders.GeminiDirect
@@ -892,6 +900,7 @@ public static class AiAdminEndpoints
         {
             probe.Id,
             result.State,
+            previousConfigurationRetained,
             result.Authentication,
             result.ModelAvailable,
             result.ImageInput,
@@ -2291,6 +2300,11 @@ public static class AiAdminEndpoints
             CreatedAt = now,
             CompletedAt = now,
         };
+
+    internal static bool IsTransientGeminiProbeFailure(AiConnectionEntity connection, AiCapabilityProbeResult probe) =>
+        connection.Provider == AiProviders.GeminiDirect && probe.State != "passed"
+        && probe.SafeErrorCode is "gemini_rate_limited" or "gemini_timeout" or "gemini_network_error"
+            or "gemini_internal_error" or "gemini_provider_unavailable";
 
     internal static void ApplyProbeResult(
         AiConnectionEntity connection,

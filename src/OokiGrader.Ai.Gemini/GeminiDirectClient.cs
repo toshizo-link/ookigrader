@@ -47,15 +47,20 @@ public sealed partial class GeminiDirectClient(
                         request, deadline.Token).ConfigureAwait(false);
                     return response with { Latency = Stopwatch.GetElapsedTime(started) };
                 }
-                catch (AiProviderException exception) when (attempt < 2
+                catch (AiProviderException exception) when (request.RetryServiceFailures && attempt < 2
                     && exception.Kind == AiFailureKind.TransientProvider
-                    && exception.HttpStatusCode == 503)
+                    && IsExplicitServiceFailure(exception.HttpStatusCode, exception.SafeErrorCode))
                 {
-                    // A completed HTTP 503 is an explicit failed response. A
-                    // timeout/network loss has an unknown outcome and is never
-                    // resent here. Preserve all pages, schema and request key.
-                    var seconds = Math.Clamp(exception.RetryAfter?.TotalSeconds
-                        ?? Math.Pow(2, attempt), 0.1, 5);
+                    // Preserve the original pages, schema and key. A gateway
+                    // error or lost connection does not identify a rejected request.
+                    var seconds = Math.Max(exception.RetryAfter?.TotalSeconds ?? Math.Pow(2, attempt), 0.1);
+                    var remaining = connection.Timeout - Stopwatch.GetElapsedTime(started);
+                    if (seconds + 0.25 >= remaining.TotalSeconds)
+                    {
+                        // There is no time to honor the service's retry delay on
+                        // this model. Preserve its explicit rejection for routing.
+                        throw;
+                    }
                     var delay = TimeSpan.FromSeconds(seconds + Random.Shared.NextDouble() * 0.25);
                     await (retryDelay ?? Task.Delay)(delay, deadline.Token).ConfigureAwait(false);
                 }
@@ -67,6 +72,9 @@ public sealed partial class GeminiDirectClient(
                 isTransient: true, innerException: exception);
         }
     }
+
+    public static bool IsExplicitServiceFailure(int? httpStatusCode, string? safeErrorCode) =>
+        httpStatusCode == 503 || (httpStatusCode == 500 && safeErrorCode == "gemini_internal_error");
 
     private async Task<AiProviderResponse> GenerateOnceAsync(
         AiConnectionSettings connection,
@@ -492,18 +500,21 @@ public sealed partial class GeminiDirectClient(
         HttpResponseMessage response,
         CancellationToken cancellationToken)
     {
-        var retryAfter = response.Headers.RetryAfter?.Delta;
+        var retryHeader = response.Headers.RetryAfter;
+        var retryAfter = retryHeader?.Delta ?? retryHeader?.Date - DateTimeOffset.UtcNow;
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
         {
             retryAfter = await ReadQuotaRetryAfterAsync(response.Content, retryAfter,
                 cancellationToken).ConfigureAwait(false);
         }
-        var safeErrorCode = response.StatusCode is HttpStatusCode.BadRequest
-            ? await ClassifyBadRequestAsync(
-                    response.Content,
-                    cancellationToken)
-                .ConfigureAwait(false)
-            : null;
+        var safeErrorCode = response.StatusCode switch
+        {
+            HttpStatusCode.BadRequest => await ClassifyBadRequestAsync(response.Content, cancellationToken)
+                .ConfigureAwait(false),
+            HttpStatusCode.InternalServerError => await ClassifyInternalErrorAsync(response.Content, cancellationToken)
+                .ConfigureAwait(false),
+            _ => null,
+        };
         return response.StatusCode switch
         {
             HttpStatusCode.BadRequest => Failure(
@@ -532,7 +543,7 @@ public sealed partial class GeminiDirectClient(
                 or HttpStatusCode.ServiceUnavailable
                 or HttpStatusCode.GatewayTimeout => new AiProviderException(
                     AiFailureKind.TransientProvider,
-                    "gemini_provider_unavailable",
+                    safeErrorCode ?? "gemini_provider_unavailable",
                     isTransient: true,
                     retryAfter,
                     httpStatusCode: (int)response.StatusCode),
@@ -541,6 +552,29 @@ public sealed partial class GeminiDirectClient(
                 $"gemini_http_{((int)response.StatusCode).ToString(CultureInfo.InvariantCulture)}",
                 isTransient: false),
         };
+    }
+
+    private static async Task<string?> ClassifyInternalErrorAsync(HttpContent content, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var bytes = await ReadBoundedAsync(content, MaximumErrorResponseBytes, cancellationToken).ConfigureAwait(false);
+            using var document = JsonDocument.Parse(bytes);
+            if (document.RootElement.ValueKind == JsonValueKind.Object
+                && document.RootElement.TryGetProperty("error", out var error)
+                && error.ValueKind == JsonValueKind.Object
+                && error.TryGetProperty("code", out var code) && code.ValueKind == JsonValueKind.Number
+                && code.TryGetInt32(out var status) && status == 500
+                && GetString(error, "status") == "INTERNAL")
+            {
+                return "gemini_internal_error";
+            }
+        }
+        catch (Exception exception) when (exception is JsonException or AiProviderException)
+        {
+            // Only the provider's error envelope identifies a confirmed rejection.
+        }
+        return null;
     }
 
     private static async Task<TimeSpan?> ReadQuotaRetryAfterAsync(

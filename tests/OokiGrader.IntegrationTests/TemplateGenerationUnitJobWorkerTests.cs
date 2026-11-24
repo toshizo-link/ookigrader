@@ -74,6 +74,103 @@ public sealed class TemplateGenerationUnitJobWorkerTests
         Assert.DoesNotContain("template.slot_inventory_unconfirmed", unit.WarningsJson);
     }
 
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public async Task ExplicitRetryRechecksInventoryAndOnlyReusesACompatibleFirstPass(
+        bool rotateCredentials, bool nonTransientFailure)
+    {
+        var freshStart = rotateCredentials || nonTransientFailure;
+        var actions = new List<ProviderAction> { ProviderAction.Embedded, ProviderAction.Fail, ProviderAction.Embedded };
+        if (freshStart) actions.Add(ProviderAction.Embedded);
+        await using var fixture = await WorkerFixture.CreateAsync([.. actions]);
+        fixture.Provider.Failure = nonTransientFailure
+            ? new AiProviderException(AiFailureKind.InvalidResponse, "invalid_response", isTransient: false)
+            : new AiProviderException(AiFailureKind.Timeout, "timeout", isTransient: true);
+        Assert.True(await fixture.Worker.ProcessNextAsync());
+        await using var db = await fixture.CreateDbContextAsync();
+        var first = await db.AiRequests.AsNoTracking().SingleAsync(item => item.AttemptNumber == 1);
+        if (rotateCredentials)
+        {
+            var connection = await db.AiConnections.SingleAsync();
+            connection.CredentialRevision++;
+            var profile = await db.AiTaskProfiles.SingleAsync();
+            profile.ConnectionRevision = connection.CredentialRevision;
+            await db.SaveChangesAsync();
+        }
+        await fixture.RetryFailedAsync("retry-inventory");
+        Assert.True(await fixture.Worker.ProcessNextAsync());
+        var unit = await db.TemplateGenerationUnits.AsNoTracking().SingleAsync();
+        Assert.True(unit.Status == TemplateGenerationUnitStatus.Extracted,
+            $"Unexpected status {unit.Status}: {unit.WarningsJson}. Provider calls: {fixture.Provider.Requests.Count}.");
+        Assert.Equal(freshStart ? 4 : 3, fixture.Provider.Requests.Count);
+        Assert.Contains("INDEPENDENT INVENTORY AUDIT", fixture.Provider.Requests[^1].UserInstruction, StringComparison.Ordinal);
+        Assert.Equal(fixture.Provider.Requests.Count, await db.AiBudgetReservations.CountAsync());
+        var finalAudit = await db.AiRequests.AsNoTracking().SingleAsync(item => item.AttemptNumber == 3 && item.State == "succeeded");
+        var parent = await db.AiRequests.AsNoTracking().SingleAsync(item => item.Id == finalAudit.RetryOfAiRequestId);
+        Assert.Equal(freshStart ? 1 : 3, parent.AttemptNumber);
+        if (!freshStart) Assert.Equal(first.Id, parent.RetryOfAiRequestId);
+    }
+
+    [Fact]
+    public async Task RepeatedExplicitRetriesAfterUpgradeContinueTheFailedAuditChain()
+    {
+        await using var fixture = await WorkerFixture.CreateAsync(ProviderAction.Embedded, ProviderAction.Fail,
+            ProviderAction.Fail, ProviderAction.Embedded);
+        fixture.Provider.Failure = new AiProviderException(AiFailureKind.Timeout, "timeout", isTransient: true);
+        Assert.True(await fixture.Worker.ProcessNextAsync());
+        await using var db = await fixture.CreateDbContextAsync();
+        var first = await db.AiRequests.SingleAsync(item => item.AttemptNumber == 1);
+        first.InputManifestHash = await fixture.GetLegacyFirstPassHashAsync(first.RequestKey);
+        first.CreatedAt = (await db.AiConnections.Select(item => item.UpdatedAt).SingleAsync()).AddSeconds(1);
+        var oldAudit = await db.AiRequests.SingleAsync(item => item.AttemptNumber == 3);
+        oldAudit.ErrorCode = "AI_PROVIDER_UNAVAILABLE";
+        await db.SaveChangesAsync();
+
+        await fixture.RetryFailedAsync("retry-one");
+        Assert.True(await fixture.Worker.ProcessNextAsync());
+        await fixture.RetryFailedAsync("retry-two");
+        Assert.True(await fixture.Worker.ProcessNextAsync());
+
+        Assert.Equal(4, fixture.Provider.Requests.Count);
+        Assert.All(fixture.Provider.Requests.Skip(1),
+            request => Assert.Contains("INDEPENDENT INVENTORY AUDIT", request.UserInstruction));
+        Assert.Equal(TemplateGenerationUnitStatus.Extracted,
+            (await db.TemplateGenerationUnits.AsNoTracking().SingleAsync()).Status);
+        var retriedAudit = await db.AiRequests.AsNoTracking().SingleAsync(item => item.RetryOfAiRequestId == oldAudit.Id);
+        var passedAudit = await db.AiRequests.AsNoTracking().SingleAsync(item => item.RetryOfAiRequestId == retriedAudit.Id);
+        Assert.Equal("succeeded", passedAudit.State);
+        Assert.Equal(4, await db.AiBudgetReservations.CountAsync());
+    }
+
+    [Fact]
+    public async Task ResumedLegacyJobRecognizesItsAcceptedFirstPassAndOriginalAuditError()
+    {
+        await using var fixture = await WorkerFixture.CreateAsync(ProviderAction.Embedded, ProviderAction.Fail);
+        fixture.Provider.Failure = new AiProviderException(AiFailureKind.Timeout, "timeout", isTransient: true);
+        Assert.True(await fixture.Worker.ProcessNextAsync());
+        await using var db = await fixture.CreateDbContextAsync();
+        var first = await db.AiRequests.SingleAsync(item => item.AttemptNumber == 1);
+        first.InputManifestHash = await fixture.GetLegacyFirstPassHashAsync(first.RequestKey);
+        first.CreatedAt = (await db.AiConnections.Select(item => item.UpdatedAt).SingleAsync()).AddSeconds(1);
+        // Model a .24 job restart after its audit error was saved to the request
+        // row, but before the unit and job could be marked failed.
+        var job = await db.BackgroundJobs.SingleAsync();
+        job.State = "queued";
+        job.AttemptCount = 0;
+        var unit = await db.TemplateGenerationUnits.Include(item => item.Batch).SingleAsync();
+        unit.Status = TemplateGenerationUnitStatus.Generating;
+        unit.Batch.Status = TemplateGenerationBatchStatus.Generating;
+        unit.Batch.LastErrorCode = null;
+        await db.SaveChangesAsync();
+
+        Assert.True(await fixture.Worker.ProcessNextAsync());
+        var batch = await db.TemplateGenerationBatches.AsNoTracking().SingleAsync();
+        Assert.Equal("AI_TIMEOUT", batch.LastErrorCode);
+        Assert.Equal(2, fixture.Provider.Requests.Count);
+    }
+
     [Fact]
     public async Task UnresolvedAnswerRemovalIsNeverSilentlyApprovedOrRetriedForever()
     {
@@ -104,6 +201,10 @@ public sealed class TemplateGenerationUnitJobWorkerTests
     [InlineData(AiFailureKind.Authentication, "gemini_authentication_failed", "AI_AUTHENTICATION_FAILED")]
     [InlineData(AiFailureKind.RateLimited, "gemini_rate_limited", "AI_RATE_LIMITED")]
     [InlineData(AiFailureKind.Timeout, "gemini_timeout", "AI_TIMEOUT")]
+    [InlineData(AiFailureKind.TransientProvider, "gemini_internal_error", "AI_SERVICE_BUSY")]
+    [InlineData(AiFailureKind.TransientProvider, "gemini_provider_unavailable", "AI_SERVICE_BUSY")]
+    [InlineData(AiFailureKind.TransientProvider, "gemini_network_error", "AI_CONNECTION_INTERRUPTED")]
+    [InlineData(AiFailureKind.TransientProvider, "openrouter_network_error", "AI_CONNECTION_INTERRUPTED")]
     [InlineData(AiFailureKind.RequestRejected, "gemini_response_schema_invalid", "AI_RESPONSE_SCHEMA_REJECTED")]
     [InlineData(AiFailureKind.RequestRejected, "gemini_thinking_config_invalid", "AI_THINKING_CONFIG_INVALID")]
     [InlineData(AiFailureKind.InvalidConfiguration, "gemini_model_not_found", "AI_MODEL_UNAVAILABLE")]
@@ -169,7 +270,7 @@ public sealed class TemplateGenerationUnitJobWorkerTests
 
         Assert.Equal("failed", request.State);
         Assert.True(request.PossibleDuplicate);
-        Assert.Equal("AI_PROVIDER_UNAVAILABLE", request.ErrorCode);
+        Assert.Equal("AI_GENERATION_INTERRUPTED", request.ErrorCode);
         Assert.Equal("recovered_dispatching_request", request.SafeErrorDetail);
         Assert.NotNull(request.CompletedAt);
         Assert.Equal("settled", reservation.State);
@@ -178,9 +279,9 @@ public sealed class TemplateGenerationUnitJobWorkerTests
         Assert.NotNull(reservation.SettledAt);
         Assert.Equal(TemplateGenerationUnitStatus.Failed, unit.Status);
         Assert.Equal(TemplateGenerationBatchStatus.Failed, batch.Status);
-        Assert.Equal("AI_PROVIDER_UNAVAILABLE", batch.LastErrorCode);
+        Assert.Equal("AI_GENERATION_INTERRUPTED", batch.LastErrorCode);
         Assert.Equal("failed", job.State);
-        Assert.Equal("AI_PROVIDER_UNAVAILABLE", job.ErrorCode);
+        Assert.Equal("AI_GENERATION_INTERRUPTED", job.ErrorCode);
         Assert.Equal(job.MaxAttempts, job.AttemptCount);
         Assert.Null(job.LeaseOwner);
         Assert.Null(job.LeaseExpiresAt);
@@ -598,12 +699,9 @@ public sealed class TemplateGenerationUnitJobWorkerTests
                 CancellationToken.None);
         }
 
-        public async Task SeedExpiredDispatchingRunAsync(
-            long reservedUsdMicros)
+        public async Task<string> GetLegacyFirstPassHashAsync(string requestKey)
         {
             await using var db = await CreateDbContextAsync();
-            var now = _timeProvider.GetUtcNow();
-            var job = await db.BackgroundJobs.SingleAsync();
             var unit = await db.TemplateGenerationUnits.SingleAsync();
             var batch = await db.TemplateGenerationBatches.SingleAsync();
             var taskProfile = await db.AiTaskProfiles
@@ -620,9 +718,6 @@ public sealed class TemplateGenerationUnitJobWorkerTests
                     WorkerJsonOptions)
                 ?? throw new InvalidOperationException(
                     "The seeded unit generation profile is missing.");
-            var requestId = _ids.NewId();
-            var requestKey =
-                $"template_unit_run_{job.Id}_1_{requestId}";
             var instruction = TemplateExtractionInstructionBuilder.Build(
                 requestKey,
                 unit.Id,
@@ -658,7 +753,18 @@ public sealed class TemplateGenerationUnitJobWorkerTests
                     attemptNumber = 1,
                 },
                 WorkerJsonOptions);
+            return Sha256(Encoding.UTF8.GetBytes(canonical));
+        }
 
+        public async Task SeedExpiredDispatchingRunAsync(long reservedUsdMicros)
+        {
+            await using var db = await CreateDbContextAsync();
+            var now = _timeProvider.GetUtcNow();
+            var job = await db.BackgroundJobs.SingleAsync();
+            var unit = await db.TemplateGenerationUnits.SingleAsync();
+            var taskProfile = await db.AiTaskProfiles.SingleAsync();
+            var requestId = _ids.NewId();
+            var requestKey = $"template_unit_run_{job.Id}_1_{requestId}";
             job.State = "leased";
             job.LeaseOwner = "crashed-worker";
             job.LeaseExpiresAt = now.AddSeconds(-1);
@@ -676,7 +782,7 @@ public sealed class TemplateGenerationUnitJobWorkerTests
                 EntityType = "template_generation_unit",
                 EntityId = unit.Id,
                 EntityRevision = unit.Revision,
-                InputManifestHash = Sha256(Encoding.UTF8.GetBytes(canonical)),
+                InputManifestHash = await GetLegacyFirstPassHashAsync(requestKey),
                 AttemptNumber = 1,
                 State = "dispatching",
                 DispatchAttempt = 1,

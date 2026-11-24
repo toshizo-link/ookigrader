@@ -11,7 +11,7 @@ namespace OokiGrader.Reports.Pdf;
 
 public sealed class ResultPdfRenderer : IResultPdfRenderer
 {
-    public const string CurrentRendererVersion = "pdfsharp-6.2.4-layout-4";
+    public const string CurrentRendererVersion = "pdfsharp-6.2.4-layout-5";
     private const double PageWidth = 595.28;
     private const double PageHeight = 841.89;
     private const double MarginLeft = 42;
@@ -28,6 +28,8 @@ public sealed class ResultPdfRenderer : IResultPdfRenderer
     private const double StudentAnswerColumnWidth = 155;
     private const double ModelAnswerColumnWidth = 200;
     private const double ScoreColumnWidth = 81.28;
+    private const double OutcomeLineHeight = 17;
+    private const double ScoreDetailLineHeight = 10;
     private const int MaximumQuestions = 2_000;
 
     private static readonly XColor Ink = XColor.FromArgb(31, 41, 55);
@@ -65,8 +67,9 @@ public sealed class ResultPdfRenderer : IResultPdfRenderer
         var fonts = ReportFonts.Create();
         var pages = new List<PageCanvas>();
         var canvas = AddPage(document, pages, report, fonts);
+        var showQuestionPoints = report.ShowQuestionPoints;
         DrawFirstPageSummary(canvas, report, fonts);
-        DrawTableHeader(canvas, fonts);
+        DrawTableHeader(canvas, showQuestionPoints, fonts);
 
         if (report.Questions.Count == 0)
         {
@@ -84,6 +87,7 @@ public sealed class ResultPdfRenderer : IResultPdfRenderer
                     report.Questions[index],
                     index == 0 ? null : report.Questions[index - 1],
                     index,
+                    showQuestionPoints,
                     fonts);
             }
         }
@@ -234,10 +238,10 @@ public sealed class ResultPdfRenderer : IResultPdfRenderer
         canvas.Y += 28;
     }
 
-    private static void DrawTableHeader(PageCanvas canvas, ReportFonts fonts)
+    private static void DrawTableHeader(PageCanvas canvas, bool showQuestionPoints, ReportFonts fonts)
     {
         var widths = ColumnWidths();
-        var labels = new[] { "大問・中問・小問", "生徒の解答", "模範解答", "得点" };
+        var labels = new[] { "大問・中問・小問", "生徒の解答", "模範解答", showQuestionPoints ? "正誤・得点" : "正誤" };
         var x = MarginLeft;
         for (var index = 0; index < labels.Length; index++)
         {
@@ -273,6 +277,7 @@ public sealed class ResultPdfRenderer : IResultPdfRenderer
         ResultReportQuestion question,
         ResultReportQuestion? previousQuestion,
         int rowIndex,
+        bool showQuestionPoints,
         ReportFonts fonts)
     {
         var studentAnswerText = string.IsNullOrWhiteSpace(question.RecognizedAnswer)
@@ -294,8 +299,19 @@ public sealed class ResultPdfRenderer : IResultPdfRenderer
         var totalLines = Math.Max(
             1,
             Math.Max(studentAnswerLines.Count, modelAnswerLines.Count));
+        var details = showQuestionPoints
+            ? $"{FormatPoints(question.AwardedPointsMilli)} / {FormatPoints(question.MaximumPointsMilli)} 点"
+            : "";
+        if (question.IsCorrected)
+        {
+            details = details.Length == 0 ? "訂正済" : details + "　訂正済";
+        }
+        List<string> scoreDetailLines = details.Length == 0 ? [] : WrapText(
+            canvas.Graphics, details, fonts.Small, ScoreColumnWidth - 6);
+        var firstChunkMinimumHeight = Math.Max(MinimumRowHeight,
+            4 + OutcomeLineHeight + (scoreDetailLines.Count * ScoreDetailLineHeight));
         var fullRowHeight = Math.Max(
-            MinimumRowHeight,
+            firstChunkMinimumHeight,
             (totalLines * BodyLineHeight) + (2 * CellPadding));
         var fullPageRowCapacity = MaximumLinesForHeight(
             ContentBottom - (HeaderBottom + 9) - TableHeaderHeight);
@@ -307,7 +323,7 @@ public sealed class ResultPdfRenderer : IResultPdfRenderer
             if (fullRowHeight > ContentBottom - canvas.Y)
             {
                 canvas = AddPage(document, pages, report, fonts);
-                DrawTableHeader(canvas, fonts);
+                DrawTableHeader(canvas, showQuestionPoints, fonts);
             }
 
             DrawQuestionChunk(
@@ -316,6 +332,7 @@ public sealed class ResultPdfRenderer : IResultPdfRenderer
                 rowIndex,
                 studentAnswerLines,
                 modelAnswerLines,
+                scoreDetailLines,
                 0,
                 totalLines,
                 fullRowHeight,
@@ -331,16 +348,17 @@ public sealed class ResultPdfRenderer : IResultPdfRenderer
         while (offset < totalLines)
         {
             var availableLines = MaximumLinesForHeight(ContentBottom - canvas.Y);
-            if (availableLines <= 0)
+            var minimumHeight = continuation ? MinimumRowHeight : firstChunkMinimumHeight;
+            if (ContentBottom - canvas.Y < minimumHeight)
             {
                 canvas = AddPage(document, pages, report, fonts);
-                DrawTableHeader(canvas, fonts);
+                DrawTableHeader(canvas, showQuestionPoints, fonts);
                 availableLines = fullPageRowCapacity;
             }
 
             var linesInChunk = Math.Min(availableLines, totalLines - offset);
             var height = Math.Max(
-                MinimumRowHeight,
+                minimumHeight,
                 (linesInChunk * BodyLineHeight) + (2 * CellPadding));
             DrawQuestionChunk(
                 canvas,
@@ -348,6 +366,7 @@ public sealed class ResultPdfRenderer : IResultPdfRenderer
                 rowIndex,
                 studentAnswerLines,
                 modelAnswerLines,
+                scoreDetailLines,
                 offset,
                 linesInChunk,
                 height,
@@ -360,7 +379,7 @@ public sealed class ResultPdfRenderer : IResultPdfRenderer
             if (offset < totalLines)
             {
                 canvas = AddPage(document, pages, report, fonts);
-                DrawTableHeader(canvas, fonts);
+                DrawTableHeader(canvas, showQuestionPoints, fonts);
             }
         }
     }
@@ -407,6 +426,7 @@ public sealed class ResultPdfRenderer : IResultPdfRenderer
         int rowIndex,
         List<string> studentAnswerLines,
         List<string> modelAnswerLines,
+        List<string> scoreDetailLines,
         int offset,
         int lineCount,
         double height,
@@ -471,42 +491,20 @@ public sealed class ResultPdfRenderer : IResultPdfRenderer
 
         if (!continuation)
         {
-            var score = $"{FormatPoints(question.AwardedPointsMilli)} 点";
-            var scoreX = MarginLeft
-                + LabelColumnWidth
-                + StudentAnswerColumnWidth
-                + ModelAnswerColumnWidth;
-            if (question.IsCorrected)
+            var scoreX = PageWidth - MarginRight - ScoreColumnWidth;
+            var y = canvas.Y + (height - OutcomeLineHeight - (scoreDetailLines.Count * ScoreDetailLineHeight)) / 2;
+            var (mark, text, color) = OutcomeStyle(question.Outcome);
+            var brush = new XSolidBrush(color);
+            canvas.Graphics.DrawString(mark, fonts.OutcomeMark, brush,
+                new XRect(scoreX + 6, y, 22, OutcomeLineHeight), XStringFormats.Center);
+            canvas.Graphics.DrawString(text, fonts.Body, brush,
+                new XRect(scoreX + 31, y, ScoreColumnWidth - 34, OutcomeLineHeight), XStringFormats.CenterLeft);
+            y += OutcomeLineHeight;
+            foreach (var detail in scoreDetailLines)
             {
-                canvas.Graphics.DrawString(
-                    score,
-                    fonts.TableBody,
-                    new XSolidBrush(OutcomeColor(question.Outcome)),
-                    new XRect(
-                        scoreX + 3,
-                        canvas.Y + (height / 2) - 15,
-                        ScoreColumnWidth - 6,
-                        14),
-                    XStringFormats.Center);
-                canvas.Graphics.DrawString(
-                    "訂正済",
-                    fonts.Footer,
-                    new XSolidBrush(XColors.DarkGoldenrod),
-                    new XRect(
-                        scoreX + 2,
-                        canvas.Y + (height / 2),
-                        ScoreColumnWidth - 4,
-                        12),
-                    XStringFormats.Center);
-            }
-            else
-            {
-                canvas.Graphics.DrawString(
-                    score,
-                    fonts.TableBody,
-                    new XSolidBrush(OutcomeColor(question.Outcome)),
-                    new XRect(scoreX + 3, canvas.Y, ScoreColumnWidth - 6, height),
-                    XStringFormats.Center);
+                canvas.Graphics.DrawString(detail, fonts.Small, new XSolidBrush(MutedInk),
+                    new XRect(scoreX + 3, y, ScoreColumnWidth - 6, ScoreDetailLineHeight), XStringFormats.Center);
+                y += ScoreDetailLineHeight;
             }
         }
     }
@@ -745,29 +743,14 @@ public sealed class ResultPdfRenderer : IResultPdfRenderer
             ? 0
             : Math.Clamp((decimal)earned * 100m / possible, 0m, 100m);
 
-    private static string LocalizeOutcome(string outcome)
+    private static (string Mark, string Label, XColor Color) OutcomeStyle(string outcome) => outcome switch
     {
-        return outcome switch
-        {
-            "correct" => "正解",
-            "partial" => "部分点",
-            "incorrect" => "不正解",
-            "blank" => "空欄",
-            "unreadable" => "判読不可",
-            _ => throw new ArgumentOutOfRangeException(
-                nameof(outcome),
-                "Unsupported result outcome."),
-        };
-    }
-
-    private static XColor OutcomeColor(string outcome) => outcome switch
-    {
-        "correct" => XColor.FromArgb(18, 118, 82),
-        "partial" => XColor.FromArgb(157, 98, 4),
-        "incorrect" => XColor.FromArgb(178, 52, 52),
-        "blank" => MutedInk,
-        "unreadable" => XColor.FromArgb(120, 80, 153),
-        _ => Ink,
+        "correct" => ("○", "正解", XColor.FromArgb(18, 118, 82)),
+        "partial" => ("△", "部分点", XColor.FromArgb(145, 88, 0)),
+        "incorrect" => ("×", "不正解", XColor.FromArgb(169, 46, 46)),
+        "blank" => ("×", "空欄", MutedInk),
+        "unreadable" => ("？", "判読不可", XColor.FromArgb(110, 66, 143)),
+        _ => throw new ArgumentOutOfRangeException(nameof(outcome)),
     };
 
     private static int VerifyPdf(byte[] bytes, int expectedPageCount)
@@ -985,6 +968,7 @@ public sealed class ResultPdfRenderer : IResultPdfRenderer
         XFont Small,
         XFont TableHeader,
         XFont TableBody,
+        XFont OutcomeMark,
         XFont Footer)
     {
         public static ReportFonts Create()
@@ -1022,6 +1006,11 @@ public sealed class ResultPdfRenderer : IResultPdfRenderer
                     NotoSansJpFontResolver.FamilyName,
                     8.5,
                     XFontStyleEx.Regular,
+                    options),
+                new XFont(
+                    NotoSansJpFontResolver.FamilyName,
+                    16,
+                    XFontStyleEx.Bold,
                     options),
                 new XFont(
                     NotoSansJpFontResolver.FamilyName,

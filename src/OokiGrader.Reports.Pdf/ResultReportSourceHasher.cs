@@ -28,6 +28,10 @@ public static class ResultReportSourceHasher
         Append(hash, report.PossiblePointsMilli);
         Append(hash, report.IsCorrectedGrade);
         Append(hash, report.IncludeTeacherComments);
+        if (report.AlwaysShowQuestionPoints)
+        {
+            Append(hash, "alwaysShowQuestionPoints");
+        }
         if (report.MaximumMistakesToPass is not null)
         {
             Append(hash, "maximumMistakesToPass");

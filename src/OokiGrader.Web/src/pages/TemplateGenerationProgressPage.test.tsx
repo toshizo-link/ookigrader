@@ -106,6 +106,18 @@ describe("TemplateGenerationProgressPage", () => {
     expect(queryState.reload).toHaveBeenCalledTimes(1);
   });
 
+  it("shows the last failure beside the retry action without claiming the job is still running", () => {
+    queryState.data = {
+      ...makeBatch(), status: "failed", lastErrorCode: "AI_PROVIDER_UNAVAILABLE",
+      units: [{ ...makeBatch().units[0]!, status: "failed", questionCount: 0 }],
+    };
+    renderPage();
+    expect(screen.getByText(/AIサービスを利用できませんでした/)).toBeVisible();
+    expect(screen.getByText("エラーコード：AI_PROVIDER_UNAVAILABLE")).toBeVisible();
+    expect(screen.getByRole("button", { name: "失敗した項目を再試行" })).toBeEnabled();
+    expect(screen.queryByText(/画面を離れても処理は続きます|0問を抽出/)).not.toBeInTheDocument();
+  });
+
   it("remembers a directly opened generation URL so the list can recover it", () => {
     renderPage();
 

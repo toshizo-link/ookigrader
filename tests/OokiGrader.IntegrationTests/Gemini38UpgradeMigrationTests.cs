@@ -118,7 +118,7 @@ public sealed class Gemini38UpgradeMigrationTests
     {
         await using var fixture = await Fixture.CreateAsync("gemini-3.5-flash-lite");
         fixture.Provider.Result = new AiCapabilityProbeResult(
-            true, false, false, false, false, "failed", "gemini_rate_limited", null);
+            true, false, false, false, false, "failed", "gemini_model_not_found", null);
         await using var db = fixture.CreateDbContext();
         var before = await SnapshotSchoolDataAsync(db);
         Assert.True(await fixture.ApplyAsync(db));
@@ -127,7 +127,7 @@ public sealed class Gemini38UpgradeMigrationTests
         Assert.Equal("gemini-3.8-flash", connection.ModelId);
         Assert.Equal("blocked", connection.State);
         Assert.Equal("failed", connection.LastCapabilityProbeState);
-        Assert.Equal("gemini_rate_limited", connection.LastCapabilityProbeErrorCode);
+        Assert.Equal("gemini_model_not_found", connection.LastCapabilityProbeErrorCode);
         Assert.Equal(7, connection.CredentialRevision);
         using var stored = await fixture.Secrets.ReadAsync(
             new AiSecretReference(connection.SecretReference));
@@ -138,13 +138,64 @@ public sealed class Gemini38UpgradeMigrationTests
         Assert.Equal(1, fixture.Provider.ProbeCount);
 
         // The existing administrator recheck path can enable the migrated
-        // defaults when the temporary provider problem has cleared.
+        // defaults once the configured model is available.
         var now = TimeProvider.System.GetUtcNow();
         AiAdminEndpoints.ApplyProbeResult(connection, Fixture.PassedProbe, now);
         await AiAdminEndpoints.ReconcileCurrentProfilesAsync(
             db, connection, connection.CreatedByStaffUserId, fixture.Catalog,
             now, replaceOtherProviders: true, cancellationToken: default);
         await AssertCurrentProfilesAsync(db, fixture.Catalog, active: true);
+    }
+
+    [Theory]
+    [InlineData("gemini_rate_limited")]
+    [InlineData("gemini_provider_unavailable")]
+    [InlineData("gemini_timeout")]
+    public async Task TransientUpgradeFailurePreservesVerifiedModelUntilSuccessfulProbe(string error)
+    {
+        await using var fixture = await Fixture.CreateAsync(AiProviderCatalog.GeminiLightModelId);
+        await using var db = fixture.CreateDbContext();
+        var previous = await db.AiConnections.AsNoTracking().SingleAsync();
+        var profiles = await db.AiTaskProfiles.AsNoTracking().Where(p => p.Active).Select(p => p.Id).Order().ToArrayAsync();
+        fixture.Provider.Result = Fixture.PassedProbe with { State = "failed", SafeErrorCode = error };
+        Assert.False(await fixture.ApplyAsync(db));
+        db.ChangeTracker.Clear();
+        var retained = await db.AiConnections.SingleAsync();
+        Assert.Equal(previous.Revision, retained.Revision);
+        Assert.Equal(previous.ModelId, retained.ModelId);
+        Assert.Equal("passed", retained.LastCapabilityProbeState);
+        Assert.Equal(profiles, await db.AiTaskProfiles.Where(p => p.Active).Select(p => p.Id).Order().ToArrayAsync());
+        fixture.Provider.Result = Fixture.PassedProbe;
+        Assert.True(await fixture.ApplyAsync(db));
+        await AssertCurrentProfilesAsync(db, fixture.Catalog, active: true);
+        Assert.False(await fixture.ApplyAsync(db));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PriorVersionBlockedByTransientProbeRecoversOnlyIfNoNewRecheck(bool laterRecheck)
+    {
+        await using var fixture = await Fixture.CreateAsync(AiProviderCatalog.GeminiLightModelId);
+        await using var db = fixture.CreateDbContext();
+        var connection = await db.AiConnections.SingleAsync();
+        var timestamp = DateTimeOffset.FromUnixTimeMilliseconds(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        connection.ModelId = Gemini38UpgradeMigration.ModelId;
+        connection.State = "blocked";
+        connection.LastCapabilityProbeState = "failed";
+        connection.LastCapabilityProbeErrorCode = "gemini_timeout";
+        connection.LastCapabilityProbeAt = laterRecheck ? timestamp.AddMinutes(1) : timestamp;
+        db.AuditEvents.Add(new AuditEventEntity
+        {
+            Id = UlidId.New(timestamp), OccurredAt = timestamp, EventType = Gemini38UpgradeMigration.AuditEventType,
+            ObjectType = "ai_connection", ObjectId = connection.Id, Outcome = "succeeded",
+            SafeMetadataJson = JsonSerializer.Serialize(new { connection.CredentialRevision, capabilityProbeErrorCode = "gemini_timeout" }),
+        });
+        await db.SaveChangesAsync();
+        Assert.Equal(!laterRecheck, await fixture.ApplyAsync(db));
+        Assert.Equal(laterRecheck ? "blocked" : "active", connection.State);
+        Assert.Equal(laterRecheck ? 0 : 1, fixture.Provider.ProbeCount);
+        Assert.False(await fixture.ApplyAsync(db));
     }
 
     [Fact]

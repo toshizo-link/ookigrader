@@ -121,8 +121,10 @@ export function TemplateGenerationProgressPage() {
     <div className="page template-generation-page">
       <PageHeader
         eyebrow="テンプレート生成"
-        title="テンプレートを生成しています"
-        description="PDFの分割範囲は固定されています。この画面を離れても処理は続きます。"
+        title="テンプレートの生成状況"
+        description={isActiveBatchStatus(batch.status)
+          ? "この画面を離れても処理は続きます。"
+          : undefined}
         backAction={
           <Link className="back-link" to="/templates">
             <Icon name="arrowLeft" size={17} />
@@ -166,9 +168,9 @@ export function TemplateGenerationProgressPage() {
             </Button>
           }
         >
-          <p>
-            成功済みの項目は保持されています。すべて成功するまで最終確認には進めません。
-          </p>
+          <p>{batch.lastErrorCode ? warningMessage(batch.lastErrorCode)
+            : "各ページのエラーを確認して、失敗した項目を再試行してください。"}</p>
+          {batch.lastErrorCode && <small>エラーコード：{batch.lastErrorCode}</small>}
         </InlineAlert>
       ) : null}
 
@@ -313,7 +315,7 @@ export function TemplateGenerationProgressPage() {
                     ) : null}
                   </div>
                   <span>{unitStatusLabel(unit.status)}</span>
-                  {unit.questionCount !== undefined ? (
+                  {unit.questionCount !== undefined && (unit.questionCount > 0 || unit.status === "extracted" || unit.status === "confirmed") ? (
                     <small>{unit.questionCount}問を抽出</small>
                   ) : null}
                   {unit.orientationCorrectionSummary ? (

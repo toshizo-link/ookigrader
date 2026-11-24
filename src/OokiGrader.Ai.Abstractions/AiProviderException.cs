@@ -21,7 +21,8 @@ public sealed class AiProviderException : Exception
         bool isTransient,
         TimeSpan? retryAfter = null,
         Exception? innerException = null,
-        int? httpStatusCode = null)
+        int? httpStatusCode = null,
+        string? modelRoutingReason = null)
         : base(safeErrorCode, innerException)
     {
         Kind = kind;
@@ -29,6 +30,7 @@ public sealed class AiProviderException : Exception
         IsTransient = isTransient;
         RetryAfter = retryAfter;
         HttpStatusCode = httpStatusCode;
+        ModelRoutingReason = modelRoutingReason;
     }
 
     public AiFailureKind Kind { get; }
@@ -40,4 +42,6 @@ public sealed class AiProviderException : Exception
     public TimeSpan? RetryAfter { get; }
 
     public int? HttpStatusCode { get; }
+
+    public string? ModelRoutingReason { get; }
 }

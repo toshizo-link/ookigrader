@@ -5,6 +5,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using OokiGrader.Application.Abstractions;
 using OokiGrader.Application.Identifiers;
+using OokiGrader.Domain.Templates;
 using OokiGrader.Host.Api;
 using OokiGrader.Host.Jobs;
 using OokiGrader.Host.Reports;
@@ -18,6 +19,25 @@ namespace OokiGrader.IntegrationTests;
 
 public sealed class ResultPdfJobWorkerTests
 {
+    [Theory]
+    [InlineData(TestType.Hop, true)]
+    [InlineData(TestType.Step, true)]
+    [InlineData(TestType.ClassPlacement, true)]
+    [InlineData(TestType.Other, false)]
+    [InlineData(null, false)]
+    public async Task PublishedTestTypeDeterminesWhetherUniformRowsRetainPoints(TestType? testType, bool expected)
+    {
+        await using var fixture = await ResultPdfWorkerFixture.CreateAsync();
+        var seeded = await fixture.SeedAsync();
+        await using var db = await fixture.CreateDbContextAsync();
+        var version = await db.TemplateVersions.SingleAsync();
+        version.TestType = testType;
+        await db.SaveChangesAsync();
+        var source = await ResultReportSourceLoader.LoadAsync(db, seeded.SubmissionId,
+            "verdict-column", DateTimeOffset.UtcNow, true, CancellationToken.None);
+        Assert.Equal(expected, source.Document.AlwaysShowQuestionPoints);
+    }
+
     [Fact]
     public async Task ReportUsesTokyoFinalizationDateWhenTestDateIsOmitted()
     {

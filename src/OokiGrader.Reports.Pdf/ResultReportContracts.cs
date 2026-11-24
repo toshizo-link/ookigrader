@@ -19,7 +19,14 @@ public sealed record ResultReportDocument(
     string? StudentGradeLabel = null,
     string? StudentClassLabel = null,
     string? OriginalScanSha256 = null,
-    int? MaximumMistakesToPass = null);
+    int? MaximumMistakesToPass = null,
+    bool AlwaysShowQuestionPoints = false)
+{
+    public bool ShowQuestionPoints => AlwaysShowQuestionPoints || Questions.Any(question =>
+        question.MaximumPointsMilli != Questions[0].MaximumPointsMilli
+        || question.Outcome == "partial"
+        || question.AwardedPointsMilli != (question.Outcome == "correct" ? question.MaximumPointsMilli : 0));
+}
 
 public sealed record ResultReportQuestion(
     string DisplayLabel,

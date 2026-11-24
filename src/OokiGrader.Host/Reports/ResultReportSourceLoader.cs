@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using OokiGrader.Application.Abstractions;
+using OokiGrader.Domain.Templates;
 using OokiGrader.Infrastructure.Persistence;
 using OokiGrader.Infrastructure.Persistence.Entities;
 using OokiGrader.Reports.Pdf;
@@ -175,7 +176,8 @@ internal static class ResultReportSourceLoader
             submission.AssignedStudent.SchoolClass
                 ?? submission.TestSession.ClassLabel,
             originalPdf?.Locator.Sha256,
-            submission.TestSession.MaximumMistakesToPass);
+            submission.TestSession.MaximumMistakesToPass,
+            AlwaysShowQuestionPoints: version.TestType is TestType.Hop or TestType.Step or TestType.ClassPlacement);
         return new ResultReportSource(
             document,
             submission.Id,

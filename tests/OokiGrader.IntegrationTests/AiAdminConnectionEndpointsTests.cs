@@ -621,6 +621,40 @@ public sealed class AiAdminConnectionEndpointsTests
     }
 
     [Fact]
+    public async Task TransientRecheckReportsFailureButRetainsVerifiedGeminiProfiles()
+    {
+        await using var application = await AiAdminTestApplication.CreateAsync();
+        var created = await application.PostAsync("/api/v1/admin/ai-connections",
+            ConnectionBody("synthetic-recheck-credential-1234567890", AiProviders.GeminiDirect, GeminiModel, testAndEnable: true));
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+        using var createdDocument = await ReadJsonAsync(created);
+        var connectionId = createdDocument.RootElement.GetProperty("id").GetString();
+        application.GeminiClient.Result = application.GeminiClient.Result with
+        {
+            State = "failed", SafeErrorCode = "gemini_provider_unavailable", HttpStatusCode = 503,
+            ImageInput = false, StructuredOutput = false,
+        };
+        var recheck = await application.PostAsync($"/api/v1/admin/ai-connections/{connectionId}:test");
+        Assert.Equal(HttpStatusCode.OK, recheck.StatusCode);
+        using var result = await ReadJsonAsync(recheck);
+        Assert.Equal("failed", result.RootElement.GetProperty("state").GetString());
+        Assert.True(result.RootElement.GetProperty("previousConfigurationRetained").GetBoolean());
+        using var list = await ReadJsonAsync(await application.GetAsync("/api/v1/admin/ai-connections"));
+        var effective = list.RootElement.GetProperty("items")[0].GetProperty("lastCapabilityProbe");
+        Assert.Equal("passed", effective.GetProperty("state").GetString());
+        Assert.True(effective.GetProperty("imageInput").GetBoolean());
+        Assert.True(effective.GetProperty("structuredOutput").GetBoolean());
+        await application.WithDatabaseAsync(async db =>
+        {
+            var stored = await db.AiConnections.AsNoTracking().SingleAsync();
+            Assert.Equal("active", stored.State);
+            Assert.Equal("passed", stored.LastCapabilityProbeState);
+            Assert.Equal(4, await db.AiTaskProfiles.CountAsync(p => p.Active));
+            Assert.Equal(1, await db.AiCapabilityProbes.CountAsync(p => p.SafeErrorCode == "gemini_provider_unavailable"));
+        });
+    }
+
+    [Fact]
     public async Task FailedRecheckMarksExistingProfilesStaleForClients()
     {
         await using var application = await AiAdminTestApplication.CreateAsync();

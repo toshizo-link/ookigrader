@@ -36,32 +36,39 @@ internal static class Gemini38UpgradeMigration
             .ThenByDescending(item => item.UpdatedAt)
             .ThenByDescending(item => item.Id)
             .FirstOrDefaultAsync(cancellationToken);
-        if (connection is null
-            || await db.AuditEvents.AnyAsync(
-                item => item.EventType == AuditEventType
-                    && item.ObjectId == connection.Id,
-                cancellationToken))
+        if (connection is null || connection.State == "disabled")
         {
             return false;
         }
 
+        var previousUpgrade = await db.AuditEvents.AsNoTracking()
+            .Where(item => item.EventType == AuditEventType && item.ObjectId == connection.Id)
+            .OrderByDescending(item => item.OccurredAt).ThenByDescending(item => item.Id)
+            .FirstOrDefaultAsync(cancellationToken);
+        if (previousUpgrade is not null && !WasBlockedByTransientUpgrade(connection, previousUpgrade))
+            return false;
+
         var previousModelId = connection.ModelId;
         // A model switch does not rotate or rewrite the stored API key. Its
         // credential revision and opaque secret reference must stay aligned.
-        connection.ModelId = ModelId;
-        connection.EndpointProfile = AiProviderCatalog.GeminiEndpointProfile;
-        connection.TimeoutSeconds = 300;
         var result = await ProbeAsync(
             connection,
             featurePolicy,
             secretStore,
             providerResolver,
             cancellationToken);
-        var now = timeProvider.GetUtcNow();
-        var ready = AiAdminEndpoints.IsSuccessfulImageProbe(connection, result);
+        // An inconclusive probe for the replacement model says nothing about
+        // the existing credentials or profiles. Retry on a subsequent startup.
+        if (AiAdminEndpoints.IsTransientGeminiProbeFailure(connection, result))
+            return false;
 
+        var now = timeProvider.GetUtcNow();
         await using var transaction = await db.Database.BeginTransactionAsync(
             cancellationToken);
+        connection.ModelId = ModelId;
+        connection.EndpointProfile = AiProviderCatalog.GeminiEndpointProfile;
+        connection.TimeoutSeconds = 300;
+        var ready = AiAdminEndpoints.IsSuccessfulImageProbe(connection, result);
         AiAdminEndpoints.ApplyProbeResult(connection, result, now);
         db.AiCapabilityProbes.Add(AiAdminEndpoints.BuildProbe(
             connection,
@@ -73,7 +80,7 @@ internal static class Gemini38UpgradeMigration
             connection.CreatedByStaffUserId,
             promptCatalog,
             now,
-            replaceOtherProviders: true,
+            replaceOtherProviders: ready && previousUpgrade is null,
             cancellationToken: cancellationToken,
             activate: ready);
         db.AuditEvents.Add(new AuditEventEntity
@@ -96,6 +103,33 @@ internal static class Gemini38UpgradeMigration
         await db.SaveChangesAsync(cancellationToken);
         await transaction.CommitAsync(cancellationToken);
         return true;
+    }
+
+    private static bool WasBlockedByTransientUpgrade(AiConnectionEntity connection, AuditEventEntity audit)
+    {
+        // Earlier releases recorded even an inconclusive migration probe as complete.
+        // Limit recovery to its exact blocked model, credential and probe; a later
+        // administrator selection, reconnect or probe must not be overwritten.
+        if (connection.State != "blocked" || connection.ModelId != ModelId
+            || connection.LastCapabilityProbeState != "failed" || connection.LastCapabilityProbeAt != audit.OccurredAt
+            || connection.LastCapabilityProbeErrorCode is not ("gemini_rate_limited" or "gemini_timeout"
+                or "gemini_network_error" or "gemini_provider_unavailable")
+            || audit.SafeMetadataJson is null)
+            return false;
+        try
+        {
+            using var document = JsonDocument.Parse(audit.SafeMetadataJson);
+            var data = document.RootElement;
+            return data.ValueKind == JsonValueKind.Object
+                && data.TryGetProperty("CredentialRevision", out var revision) && revision.ValueKind == JsonValueKind.Number
+                && revision.TryGetInt64(out var value) && value == connection.CredentialRevision
+                && data.TryGetProperty("capabilityProbeErrorCode", out var error) && error.ValueKind == JsonValueKind.String
+                && error.GetString() == connection.LastCapabilityProbeErrorCode;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
     }
 
     private static async Task<AiCapabilityProbeResult> ProbeAsync(
@@ -127,7 +161,7 @@ internal static class Gemini38UpgradeMigration
                 ModelId,
                 // Keep a network outage from holding up the Windows service's
                 // upgrade startup. The configured request timeout is retained.
-                TimeSpan.FromSeconds(Math.Clamp(connection.TimeoutSeconds, 5, 25)));
+                TimeSpan.FromSeconds(25));
             return await providerResolver.GetRequired(connection.Provider)
                 .ProbeAsync(settings, secret.Utf8Bytes, cancellationToken);
         }
