@@ -11,8 +11,10 @@ namespace OokiGrader.Infrastructure.Tests;
 
 public sealed class OpenRouterMigrationTests
 {
-    [Fact]
-    public async Task UpgradePreservesGeminiAndAllowsOneOpenRouterConnection()
+    [Theory]
+    [InlineData("high")]
+    [InlineData("medium")]
+    public async Task UpgradePreservesGeminiAndAllowsOneOpenRouterConnection(string gradingResolution)
     {
         var rootPath = Path.Combine(
             Path.GetTempPath(),
@@ -40,19 +42,28 @@ public sealed class OpenRouterMigrationTests
                 var migrator = context.GetService<IMigrator>();
                 await migrator.MigrateAsync(
                     "20260805000000_0015_NonModelAnswerTemplateSourceRole");
-                var geminiConnection = Connection(
-                    geminiId,
-                    "geminiDirect",
-                    "googleGenerativeLanguage",
-                    "gemini-3.5-flash-lite",
-                    now);
-                context.AddRange(
-                    geminiConnection,
-                    Profile(
-                        geminiProfileId,
-                        geminiConnection,
-                        now.AddMilliseconds(2)));
-                await context.SaveChangesAsync();
+                // Seed the 0015 schema directly so the upgrade runs against the historical columns.
+                var timestamp = now.ToUnixTimeMilliseconds();
+                var staffId = UlidId.New(now);
+                await context.Database.ExecuteSqlAsync($"""
+                    INSERT INTO ai_connection
+                        (id, provider, endpoint_profile, model_id, secret_reference, key_fingerprint,
+                         credential_revision, timeout_seconds, concurrency_limit, state,
+                         created_by_staff_user_id, created_at, updated_at, revision)
+                    VALUES ({geminiId}, 'geminiDirect', 'googleGenerativeLanguage', 'gemini-3.5-flash-lite',
+                            'secret:fixture', 'sha256:test', 1, 75, 2, 'active',
+                            {staffId}, {timestamp}, {timestamp}, 1);
+                    """);
+                await context.Database.ExecuteSqlAsync($"""
+                    INSERT INTO ai_task_profile
+                        (id, name, task_type, ai_connection_id, connection_revision, model_id, processing_strategy,
+                         prompt_version, schema_version, prompt_content_hash, thinking_level, media_resolution,
+                         max_output_tokens, concurrency_limit, approval_state, active, created_by_staff_user_id,
+                         created_at, updated_at, revision)
+                    VALUES ({geminiProfileId}, 'grading', 'initialGrading', {geminiId}, 1, 'gemini-3.5-flash-lite',
+                            'queued_standard', 'test-v1', 'test-v1', {new string('a', 64)}, 'low', {gradingResolution},
+                            8192, 1, 'capability_passed', 1, {staffId}, {timestamp}, {timestamp}, 1);
+                    """);
 
                 await migrator.MigrateAsync();
             }
@@ -63,10 +74,12 @@ public sealed class OpenRouterMigrationTests
                     .AsNoTracking()
                     .SingleAsync(item => item.Id == geminiId);
                 Assert.Equal("geminiDirect", preserved.Provider);
+                Assert.Equal(gradingResolution, preserved.InitialGradingMediaResolution);
                 var preservedProfile = await context.AiTaskProfiles
                     .AsNoTracking()
                     .SingleAsync(item => item.Id == geminiProfileId);
                 Assert.Equal(geminiId, preservedProfile.AiConnectionId);
+                Assert.Equal(gradingResolution, preservedProfile.MediaResolution);
 
                 context.AiConnections.Add(Connection(
                     UlidId.New(now.AddSeconds(1)),

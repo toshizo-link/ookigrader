@@ -43,6 +43,7 @@ interface AiConnection {
   configured: boolean;
   keyFingerprint?: string;
   modelId: string;
+  initialGradingMediaResolution?: "high" | "medium" | null;
   state: string;
   timeoutSeconds: number;
   concurrencyLimit: number;
@@ -54,6 +55,11 @@ interface AiConnection {
     imageInput?: boolean;
     structuredOutput?: boolean;
   };
+  lastBatchCapabilityProbe?: {
+    state: string;
+    checkedAt?: string;
+    safeErrorCode?: string;
+  } | null;
 }
 
 interface AiCapabilityProbeResult {
@@ -68,8 +74,10 @@ interface AiCapabilityProbeResult {
   checkedAt?: string;
 }
 
-const geminiDefaultModel = "gemini-3.7-flash";
+const geminiDefaultModel = "gemini-3.8-flash";
 const deepSeekV4FlashModel = "deepseek/deepseek-v4-flash";
+const retainedBatchOutputCode = "gemini_batch_probe_provider_managed_output";
+const retainedBatchOutputNotice = "確認用の出力ファイルはGemini側に残っています。";
 const temporaryGeminiProbeErrors: Record<string, string> = {
   gemini_rate_limited: "Gemini APIの利用上限に達しました。",
   gemini_provider_unavailable: "Gemini側の一時エラーで接続を確認できませんでした。",
@@ -926,9 +934,11 @@ function AiConfigurationView({
   }>();
   const [apiKey, setApiKey] = useState("");
   const [modelId, setModelId] = useState(geminiDefaultModel);
+  const [initialGradingMediaResolution, setInitialGradingMediaResolution] = useState("medium");
   const [timeoutSeconds, setTimeoutSeconds] = useState("75");
   const [concurrencyLimit, setConcurrencyLimit] = useState("2");
   const [probingConnectionId, setProbingConnectionId] = useState<string>();
+  const [probingBatch, setProbingBatch] = useState(false);
   const [working, setWorking] = useState(false);
   const [message, setMessage] = useState<string>();
   const [error, setError] = useState<string>();
@@ -941,6 +951,7 @@ function AiConfigurationView({
     setModelId(
       connection?.modelId || defaultModelForProvider(provider),
     );
+    setInitialGradingMediaResolution(connection?.initialGradingMediaResolution ?? "medium");
     setTimeoutSeconds(String(connection?.timeoutSeconds ?? 75));
     setConcurrencyLimit(String(connection?.concurrencyLimit ?? 2));
     setError(undefined);
@@ -976,6 +987,7 @@ function AiConfigurationView({
         ...(replacingApiKey ? { apiKey } : {}),
         provider,
         modelId: selectedModelId,
+        ...(automaticSetup ? { initialGradingMediaResolution } : {}),
         timeoutSeconds: Number(timeoutSeconds),
         concurrencyLimit: Number(concurrencyLimit),
         revision: connection?.revision,
@@ -997,8 +1009,8 @@ function AiConfigurationView({
       setMessage(
         automaticSetup
           ? replacingApiKey
-            ? "Geminiの接続を確認して保存しました。全てのAI機能を利用できます。"
-            : "Geminiのモデルと接続設定を確認して保存しました。全てのAI機能を利用できます。"
+            ? "Geminiの接続を確認して保存しました。ひな形作成と通常採点を利用できます。"
+            : "Geminiのモデルと接続設定を確認して保存しました。ひな形作成と通常採点を利用できます。"
           : replacingApiKey
             ? "OpenRouterのAPIキーを保存しました。「再確認」を押して接続を確認してください。"
             : "OpenRouterのモデルと接続設定を保存しました。「再確認」を押して接続を確認してください。",
@@ -1037,7 +1049,7 @@ function AiConfigurationView({
       ) {
         setMessage(
           connection.provider === "geminiDirect"
-            ? "Geminiとの接続と必要な機能を確認しました。全てのAI機能を利用できます。"
+            ? "Geminiとの接続を確認しました。ひな形作成と通常採点を利用できます。"
             : "OpenRouterとの接続と必要な機能を確認しました。既定のAI機能はGemini設定を使用します。",
         );
       } else if (isDeepSeekV4Flash(connection.modelId)) {
@@ -1070,12 +1082,40 @@ function AiConfigurationView({
   }
 
   const connectionLoading = connections.status === "loading";
+  async function probeBatch(connection: AiConnection) {
+    if (working) return;
+    setWorking(true);
+    setProbingBatch(true);
+    setMessage(undefined);
+    setError(undefined);
+    try {
+      const result = await api.post<{
+        state: string;
+        safeErrorCode?: string;
+        cleanupSucceeded: boolean;
+      }>(`/admin/ai-connections/${encodeURIComponent(connection.id)}:test-batch`, {});
+      const retainedOutput = result.safeErrorCode === retainedBatchOutputCode;
+      if (result.state === "passed" && (result.cleanupSucceeded || retainedOutput)) {
+        const notice = retainedOutput ? ` ${retainedBatchOutputNotice}` : "";
+        setMessage(`Batch接続を確認しました。新しいテスト実施では、まとめ採点が最初に選択されます。${notice}`);
+      } else {
+        const detail = result.cleanupSucceeded ? "" : " 確認用データの削除状況をGemini側で確認してください。";
+        const code = result.safeErrorCode ? `（${result.safeErrorCode}）` : "";
+        setError(`Batch接続を確認できませんでした${code}。${detail}`);
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Batch接続を確認できませんでした。");
+    } finally {
+      connections.reload();
+      setProbingBatch(false);
+      setWorking(false);
+    }
+  }
   const profileItems = profiles.data?.items ?? [];
   const aiTasks = [
     "templateExtraction",
     "nameTranscription",
     "initialGrading",
-    "adjudication",
   ];
 
   return (
@@ -1096,7 +1136,7 @@ function AiConfigurationView({
         </p>
         {geminiConnection?.modelId === "gemini-3.8-flash" ? (
           <p>
-            ひな形作成・採点・再確認はGemini 3.8 Flash、氏名読み取りは3.5 Flash-Liteを使います。
+            ひな形作成と採点にはGemini 3.8 Flashを使います。氏名だけを読み取る場合は3.5 Flash-Liteを使います。
             3.8の利用上限に達すると3.5で処理を続け、上限の解除後は自動で3.8に戻ります。
             実際に使用したモデルはAI使用履歴で確認できます。
           </p>
@@ -1116,6 +1156,8 @@ function AiConfigurationView({
             openConnectionEditor("geminiDirect", geminiConnection)
           }
           onProbe={probeConnection}
+          onProbeBatch={probeBatch}
+          probingBatch={probingBatch}
         />
 
         <Card>
@@ -1197,7 +1239,7 @@ function AiConfigurationView({
           <div>
             <h2>利用中のAI機能</h2>
             <p>
-              ひな形作成、氏名読み取り、採点、判定の再確認に使う設定です。
+              ひな形作成、氏名読み取り、採点に使う設定です。
             </p>
           </div>
         </div>
@@ -1413,6 +1455,22 @@ function AiConfigurationView({
               />
             </Field>
           )}
+          {connectionEditor?.provider === "geminiDirect" ? (
+            <Field
+              label="初回採点の画像解像度"
+              htmlFor="ai-initial-grading-resolution"
+              hint="標準では画像入力のトークン数を抑えられる場合があります。細かな漢字や薄い筆跡を読むときは高精細を選んでください。"
+            >
+              <select
+                id="ai-initial-grading-resolution"
+                value={initialGradingMediaResolution}
+                onChange={(event) => setInitialGradingMediaResolution(event.target.value)}
+              >
+                <option value="medium">標準（既定）</option>
+                <option value="high">高精細</option>
+              </select>
+            </Field>
+          ) : null}
           {connectionEditor?.provider === "geminiDirect" &&
           modelId.trim() &&
           !isValidAiModelId("geminiDirect", modelId.trim()) ? (
@@ -1504,6 +1562,8 @@ function AiConnectionCard({
   onRetry,
   onEdit,
   onProbe,
+  onProbeBatch,
+  probingBatch,
 }: {
   provider: AiProvider;
   connection?: AiConnection;
@@ -1514,6 +1574,8 @@ function AiConnectionCard({
   onRetry: () => void;
   onEdit: () => void;
   onProbe: (connection: AiConnection) => void;
+  onProbeBatch?: (connection: AiConnection) => void;
+  probingBatch?: boolean;
 }) {
   const providerLabel = aiProviderLabel(provider);
   const probe = connection?.lastCapabilityProbe;
@@ -1577,6 +1639,30 @@ function AiConnectionCard({
               {probing ? "再確認中…" : "再確認"}
             </Button>
           </div>
+          {onProbeBatch ? (
+            <div className="stack">
+              <div>
+                <strong>まとめ採点（Gemini Batch）</strong>
+                <p>
+                  {connection.lastBatchCapabilityProbe?.state === "passed"
+                    ? `確認済み（${formatDateTime(connection.lastBatchCapabilityProbe.checkedAt)}）`
+                    : connection.lastBatchCapabilityProbe?.state === "failed"
+                      ? `接続確認に失敗しました（${connection.lastBatchCapabilityProbe.safeErrorCode || "原因不明"}）。`
+                      : "新しいテスト実施でまとめ採点を使うには、「Batch接続を確認」を押してください。"}
+                  {connection.lastBatchCapabilityProbe?.state === "passed"
+                    && connection.lastBatchCapabilityProbe.safeErrorCode === retainedBatchOutputCode
+                    && ` ${retainedBatchOutputNotice}`}
+                  確認時はテスト用画像を1件送信します。
+                </p>
+              </div>
+              <div>
+                <Button variant="secondary" onClick={() => onProbeBatch(connection)}
+                  disabled={working || connection.state !== "active" || probe?.state !== "passed"}>
+                  {probingBatch ? "Batch接続を確認中…" : "Batch接続を確認"}
+                </Button>
+              </div>
+            </div>
+          ) : null}
           {deepSeekTextOnly ? (
             <InlineAlert tone="warning">
               <p>
@@ -3028,15 +3114,17 @@ function JobsView({
                   </td>
                   <td>
                     <div className="row-actions">
-                      <Button
-                        size="small"
-                        variant="secondary"
-                        leadingIcon="retry"
-                        disabled={workingId === job.id}
-                        onClick={() => void action(job, "retry")}
-                      >
-                        再試行
-                      </Button>
+                      {job.jobType !== "gemini_answer_adjudication" && (
+                        <Button
+                          size="small"
+                          variant="secondary"
+                          leadingIcon="retry"
+                          disabled={workingId === job.id}
+                          onClick={() => void action(job, "retry")}
+                        >
+                          再試行
+                        </Button>
+                      )}
                       {job.state === "queued" ? (
                         <Button
                           size="small"

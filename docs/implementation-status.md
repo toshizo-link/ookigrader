@@ -208,7 +208,7 @@ here supersede the older Batch/priority controls in the baseline
   questions, labels, text, answers, points, and grading policy without asking
   teachers or Gemini for rectangles. Japanese sheets may interleave questions,
   maps/tables, shared answer grids, and long written answers on one page.
-- Template extraction and adjudication use complete normalized pages. For an
+- Template extraction uses complete normalized pages. For an
   ordered submission, the first combined analysis chunk reads identity from
   logical page 1 while grading its visible answers; later chunks return no
   identity. Initial grading consumes every normalized page through deterministic consecutive chunks, so
@@ -219,12 +219,12 @@ here supersede the older Batch/priority controls in the baseline
 ### AI provider and grading path
 
 - Official Google Gemini direct client fixed to the configured
-  model identifier (`gemini-3.7-flash` in the checked-in flow), Google-host
+  model identifier (`gemini-3.8-flash` by default), Google-host
   allow-listing, bounded requests/responses, structured JSON schemas,
   task-specific thinking/media-resolution controls, usage metadata, safe
   failure classification, and capability probes. The current template profile
-  uses `medium` thinking and `high` media resolution; grading remains on its
-  separately versioned current profile.
+  uses `medium` thinking and `high` media resolution. Immediate and Batch
+  grading use `low` thinking on the default model.
 - Existing Gemini connections can change model without resubmitting the API key.
   The host leases the encrypted credential, runs the same full capability probe,
   and commits the new model/current profiles only on success. New Gemini 3.7
@@ -244,7 +244,7 @@ here supersede the older Batch/priority controls in the baseline
 - Gemini add/replace performs that full capability and representative image-task
   probe against the supplied candidate before persistence. Full success alone
   encrypts the key and atomically makes the exact current profiles for template
-  extraction, name transcription, initial grading, and adjudication available
+  extraction, name transcription, and initial grading available
   with `approval_state=capability_passed`. Failure or an ambiguous replacement
   preserves the previous connection, key, and profile set. The manual connection
   test self-heals missing/stale current profiles, and startup reconciles active
@@ -256,7 +256,7 @@ here supersede the older Batch/priority controls in the baseline
   production secret-storage claim; Testing remains process-local.
 - Teacher-gated template extraction, combined page-1 name/student-number
   transcription plus initial semantic grading, deterministic grading shortcuts,
-  second-pass adjudication, retry schedules, and provider-free/name-only legacy
+  teacher review of flagged results, retry schedules, and provider-free/name-only legacy
   fallback. Roster matching and student assignment remain local teacher gates.
 - Every supported question type now selects AI-rubric grading by default. The
   teacher-facing editor has one simple judgment preset with exact, numeric,
@@ -292,9 +292,9 @@ here supersede the older Batch/priority controls in the baseline
   same question from multiple chunks become the explicit manual-review result
   `ai_chunk_observation_conflict`. Oversized rubrics/instructions or a single
   page that cannot fit are rejected before provider media is read or sent.
-- An unassigned completed run is staged as non-current `awaiting_identity`; the
-  existing teacher assignment/unidentified action activates it and parked
-  adjudication without resending answer pages. Non-student samples never expose
+- An unassigned completed run is staged as non-current `awaiting_identity`. The
+  teacher assignment/unidentified action activates the saved results for review.
+  Non-student samples never expose
   the staged run.
 - The answer-specific grading workspace streams the original/assembled PDF,
   lazily falls back to normalized pages/thumbnails, exposes all current results,
@@ -395,13 +395,14 @@ here supersede the older Batch/priority controls in the baseline
 ## Checked-in safety defaults
 
 - Enabled: Gemini direct, optional OpenRouter connection configuration,
-  template extraction, semantic grading, adjudication, PDF reports, and
+  template extraction, semantic grading, PDF reports, and
   proactive storage retention. Gemini remains the selected default.
-- Disabled: Gemini Batch for new work, cross-provider failover, automatic
+- Gemini Batch is available per test session after an administrator checks the connection.
+- Disabled: cross-provider failover, automatic
   roster assignment, and automatic finalization.
 - Backup scheduling is disabled and its destination is blank.
-- A full Gemini candidate-key probe enables only the four current AI draft and
-  review-support profiles. Automatic roster assignment and automatic
+- A full Gemini candidate-key probe enables the current AI draft and grading
+  profiles. Automatic roster assignment and automatic
   finalization remain disabled, and teachers still review/publish/finalize.
 - Prompt/schema activation is version-exact. Startup and the manual connection
   test reconcile active Gemini profiles to the exact checked-in prompt, schema,

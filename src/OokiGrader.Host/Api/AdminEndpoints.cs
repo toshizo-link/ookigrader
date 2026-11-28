@@ -476,7 +476,7 @@ internal static class AdminEndpoints
         });
     }
 
-    private static Task<IResult> RetryJobAsync(
+    internal static Task<IResult> RetryJobAsync(
         string jobId,
         HttpContext context,
         OokiGraderDbContext database,
@@ -492,7 +492,7 @@ internal static class AdminEndpoints
             "job.retry",
             cancellationToken);
 
-    private static Task<IResult> CancelJobAsync(
+    internal static Task<IResult> CancelJobAsync(
         string jobId,
         HttpContext context,
         OokiGraderDbContext database,
@@ -530,6 +530,13 @@ internal static class AdminEndpoints
                 "指定されたジョブは存在しません。");
         }
 
+        if (job.Type == AiAdjudicationJobWorker.JobType && destinationState == "queued")
+        {
+            return ApiHelpers.Problem(context, StatusCodes.Status409Conflict,
+                "AUTOMATIC_ADJUDICATION_RETIRED", "このジョブは再実行できません",
+                "採点結果の要確認の設問は、答案の確認画面で確認してください。");
+        }
+
         if (!allowedSourceStates.Contains(job.State, StringComparer.Ordinal))
         {
             return ApiHelpers.Problem(
@@ -540,6 +547,19 @@ internal static class AdminEndpoints
                 $"状態が {job.State} のジョブにはこの操作を実行できません。");
         }
 
+        if (job.Type == AiBatchJobWorker.CleanupJobType)
+        {
+            var batch = await database.AiBatches.SingleOrDefaultAsync(
+                item => "ai-batch:" + item.Id + ":cleanup" == job.DeduplicationKey, cancellationToken);
+            if (batch is not null && batch.CleanupState != "completed")
+            {
+                batch.CleanupState = destinationState == "queued" ? "pending" : "failed";
+                if (destinationState == "queued")
+                {
+                    job.AttemptCount = 0;
+                }
+            }
+        }
         job.State = destinationState;
         job.NextAttemptAt = DateTimeOffset.UtcNow;
         job.LeaseOwner = null;
@@ -1044,6 +1064,7 @@ internal static class AdminEndpoints
                 (item.Type == AiBatchJobWorker.PrepareJobType
                     || item.Type == AiBatchJobWorker.SubmitJobType
                     || item.Type == AiBatchJobWorker.PollJobType
+                    || item.Type == AiBatchJobWorker.CleanupJobType
                     || item.Type == AiBatchJobWorker.ReconcileJobType)
                 && (item.State == "queued"
                     || item.State == "retry_waiting"

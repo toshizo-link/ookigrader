@@ -21,6 +21,7 @@ public sealed record AiBatchJobWorkerOptions
     public TimeSpan LeaseDuration { get; init; } = TimeSpan.FromMinutes(15);
     public int AggregationRequestCount { get; init; } = 20;
     public int MaximumRequestsPerBatch { get; init; } = 100;
+    public int TargetJsonLinesBytes { get; init; } = 64 * 1024 * 1024;
     public int MaximumRequestAttempts { get; init; } = 3;
     public TimeSpan MaximumAggregationWait { get; init; } =
         TimeSpan.FromMinutes(5);
@@ -42,6 +43,7 @@ public sealed record AiBatchJobWorkerOptions
             || AggregationRequestCount is < 1 or > 100
             || MaximumRequestsPerBatch < AggregationRequestCount
             || MaximumRequestsPerBatch > 10_000
+            || TargetJsonLinesBytes is < 1 or > 1024 * 1024 * 1024
             || MaximumRequestAttempts is < 1 or > 8
             || MaximumAggregationWait < TimeSpan.Zero
             || MaximumAggregationWait > TimeSpan.FromHours(1)
@@ -68,6 +70,7 @@ public sealed partial class AiBatchJobWorker : BackgroundService
     public const string PrepareJobType = "gemini_batch_prepare";
     public const string SubmitJobType = "gemini_batch_submit";
     public const string PollJobType = "gemini_batch_poll";
+    public const string CleanupJobType = "gemini_batch_cleanup";
     public const string ReconcileJobType = "gemini_batch_reconcile";
     public const int JobSchemaVersion = 1;
 
@@ -84,6 +87,7 @@ public sealed partial class AiBatchJobWorker : BackgroundService
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<AiBatchJobWorker> _logger;
     private readonly AiBatchJobWorkerOptions _options;
+    private bool _checkedHistoricalCleanup;
     private readonly string _workerId = $"gemini-batch-{Guid.NewGuid():N}";
 
     public AiBatchJobWorker(
@@ -108,6 +112,11 @@ public sealed partial class AiBatchJobWorker : BackgroundService
     public async Task<bool> ProcessNextAsync(
         CancellationToken cancellationToken = default)
     {
+        if (!_checkedHistoricalCleanup)
+        {
+            await RecoverHistoricalCleanupAsync(cancellationToken).ConfigureAwait(false);
+            _checkedHistoricalCleanup = true;
+        }
         var lease = await LeaseNextAsync(cancellationToken).ConfigureAwait(false);
         if (lease is null)
         {
@@ -140,6 +149,9 @@ public sealed partial class AiBatchJobWorker : BackgroundService
                     await PollBatchAsync(lease, cancellationToken)
                         .ConfigureAwait(false);
                     break;
+                case CleanupJobType:
+                    await CleanupBatchAsync(lease, cancellationToken).ConfigureAwait(false);
+                    break;
                 case ReconcileJobType:
                     await ReconcileBatchAsync(lease, cancellationToken)
                         .ConfigureAwait(false);
@@ -164,6 +176,12 @@ public sealed partial class AiBatchJobWorker : BackgroundService
                 lease.Id,
                 lease.Type,
                 exception.GetType().Name);
+            // Cleanup retains its durable lease if saving its outcome fails. A
+            // later worker can repeat a DELETE, including after the final lease.
+            if (lease.Type == CleanupJobType)
+            {
+                return true;
+            }
             await RetryJobAsync(
                     lease.Id,
                     "ai_batch_worker_error",
@@ -203,8 +221,10 @@ public sealed partial class AiBatchJobWorker : BackgroundService
                     (item.Type == PrepareJobType
                         || item.Type == SubmitJobType
                         || item.Type == PollJobType
-                        || item.Type == ReconcileJobType)
-                    && item.AttemptCount < item.MaxAttempts
+                        || item.Type == ReconcileJobType
+                        || item.Type == CleanupJobType)
+                    && (item.AttemptCount < item.MaxAttempts
+                        || (item.Type == CleanupJobType && item.State == "leased"))
                     && ((item.State == "queued" && item.NextAttemptAt <= now)
                         || (item.State == "retry_waiting"
                             && item.NextAttemptAt <= now)
@@ -223,9 +243,9 @@ public sealed partial class AiBatchJobWorker : BackgroundService
             }
 
             job.State = "leased";
-            job.LeaseOwner = _workerId;
+            job.LeaseOwner = job.Type == CleanupJobType ? $"{_workerId}:{UlidId.New(now)}" : _workerId;
             job.LeaseExpiresAt = now.Add(_options.LeaseDuration);
-            job.AttemptCount = checked(job.AttemptCount + 1);
+            job.AttemptCount = Math.Min(job.MaxAttempts, checked(job.AttemptCount + 1));
             job.StartedAt ??= now;
             job.ErrorCode = null;
             job.SafeErrorDetail = null;
@@ -236,7 +256,8 @@ public sealed partial class AiBatchJobWorker : BackgroundService
                 job.Type,
                 job.SchemaVersion,
                 job.PayloadJson,
-                job.CorrelationId);
+                job.CorrelationId,
+                job.LeaseOwner);
         }, cancellationToken);
     }
 
@@ -264,20 +285,19 @@ public sealed partial class AiBatchJobWorker : BackgroundService
             var job = await LoadOwnedJobAsync(db, lease.Id, token)
                 .ConfigureAwait(false);
             var now = _timeProvider.GetUtcNow();
-            var candidates = await db.AiBatchRequests
-                .Include(item => item.AiRequest)
-                    .ThenInclude(item => item.AiTaskProfile)
-                        .ThenInclude(item => item.AiConnection)
+            var readyRequests = db.AiBatchRequests
                 .Where(item =>
                     item.State == "ready"
                     && item.AiBatchId == null
                     && item.CompatibilityKey == payload.CompatibilityKey)
                 .OrderBy(item => item.CreatedAt)
-                .ThenBy(item => item.Id)
+                .ThenBy(item => item.Id);
+            var headers = await readyRequests
+                .Select(item => new { item.Id, item.CreatedAt, item.ProviderRequestBytes })
                 .Take(_options.MaximumRequestsPerBatch)
                 .ToListAsync(token)
                 .ConfigureAwait(false);
-            if (candidates.Count == 0)
+            if (headers.Count == 0)
             {
                 CompleteJob(job, now);
                 await db.SaveChangesAsync(token).ConfigureAwait(false);
@@ -285,10 +305,26 @@ public sealed partial class AiBatchJobWorker : BackgroundService
                 return;
             }
 
-            var dueAt = candidates[0].CreatedAt.Add(
-                _options.MaximumAggregationWait);
+            var selectedIds = new List<string>();
+            long jsonLinesBytes = 0;
+            foreach (var header in headers)
+            {
+                var lineBytes = header.ProviderRequestBytes + 1; // Final LF on every JSONL record.
+                if (selectedIds.Count > 0 && jsonLinesBytes + lineBytes > _options.TargetJsonLinesBytes)
+                {
+                    break;
+                }
+
+                // A single supported request may exceed the aggregation target.
+                selectedIds.Add(header.Id);
+                jsonLinesBytes += lineBytes;
+            }
+
+            var fullByBytes = selectedIds.Count < headers.Count || jsonLinesBytes >= _options.TargetJsonLinesBytes;
+            var dueAt = headers[0].CreatedAt.Add(_options.MaximumAggregationWait);
             if (!payload.SubmitNow
-                && candidates.Count < _options.AggregationRequestCount
+                && !fullByBytes
+                && selectedIds.Count < _options.AggregationRequestCount
                 && now < dueAt)
             {
                 RetryJob(job, "ai_batch_waiting_for_aggregation", dueAt);
@@ -297,87 +333,98 @@ public sealed partial class AiBatchJobWorker : BackgroundService
                 return;
             }
 
-            if (candidates.Any(item => !IsCurrentDispatchProfile(
-                    item.AiRequest.AiTaskProfile)))
+            var candidates = await readyRequests
+                .Where(item => selectedIds.Contains(item.Id))
+                .Include(item => item.AiRequest)
+                    .ThenInclude(item => item.AiTaskProfile)
+                        .ThenInclude(item => item.AiConnection)
+                .ToListAsync(token)
+                .ConfigureAwait(false);
+            candidates = await KeepDispatchableRequestsAsync(db, candidates, now, token).ConfigureAwait(false);
+            if (candidates.Count == 0)
             {
-                const string errorCode = "ai_batch_profile_unavailable";
-                FailUndispatchedRequests(db, candidates, now, errorCode);
-                FailJob(job, now, errorCode);
+                FailJob(job, now, "ai_batch_profile_unavailable");
                 await db.SaveChangesAsync(token).ConfigureAwait(false);
                 await transaction.CommitAsync(token).ConfigureAwait(false);
                 return;
             }
 
-            ValidateCandidates(candidates);
-            var firstRequest = candidates[0].AiRequest;
-            var profile = firstRequest.AiTaskProfile;
-            var connection = profile.AiConnection;
-            var batchId = UlidId.New(now);
-            var manifestItems = candidates.Select(
-                    (item, ordinal) => new
-                    {
-                        ordinal,
-                        batchRequestId = item.Id,
-                        item.AiRequestId,
-                        item.RequestKey,
-                        item.ProviderRequestHash,
-                    })
-                .ToArray();
-            var manifestJson = JsonSerializer.Serialize(new
-            {
-                schemaVersion = 1,
-                provider = AiProviders.GeminiDirect,
-                modelId = profile.ModelId,
-                payload.CompatibilityKey,
-                connectionId = connection.Id,
-                connectionRevision = profile.ConnectionRevision,
-                profileId = profile.Id,
-                profileRevision = firstRequest.TaskProfileRevision,
-                requests = manifestItems,
-            });
-            var manifestHash = Sha256(Encoding.UTF8.GetBytes(manifestJson));
-            var batch = new AiBatchEntity
-            {
-                Id = batchId,
-                Provider = AiProviders.GeminiDirect,
-                ModelId = profile.ModelId,
-                AiConnectionId = connection.Id,
-                ConnectionRevision = profile.ConnectionRevision,
-                AiTaskProfileId = profile.Id,
-                TaskProfileRevision = firstRequest.TaskProfileRevision,
-                CompatibilityKey = payload.CompatibilityKey,
-                ManifestJson = manifestJson,
-                ManifestHash = manifestHash,
-                DisplayName = $"ooki-{batchId}-{manifestHash[..12]}",
-                State = "prepared",
-                RequestCount = candidates.Count,
-                PendingRequestCount = candidates.Count,
-                ReconciliationDeadlineAt = now.Add(
-                    _options.ReconciliationWindow),
-                NextActionAt = now,
-                CreatedAt = now,
-                UpdatedAt = now,
-            };
-            db.AiBatches.Add(batch);
-            for (var index = 0; index < candidates.Count; index++)
-            {
-                candidates[index].AiBatchId = batch.Id;
-                candidates[index].Ordinal = index;
-                candidates[index].State = "prepared";
-                candidates[index].UpdatedAt = now;
-            }
-
-            EnqueueBatchJob(
-                db,
-                SubmitJobType,
-                batch,
-                $"ai-batch:{batch.Id}:submit:{batch.SubmissionEpoch}",
-                now,
-                lease.CorrelationId);
+            CreatePreparedBatch(db, candidates, payload.CompatibilityKey, lease.CorrelationId, now);
             CompleteJob(job, now);
             await db.SaveChangesAsync(token).ConfigureAwait(false);
             await transaction.CommitAsync(token).ConfigureAwait(false);
         }, cancellationToken);
+    }
+
+    private void CreatePreparedBatch(OokiGraderDbContext db, List<AiBatchRequestEntity> candidates,
+        string compatibilityKey, string? correlationId, DateTimeOffset now)
+    {
+        ValidateCandidates(candidates);
+        var firstRequest = candidates[0].AiRequest;
+        var profile = firstRequest.AiTaskProfile;
+        var connection = profile.AiConnection;
+        var batchId = UlidId.New(now);
+        var manifestItems = candidates.Select(
+                (item, ordinal) => new
+                {
+                    ordinal,
+                    batchRequestId = item.Id,
+                    item.AiRequestId,
+                    item.RequestKey,
+                    item.ProviderRequestHash,
+                })
+            .ToArray();
+        var manifestJson = JsonSerializer.Serialize(new
+        {
+            schemaVersion = 1,
+            provider = AiProviders.GeminiDirect,
+            modelId = profile.ModelId,
+            CompatibilityKey = compatibilityKey,
+            connectionId = connection.Id,
+            connectionRevision = profile.ConnectionRevision,
+            profileId = profile.Id,
+            profileRevision = firstRequest.TaskProfileRevision,
+            requests = manifestItems,
+        });
+        var manifestHash = Sha256(Encoding.UTF8.GetBytes(manifestJson));
+        var batch = new AiBatchEntity
+        {
+            Id = batchId,
+            Provider = AiProviders.GeminiDirect,
+            ModelId = profile.ModelId,
+            AiConnectionId = connection.Id,
+            ConnectionRevision = profile.ConnectionRevision,
+            AiTaskProfileId = profile.Id,
+            TaskProfileRevision = firstRequest.TaskProfileRevision,
+            CompatibilityKey = compatibilityKey,
+            ManifestJson = manifestJson,
+            ManifestHash = manifestHash,
+            DisplayName = $"ooki-{batchId}-{manifestHash[..12]}",
+            State = "prepared",
+            RequestCount = candidates.Count,
+            PendingRequestCount = candidates.Count,
+            ReconciliationDeadlineAt = now.Add(
+                _options.ReconciliationWindow),
+            NextActionAt = now,
+            CreatedAt = now,
+            UpdatedAt = now,
+        };
+        db.AiBatches.Add(batch);
+        for (var index = 0; index < candidates.Count; index++)
+        {
+            candidates[index].AiBatchId = batch.Id;
+            candidates[index].Ordinal = index;
+            candidates[index].State = "prepared";
+            candidates[index].UpdatedAt = now;
+        }
+
+        EnqueueBatchJob(
+            db,
+            SubmitJobType,
+            batch,
+            $"ai-batch:{batch.Id}:submit:{batch.SubmissionEpoch}",
+            now,
+            correlationId);
     }
 
     private async Task SubmitBatchAsync(
@@ -405,37 +452,10 @@ public sealed partial class AiBatchJobWorker : BackgroundService
             return;
         }
 
-        if (!claim.MayDispatch && claim.ProviderInputFileName is null)
-        {
-            return;
-        }
-
         using var secret = await _secretStore.ReadAsync(
                 new AiSecretReference(claim.SecretReference),
                 cancellationToken)
             .ConfigureAwait(false);
-        if (!claim.MayDispatch)
-        {
-            using var raw = JsonDocument.Parse("{}");
-            await CleanupProviderFilesAsync(
-                new RemoteClaim(
-                    claim.BatchId,
-                    string.Empty,
-                    claim.ProviderInputFileName,
-                    claim.SecretReference,
-                    claim.Connection),
-                new AiBatchStatus(
-                    string.Empty,
-                    claim.DisplayName,
-                    AiBatchRemoteState.Failed,
-                    null, null, _timeProvider.GetUtcNow(), null, null,
-                    "ai_batch_profile_unavailable",
-                    raw.RootElement.Clone()),
-                secret.Utf8Bytes,
-                cancellationToken).ConfigureAwait(false);
-            return;
-        }
-
         var inputFileName = claim.ProviderInputFileName;
         if (inputFileName is null)
         {
@@ -513,32 +533,6 @@ public sealed partial class AiBatchJobWorker : BackgroundService
                     exception,
                     cancellationToken)
                 .ConfigureAwait(false);
-            if (exception.Kind
-                == AiBatchCreateFailureKind.DefiniteRemoteRejection)
-            {
-                using var raw = JsonDocument.Parse("{}");
-                await CleanupProviderFilesAsync(
-                        new RemoteClaim(
-                            claim.BatchId,
-                            string.Empty,
-                            inputFileName,
-                            claim.SecretReference,
-                            claim.Connection),
-                        new AiBatchStatus(
-                            string.Empty,
-                            claim.DisplayName,
-                            AiBatchRemoteState.Failed,
-                            null,
-                            null,
-                            _timeProvider.GetUtcNow(),
-                            null,
-                            null,
-                            exception.SafeErrorCode,
-                            raw.RootElement.Clone()),
-                        secret.Utf8Bytes,
-                        cancellationToken)
-                    .ConfigureAwait(false);
-            }
         }
         catch (OperationCanceledException)
             when (cancellationToken.IsCancellationRequested)
@@ -650,12 +644,6 @@ public sealed partial class AiBatchJobWorker : BackgroundService
                     results,
                     cancellationToken)
                 .ConfigureAwait(false);
-            await CleanupProviderFilesAsync(
-                    claim,
-                    status,
-                    secret.Utf8Bytes,
-                    cancellationToken)
-                .ConfigureAwait(false);
             return;
         }
 
@@ -663,12 +651,6 @@ public sealed partial class AiBatchJobWorker : BackgroundService
                 lease.Id,
                 claim.BatchId,
                 status,
-                cancellationToken)
-            .ConfigureAwait(false);
-        await CleanupProviderFilesAsync(
-                claim,
-                status,
-                secret.Utf8Bytes,
                 cancellationToken)
             .ConfigureAwait(false);
     }
@@ -799,35 +781,6 @@ public sealed partial class AiBatchJobWorker : BackgroundService
             // A request with a previous model snapshot may be read to finish
             // an already submitted remote batch. Before the first create call,
             // however, an update must never start a new call to the old model.
-            var mayDispatch = batch.CreateAttemptCount > 0
-                || batch.ProviderBatchName is not null
-                || IsCurrentDispatchProfile(batch.AiTaskProfile);
-            if (!mayDispatch)
-            {
-                const string errorCode = "ai_batch_profile_unavailable";
-                batch.State = "failed";
-                batch.ErrorCode = errorCode;
-                batch.CompletedAt = now;
-                batch.NextActionAt = null;
-                batch.CleanupState = batch.ProviderInputFileName is null
-                    ? "completed"
-                    : "pending";
-                FailUndispatchedRequests(db, batch.Requests, now, errorCode);
-                FailJob(job, now, errorCode);
-                await db.SaveChangesAsync(token).ConfigureAwait(false);
-                return new SubmitClaim(
-                    batch.Id,
-                    batch.DisplayName,
-                    batch.ManifestHash,
-                    batch.RequestCount,
-                    batch.ProviderInputFileName,
-                    [],
-                    string.Empty,
-                    ToConnection(batch),
-                    batch.AiConnection.SecretReference,
-                    MayDispatch: false);
-            }
-
             ValidateBatchConfiguration(batch);
             var ordered = batch.Requests
                 .OrderBy(item => item.Ordinal)
@@ -851,6 +804,29 @@ public sealed partial class AiBatchJobWorker : BackgroundService
                 return null;
             }
 
+            if (batch.CreateAttemptCount == 0 && batch.ProviderBatchName is null)
+            {
+                var eligible = await KeepDispatchableRequestsAsync(db, ordered, now, token).ConfigureAwait(false);
+                if (eligible.Count != ordered.Length)
+                {
+                    // A mixed local batch can contain unfinished papers on a retired profile
+                    // alongside first chunks that must be scheduled on the new active profile.
+                    // Keep the original manifest for audit and upload a fresh file for the subset.
+                    const string errorCode = "ai_batch_profile_unavailable";
+                    batch.State = "failed";
+                    batch.ErrorCode = errorCode;
+                    batch.CompletedAt = now;
+                    batch.FailedRequestCount = ordered.Length - eligible.Count;
+                    batch.PendingRequestCount = 0;
+                    batch.NextActionAt = null;
+                    ScheduleCleanup(db, batch, now, job.CorrelationId);
+                    FailJob(job, now, errorCode);
+                    if (eligible.Count > 0) CreatePreparedBatch(db, eligible, batch.CompatibilityKey, job.CorrelationId, now);
+                    await db.SaveChangesAsync(token).ConfigureAwait(false);
+                    return null;
+                }
+            }
+
             var jsonLines = Encoding.UTF8.GetBytes(
                 string.Concat(
                     ordered.Select(item => item.ProviderRequestJson! + "\n")));
@@ -864,8 +840,7 @@ public sealed partial class AiBatchJobWorker : BackgroundService
                 jsonLines,
                 hash,
                 ToConnection(batch),
-                batch.AiConnection.SecretReference,
-                mayDispatch);
+                batch.AiConnection.SecretReference);
         }, cancellationToken);
     }
 
@@ -1123,7 +1098,7 @@ public sealed partial class AiBatchJobWorker : BackgroundService
                 batch.CreateAttemptCompletedAt = now;
                 batch.CompletedAt = now;
                 batch.NextActionAt = null;
-                batch.CleanupState = "pending";
+                ScheduleCleanup(db, batch, now, job.CorrelationId);
                 foreach (var mapping in batch.Requests)
                 {
                     mapping.State = "failed";
@@ -1237,7 +1212,6 @@ public sealed partial class AiBatchJobWorker : BackgroundService
             return new RemoteClaim(
                 batch.Id,
                 batch.ProviderBatchName,
-                batch.ProviderInputFileName,
                 batch.AiConnection.SecretReference,
                 ToConnection(batch));
         }, cancellationToken);
@@ -1360,6 +1334,8 @@ public sealed partial class AiBatchJobWorker : BackgroundService
             {
                 batch.State = "manual_review";
                 batch.ErrorCode = "gemini_batch_result_key_unknown";
+                ApplyRemoteMetadata(batch, status, now);
+                ScheduleCleanup(db, batch, now, job.CorrelationId);
                 batch.PossibleDuplicate = true;
                 batch.CompletedAt = now;
                 FailJob(job, now, batch.ErrorCode);
@@ -1553,14 +1529,13 @@ public sealed partial class AiBatchJobWorker : BackgroundService
             batch.SuccessfulRequestCount = successful;
             batch.FailedRequestCount = failed;
             batch.PendingRequestCount = 0;
-            batch.ProviderOutputFileName = status.OutputFileName;
-            batch.CleanupState = "pending";
             batch.CompletedAt = now;
             batch.NextActionAt = null;
             batch.ErrorCode = failed > 0
                 ? "gemini_batch_partial_failure"
                 : null;
             ApplyRemoteMetadata(batch, status, now);
+            ScheduleCleanup(db, batch, now, job.CorrelationId);
             CompleteJob(job, now);
             db.OutboxEvents.Add(new OutboxEventEntity
             {
@@ -1801,7 +1776,7 @@ public sealed partial class AiBatchJobWorker : BackgroundService
         }
 
         var retryRequestId = UlidId.New(now);
-        var retryRequestKey = $"grade_{retryRequestId}";
+        var retryRequestKey = InitialGradingWire.RetryKey(retryRequestId, failedMapping.RequestKey);
         string retryJson;
         try
         {
@@ -1846,6 +1821,7 @@ public sealed partial class AiBatchJobWorker : BackgroundService
         {
             Id = retryRequestId,
             RequestKey = retryRequestKey,
+            GradingMode = "batch",
             AiTaskProfileId = failedRequest.AiTaskProfileId,
             TaskProfileRevision = failedRequest.TaskProfileRevision,
             Purpose = failedRequest.Purpose,
@@ -2048,8 +2024,8 @@ public sealed partial class AiBatchJobWorker : BackgroundService
                 ?? "gemini_batch_remote_" + batch.State;
             batch.CompletedAt = now;
             batch.NextActionAt = null;
-            batch.CleanupState = "pending";
             ApplyRemoteMetadata(batch, status, now);
+            ScheduleCleanup(db, batch, now, job.CorrelationId);
             foreach (var mapping in batch.Requests)
             {
                 var cancelled =
@@ -2090,65 +2066,6 @@ public sealed partial class AiBatchJobWorker : BackgroundService
             CompleteJob(job, now);
             await db.SaveChangesAsync(token).ConfigureAwait(false);
         }, cancellationToken);
-    }
-
-    private async Task CleanupProviderFilesAsync(
-        RemoteClaim claim,
-        AiBatchStatus status,
-        ReadOnlyMemory<byte> credential,
-        CancellationToken cancellationToken)
-    {
-        var files = new[]
-            {
-                claim.ProviderInputFileName,
-                status.OutputFileName,
-            }
-            .Where(item => item is not null)
-            .Distinct(StringComparer.Ordinal)
-            .Cast<string>()
-            .ToArray();
-        string? errorCode = null;
-        foreach (var file in files)
-        {
-            try
-            {
-                await _batchProvider.DeleteFileAsync(
-                        claim.Connection,
-                        credential,
-                        file,
-                        cancellationToken)
-                    .ConfigureAwait(false);
-            }
-            catch (AiProviderException exception)
-            {
-                errorCode = exception.SafeErrorCode;
-                break;
-            }
-        }
-
-        await _writeCoordinator.ExecuteAsync(async token =>
-        {
-            await using var db = await _dbContextFactory
-                .CreateDbContextAsync(token)
-                .ConfigureAwait(false);
-            var batch = await db.AiBatches.SingleOrDefaultAsync(
-                item => item.Id == claim.BatchId,
-                token);
-            if (batch is null)
-            {
-                return;
-            }
-
-            batch.CleanupState = errorCode is null ? "completed" : "failed";
-            if (errorCode is not null && batch.ErrorCode is null)
-            {
-                batch.ErrorCode = "gemini_batch_cleanup_failed";
-                batch.SafeErrorDetail = errorCode;
-            }
-
-            batch.UpdatedAt = _timeProvider.GetUtcNow();
-            await db.SaveChangesAsync(token).ConfigureAwait(false);
-        }, cancellationToken).ConfigureAwait(false);
     }
 
     private Task<ReconcileClaim?> LoadReconcileClaimAsync(
@@ -2395,8 +2312,7 @@ public sealed partial class AiBatchJobWorker : BackgroundService
         var first = candidates[0].AiRequest;
         var profile = first.AiTaskProfile;
         var connection = profile.AiConnection;
-        if (profile.ProcessingStrategy != "gemini_batch"
-            || !AiTaskProfileRuntimePolicy.IsReadyApprovalState(
+        if (!AiTaskProfileRuntimePolicy.IsReadyApprovalState(
                 profile.ApprovalState)
             || !AiProviderCatalog.IsModelIdValid(
                 AiProviders.GeminiDirect,
@@ -2404,7 +2320,8 @@ public sealed partial class AiBatchJobWorker : BackgroundService
             || connection.Provider != AiProviders.GeminiDirect
             || profile.ConnectionRevision != connection.CredentialRevision
             || candidates.Any(item =>
-                item.AiRequest.AiTaskProfileId != profile.Id
+                !GeminiBatchEligibility.IsBatchRequest(item.AiRequest, profile)
+                || item.AiRequest.AiTaskProfileId != profile.Id
                 || item.AiRequest.TaskProfileRevision
                     != first.TaskProfileRevision
                 || item.AiRequest.State != "prepared"))
@@ -2414,9 +2331,14 @@ public sealed partial class AiBatchJobWorker : BackgroundService
         }
     }
 
-    private static bool IsCurrentDispatchProfile(AiTaskProfileEntity profile) =>
-        profile.Active
-        && profile.ModelId == profile.AiConnection.ModelId;
+    private static async Task<List<AiBatchRequestEntity>> KeepDispatchableRequestsAsync(
+        OokiGraderDbContext db, IReadOnlyList<AiBatchRequestEntity> staged, DateTimeOffset now, CancellationToken token)
+    {
+        var ids = await GeminiBatchEligibility.EligibleRequestIdsAsync(
+            db, staged.Select(item => item.AiRequest).ToArray(), token).ConfigureAwait(false);
+        FailUndispatchedRequests(db, staged.Where(item => !ids.Contains(item.AiRequestId)), now, "ai_batch_profile_unavailable");
+        return staged.Where(item => ids.Contains(item.AiRequestId)).ToList();
+    }
 
     private static void FailUndispatchedRequests(
         OokiGraderDbContext db,
@@ -2841,7 +2763,8 @@ public sealed partial class AiBatchJobWorker : BackgroundService
         string Type,
         int SchemaVersion,
         string PayloadJson,
-        string? CorrelationId);
+        string? CorrelationId,
+        string Owner);
 
     private sealed record PreparePayload(
         string CompatibilityKey,
@@ -2858,13 +2781,11 @@ public sealed partial class AiBatchJobWorker : BackgroundService
         byte[] JsonLines,
         string JsonLinesHash,
         AiConnectionSettings Connection,
-        string SecretReference,
-        bool MayDispatch);
+        string SecretReference);
 
     private sealed record RemoteClaim(
         string BatchId,
         string ProviderBatchName,
-        string? ProviderInputFileName,
         string SecretReference,
         AiConnectionSettings Connection);
 

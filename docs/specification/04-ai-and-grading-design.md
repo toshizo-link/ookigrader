@@ -1,10 +1,11 @@
 # AI, recognition, and grading design
 
-> **Current-flow note (2026-08-27):** all new work uses one durable queue of
-> standard provider requests. Gemini Batch, teacher-visible economy/priority,
-> expedite, coordinate crops, and automatic cross-provider failover are disabled.
-> Batch tables below describe retained legacy persistence/recovery compatibility,
-> not an option in the current teacher or administrator workflow.
+> **Current grading flow (2026-11-27)**
+>
+> The default Gemini model uses immediate requests with `MEDIUM` thinking for template creation and
+> `LOW` for grading. New sessions default to Gemini Batch after its connection check passes.
+> Immediate grading is available for urgent tests and is the default until Batch is ready. Both modes use one
+> AI pass per required page chunk. Teachers resolve flagged answers before finalization.
 >
 > **Gemini-setup update (2026-08-27):** normal add/replace probes the supplied
 > candidate before persistence and, only on a complete capability/image-task
@@ -58,12 +59,12 @@ All external content is treated as untrusted. Structured schemas, allowlisted fi
 | Capability | Official Gemini connection | OpenRouter connection |
 |---|---|---|
 | Credential | School's Google Gemini auth/restricted API key | School's OpenRouter bearer API key |
-| Default model ID | `gemini-3.7-flash` | separately configured and accuracy-validated |
+| Default model ID | `gemini-3.8-flash` | separately configured and accuracy-validated |
 | Request API | Gemini `generateContent` | OpenRouter `/api/v1/chat/completions` |
 | Image transport | Gemini Files API/reference or inline | Base64 `image_url` data URLs; no public URL |
 | Structured result | Gemini structured output schema | `response_format.type=json_schema`, `strict=true` |
-| Current dispatch | Durable Ooki queue with bounded standard `generateContent` requests | Durable Ooki queue with bounded individual Chat Completions requests |
-| Teacher routing choices | None; no Batch/economy/priority control for new work | None; no economy/priority control for new work |
+| Current dispatch | Durable queue for immediate requests and Gemini Batch grades | Durable queue with bounded individual Chat Completions requests |
+| Teacher routing choices | Immediate grading or Gemini Batch per session | Immediate grading |
 | Usage/cost | Gemini usage metadata + local pricing snapshot | OpenRouter response usage/cost and optional generation stats |
 | Routing | Google model endpoint | Configurable OpenRouter model/provider routing |
 
@@ -75,8 +76,9 @@ The configuration supports separate profiles for:
 
 - blank-template extraction and answer proposal;
 - name transcription;
-- initial answer transcription/grading;
-- low-confidence recheck/adjudication.
+- initial answer transcription/grading.
+
+Historical adjudication profiles remain readable with the runs that used them.
 
 A profile contains provider connection, exact model ID, standard-request
 strategy, reasoning/media settings, prompt/schema/configuration hashes,
@@ -157,11 +159,11 @@ profiles. Probe content is synthetic and contains no student data.
 
 | Task | Input disclosed | Output | Default route | Teacher gate |
 |---|---|---|---|---|
-| `TemplateExtraction` (`template_extract_v6`) | one host-planned source unit, trusted test type/subject/answer style, exact page manifest | rotation-only action or paper metadata plus a grading-key draft | selected task profile | batch final check, then normal editor/publish |
+| `TemplateExtraction` | one host-planned source unit, trusted test type/subject/answer style, exact page manifest | page orientation, paper metadata and grading-key draft together | selected task profile | batch final check, then normal editor/publish |
 | `submission_analysis_v2` | one deterministic consecutive normalized-page chunk, approved compact question list/rubrics, anonymous request ID; chunk 1 also contains logical page 1 | chunk 1: raw name/number transcription plus visible-answer grading; later chunks: visible-answer grading with `identity=null` | selected initial-grading profile | local roster/teacher identity confirmation and threshold/type-dependent grade review |
 | `name_transcribe_v1` | logical page 1 for ordered intake; complete normalized pages for a legacy non-ordered submission | raw name/number transcription and legibility | fallback/legacy selected task profile | uncertain assignment |
 | `answer_transcribe_grade_v1` | historical deterministic page chunk | visible-answer transcription and proposed per-question outcome | compatibility reader only | threshold/type dependent |
-| `answer_recheck_v1` | all complete normalized pages and one rubric | independent second assessment | explicit teacher/system policy | review still required if disagreement |
+| `answer_recheck_v1` | historical pages and rubric | stored second assessment | historical records only | teacher review history |
 
 The normal Gemini path combines page-1 identity transcription with the first
 bounded grading request so the same page is not uploaded twice. Identity and
@@ -334,8 +336,8 @@ All perception/grading prompts convey, in provider-appropriate language:
 The server composes and fingerprints these code-owned fragments:
 
 ```text
-orientation-gate-v1
-common-extraction-core-v1
+orientation-with-extraction-v2
+common-extraction-core-v6
 system-1-standard-v1 | system-2-class-placement-v1 | system-3-fill-blank-v1
 paper-name-and-grade-v1
 immutable-generation-context
@@ -348,17 +350,11 @@ prompt system, page range, STEP set/variation, deterministic suffix, split and
 naming policy versions, prompt/schema versions, and source hashes. The web
 client cannot supply the prompt system and the model cannot override it.
 
-Every template request begins by inspecting every supplied page. It returns
-only quarter turns `0`, `90`, `180`, or `270`, where the value is the clockwise
-rotation the host must apply to the currently supplied page. If any page needs
-rotation, `action` is `rotate`, extraction fields are empty, and the host
-rotates a derived copy locally. The same immutable profile and prompt/schema
-are sent once more with a new request key and corrected media hashes. If the
-second response asks for rotation, processing stops; there is no third
-automatic call. If all pages are upright, `action` is `extract` and extraction
-continues in that same response.
+The model extracts the questions while reading the body text in its intended
+orientation. Each page also reports a clockwise quarter turn for local display
+correction. A wide page or rotated graph label can appear on an upright scan.
 
-After the gate, the selected system tells the model to:
+The selected system tells the model to:
 
 - enumerate printed questions in visual reading order;
 - retain Japanese numbering such as `一`, `（1）`, `問1`;
@@ -419,14 +415,11 @@ the other supplied question IDs missing; the host resolves observations across
 all chunks. The application evaluates deterministic rules independently and
 can reject the proposal.
 
-During the supervised pilot, the application applies the teacher-review
-boundary after local reconciliation. A clear, high-confidence final outcome of
-`correct` may proceed without per-question review when every other configured
-gate passes. Final outcomes of `incorrect`, `blank`, `partial`,
-`unreadable`, or `review` always require teacher review, even when provider
-confidence is high. This keeps the reliable positive path useful while
-preventing uncertain negative judgments from silently reducing a student's
-score. Paper finalization remains an explicit teacher action.
+The host applies the review rules after local reconciliation. A clearly wrong
+answer or visibly empty field can receive zero points directly. Partial credit
+must satisfy the published scoring rules. Missing evidence, unreadable answers,
+unresolved scoring conflicts, and questions explicitly configured for review
+go to a teacher. The teacher finalizes the paper.
 
 ## 6. Structured output
 
@@ -561,11 +554,9 @@ Application acceptance requires:
 - provider safety/result state is acceptable;
 - response size below limit.
 
-For answer grading, invalid output is retried once with a repair request only
-when safe and cost-effective. Template generation does not use that repair
-path: its only automatic second call is the corrected-media call after a valid
-`rotate` response. Otherwise it fails safely; free-form JSON repair by accepting
-guessed fields is prohibited.
+The host validates provider output before using it. Structured retry handling
+preserves input provenance. Successful extraction and grading skip model
+rechecks.
 
 ## 7. Automatic grading-key generation workflow
 
@@ -579,10 +570,8 @@ guessed fields is prohibited.
 4. The plan and expected unit count are shown to the teacher. Generation queues
    one durable `gemini_template_generation_unit` job per unit.
 5. Each job creates a bounded derived source, builds the server-selected prompt,
-   and makes one orientation-gated extraction call.
-6. An upright result extracts immediately. A valid rotation-only result is
-   applied locally and receives exactly one corrected-media call. A second
-   rotation request or invalid cross-field response fails the unit.
+   and extracts the questions and orientation together.
+6. The host applies any needed quarter turns to the derived copy locally.
 7. The host validates question structure and answer provenance and parses
    filename grade locally. It reconciles filename and printed-grade evidence,
    then requires a resolved grade before computing the immutable HOP, STEP, or
@@ -770,7 +759,7 @@ stricter local preset when its answer format supports it:
 
 AI-rubric results still pass local score/point-policy checks. Clear valid results
 at or above the confidence threshold can proceed to finalization review without
-per-question intervention. Partial, ambiguous, unreadable, conflicting,
+per-question intervention. Ambiguous, unreadable, conflicting,
 low-confidence, or explicitly always-review results enter the question-review
 queue. The teacher still performs the final submission finalization; the system
 never auto-finalizes a paper.
@@ -799,7 +788,7 @@ When deterministic and AI results conflict:
 Provider self-reported confidence is one feature. Final confidence also considers:
 
 - local blur/alignment/crop metrics;
-- transcription consistency across optional passes;
+- consistency of evidence for a question across any required page chunks;
 - exact rule match;
 - model finish/safety state;
 - schema repairs;
@@ -808,7 +797,9 @@ Provider self-reported confidence is one feature. Final confidence also consider
 - rubric complexity;
 - validation-set calibration.
 
-Thresholds are per task/question type. A single global 0.8 constant is prohibited.
+For per-answer review, confidence below 0.50 triggers review. Confidence
+describes the reliability of the transcription and grade, including for a
+clearly wrong or blank answer. Identity matching uses its own rules.
 
 ### 10.4 Auto-finalization policy
 
@@ -994,8 +985,7 @@ teacher review policy.
 | Provider transient | 429, 5xx, timeout | bounded exponential retry with idempotent local settlement; no automatic provider switch |
 | Safety blocked | provider safety finish | teacher review/manual grade; no prompt weakening automatically |
 | Output invalid | malformed/missing IDs, points outside range | one bounded repair/retry then review |
-| Template orientation correction | valid first `rotate` action | rotate a derived copy locally and make one corrected-media request |
-| Template orientation retry exhausted | second `rotate` action | block; teacher corrects or re-uploads source; no third call |
+| Template orientation correction | a completed extraction reports sideways pages | apply the page rotations locally and retain the extracted questions |
 | File expired | direct Gemini file gone before use | re-upload from local retained artifact if still permitted |
 | Budget blocked | daily/monthly cap | durable blocked state until reset/override |
 
@@ -1045,8 +1035,7 @@ This is not a quote. Actual visual tokens, prompt size, thinking tokens, retries
 - deduplicate identical work by input manifest hash;
 - split HOP/STEP locally before provider work and reserve only the planned unit
   count;
-- use one template-extraction call per upright unit and at most one additional
-  corrected-media call after a valid rotation response;
+- use one template-extraction call per unit, including rotated pages;
 - combine orientation, printed name, printed grade, and extraction in the v5
   contract; never issue separate classification/preflight requests;
 - warning/hard budgets;

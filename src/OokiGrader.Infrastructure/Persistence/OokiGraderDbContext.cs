@@ -797,6 +797,7 @@ public sealed class OokiGraderDbContext : DbContext, IUnitOfWork
             builder.Property(entity => entity.RequestIdempotencyKey).HasMaxLength(64);
             builder.Property(entity => entity.RequestFingerprint).HasMaxLength(64);
             builder.Property(entity => entity.TemplateTitleSnapshot).HasMaxLength(500);
+            builder.Property(entity => entity.GradingMode).HasMaxLength(16).HasDefaultValue("standard");
             builder.Property(entity => entity.Priority).HasMaxLength(32);
             builder.Property(entity => entity.State).HasMaxLength(32);
             builder.HasIndex(entity => new { entity.TestDate, entity.State })
@@ -1575,6 +1576,7 @@ public sealed class OokiGraderDbContext : DbContext, IUnitOfWork
             ConfigureUlid(builder, entity => entity.CreatedByStaffUserId);
             builder.Property(entity => entity.Provider).HasMaxLength(32);
             builder.Property(entity => entity.EndpointProfile).HasMaxLength(100);
+            builder.Property(entity => entity.InitialGradingMediaResolution).HasMaxLength(32).HasDefaultValue("medium");
             builder.Property(entity => entity.ModelId).HasMaxLength(128);
             builder.Property(entity => entity.SecretReference).HasMaxLength(500);
             builder.Property(entity => entity.KeyFingerprint).HasMaxLength(100);
@@ -1762,6 +1764,7 @@ public sealed class OokiGraderDbContext : DbContext, IUnitOfWork
             ConfigureUlid(builder, entity => entity.Id);
             ConfigureUlid(builder, entity => entity.AiTaskProfileId);
             ConfigureUlid(builder, entity => entity.RetryOfAiRequestId);
+            builder.Property(entity => entity.GradingMode).HasMaxLength(16);
             builder.Property(entity => entity.RequestKey).HasMaxLength(200);
             builder.Property(entity => entity.Purpose).HasMaxLength(100);
             builder.Property(entity => entity.EntityType).HasMaxLength(100);
@@ -1830,7 +1833,7 @@ public sealed class OokiGraderDbContext : DbContext, IUnitOfWork
                 table.HasCheckConstraint(
                     "ck_ai_batch_cleanup",
                     "cleanup_state IN ('not_started','pending','completed','failed'," +
-                    "'expired')");
+                    "'expired','provider_managed_output')");
             });
             builder.HasKey(entity => entity.Id);
             ConfigureUlid(builder, entity => entity.Id);

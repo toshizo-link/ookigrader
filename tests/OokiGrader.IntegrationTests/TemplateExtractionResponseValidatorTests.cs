@@ -11,6 +11,31 @@ public sealed class TemplateExtractionResponseValidatorTests
         "鏡にあたる前の光を入射光線、［　］したあとの光を［　］光線という。";
 
     [Theory]
+    [InlineData("(1) (［　］)は、岩手県の( )で産出していた。")]
+    [InlineData("(1) ( )は、岩手県の(［　］)で産出していた。")]
+    [InlineData("（鉄鉱石）は（　）で採れ、次に［　］を使用する。")]
+    public void ExplicitTargetKeepsItsPositionAndPreservesNeighboringSlots(string text)
+    {
+        var question = Assert.Single(Assert.Single(Validate(1,
+            CreateQuestion("slot-1", "1", 1, text, "鉄鉱石")).Pages).Questions);
+        Assert.Equal(text, question.QuestionText);
+        Assert.True(question.IsEmbeddedFillBlank);
+        Assert.DoesNotContain(question.ReviewIssues, issue => issue.Blocking);
+    }
+
+    [Theory]
+    [InlineData("森林のはたらきを3つ答えなさい。［　］", false)]
+    [InlineData("森林は［　］を防ぐ。", true)]
+    public void DistinguishesAFreeResponseWritingFieldFromAnEmbeddedBlank(string text, bool embedded)
+    {
+        var question = Assert.Single(Assert.Single(Validate(1,
+            CreateQuestion("slot-1", "1", 1, text, "洪水", declaredFillBlank: false, questionType: "semantic_short_text")).Pages).Questions);
+        Assert.Equal(text, question.QuestionText);
+        Assert.Equal(embedded, question.IsEmbeddedFillBlank);
+        Assert.Equal(embedded, question.ReviewIssues.Any(issue => issue.Code == "question.fill_blank_classification_corrected" && issue.Blocking));
+    }
+
+    [Theory]
     [InlineData("（　）")]
     [InlineData("(  )")]
     [InlineData("（＿＿）")]
@@ -78,9 +103,6 @@ public sealed class TemplateExtractionResponseValidatorTests
                     second.ReviewIssues,
                     IsMultiPlaceholderBlocker);
             });
-        Assert.False(
-            TemplateExtractionResponseValidator
-                .HasRepairableSlotStructureIssue(validated));
     }
 
     [Fact]
@@ -109,9 +131,6 @@ public sealed class TemplateExtractionResponseValidatorTests
                         == "question.fill_blank_placeholder_invalid"
                         && issue.Blocking);
             });
-        Assert.True(
-            TemplateExtractionResponseValidator
-                .HasRepairableSlotStructureIssue(validated));
     }
 
     [Fact]
@@ -241,7 +260,9 @@ public sealed class TemplateExtractionResponseValidatorTests
         string questionText,
         string answer,
         bool requiresCompleteAnswer = false,
-        bool answerOrderInsensitive = false) =>
+        bool answerOrderInsensitive = false,
+        bool declaredFillBlank = true,
+        string questionType = "exact_short_text") =>
         new
         {
             source_key = sourceKey,
@@ -250,8 +271,8 @@ public sealed class TemplateExtractionResponseValidatorTests
             answer_slot_ordinal = ordinal,
             answer_slot_count = 1,
             filled_answer_removed = true,
-            is_embedded_fill_blank = true,
-            question_type = "exact_short_text",
+            is_embedded_fill_blank = declaredFillBlank,
+            question_type = questionType,
             expected_answer = answer,
             answer_provenance = "ai_proposed",
             answer_source = (object?)null,

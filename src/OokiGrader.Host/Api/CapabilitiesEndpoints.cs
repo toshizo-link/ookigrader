@@ -32,7 +32,6 @@ internal static class CapabilitiesEndpoints
                     profile.ApprovalState))
             .Select(profile => new ReadyProfile(
                 profile.TaskType,
-                profile.ProcessingStrategy,
                 profile.ModelId,
                 profile.ConnectionRevision,
                 profile.PromptVersion,
@@ -115,7 +114,6 @@ internal static class CapabilitiesEndpoints
                             geminiDirectEnabled,
                             openRouterEnabled)
                         && profile.Provider == AiProviders.GeminiDirect
-                        && profile.ProcessingStrategy == "gemini_batch"
                         && profile.BatchProbeState == "passed"
                         && profile.BatchProbeCredentialRevision
                             == profile.ConnectionCredentialRevision)),
@@ -127,6 +125,29 @@ internal static class CapabilitiesEndpoints
                 configuration.GetValue(
                     "Features:Grading.AutoFinalize",
                     false)));
+    }
+
+    internal static async Task<(string Mode, IResult? Error)> ResolveGradingModeAsync(
+        string? mode, HttpContext context, OokiGraderDbContext db,
+        CancellationToken cancellationToken)
+    {
+        if (mode == "standard") return ("standard", null);
+        if (mode is not (null or "batch"))
+        {
+            return (mode, ApiHelpers.Problem(context, StatusCodes.Status422UnprocessableEntity,
+                "TEST_SESSION_GRADING_MODE_INVALID", "採点方法を確認してください",
+                "すぐに採点する方法、またはまとめて採点する方法を選択してください。"));
+        }
+
+        var capabilities = await ReadAsync(db,
+            context.RequestServices.GetRequiredService<IConfiguration>(),
+            context.RequestServices.GetRequiredService<IAiPromptBundleCatalog>(),
+            cancellationToken);
+        if (capabilities.Ai.GeminiBatch.Ready) return ("batch", null);
+        if (mode is null) return ("standard", null);
+        return (mode, ApiHelpers.Problem(
+            context, StatusCodes.Status409Conflict, "GEMINI_BATCH_UNAVAILABLE",
+            "まとめ採点を利用できません", "管理者にAI設定の「Batch接続を確認」を依頼するか、「通常採点（即時）」を選択してください。"));
     }
 
     private static async Task<IResult> GetAsync(
@@ -166,17 +187,12 @@ internal static class CapabilitiesEndpoints
             profile.ConnectionModelId)
         && profile.ConnectionState == "active"
         && profile.ProbeState == "passed"
-        && (profile.ProcessingStrategy != "gemini_batch"
-            || (profile.BatchProbeState == "passed"
-                && profile.BatchProbeCredentialRevision
-                    == profile.ConnectionCredentialRevision))
         && profile.PromptVersion == bundle.PromptVersion
         && profile.SchemaVersion == bundle.SchemaVersion
         && profile.PromptContentHash == bundle.ContentHash;
 
     private sealed record ReadyProfile(
         string TaskType,
-        string ProcessingStrategy,
         string ProfileModelId,
         long ProfileConnectionRevision,
         string PromptVersion,

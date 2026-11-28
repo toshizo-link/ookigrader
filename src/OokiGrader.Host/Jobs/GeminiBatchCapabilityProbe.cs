@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using OokiGrader.Ai.Abstractions;
+using OokiGrader.Ai.Gemini;
 using OokiGrader.Application.Identifiers;
 
 namespace OokiGrader.Host.Jobs;
@@ -86,16 +87,18 @@ public sealed class GeminiBatchCapabilityProbe(
                     connection.ModelId)
                 ? "MINIMAL"
                 : "LOW");
-        var jsonLines = batchProvider.BuildJsonLines([request]);
+        var jsonLines = batchProvider.BuildJsonLines([request], connection.ModelId);
         var manifestHash = Sha256(jsonLines);
         var displayName = $"ooki-{probeId}-{manifestHash[..12]}";
         AiBatchInputFile? inputFile = null;
         AiBatchCreateReceipt? receipt = null;
         AiBatchStatus? status = null;
+        var batchMayExist = false;
         var cancelIssued = false;
         var available = false;
         string? safeErrorCode = null;
         var cleanupSucceeded = true;
+        var providerManagedOutput = false;
         try
         {
             inputFile = await batchProvider.UploadJsonLinesAsync(
@@ -105,6 +108,9 @@ public sealed class GeminiBatchCapabilityProbe(
                     jsonLines,
                     overallTimeout.Token)
                 .ConfigureAwait(false);
+            // A timeout during create or reconciliation can leave a remote job
+            // even when the last error came from a list call.
+            batchMayExist = true;
             receipt = await CreateOrReconcileAsync(
                     boundedConnection,
                     credentialUtf8,
@@ -186,8 +192,13 @@ public sealed class GeminiBatchCapabilityProbe(
         {
             throw;
         }
+        catch (OperationCanceledException)
+        {
+            safeErrorCode = "gemini_batch_probe_timeout";
+        }
         catch (AiBatchCreateException exception)
         {
+            batchMayExist = exception.Kind == AiBatchCreateFailureKind.AmbiguousAfterSend;
             safeErrorCode = exception.SafeErrorCode;
         }
         catch (AiProviderException exception)
@@ -226,29 +237,40 @@ public sealed class GeminiBatchCapabilityProbe(
                         receipt.ProviderBatchName,
                         cleanupTimeout.Token));
             }
-            else if (inputFile is not null
-                     && safeErrorCode?.Contains(
-                         "ambiguous",
-                         StringComparison.Ordinal) == true)
+            else if (batchMayExist)
             {
                 cleanupSucceeded = false;
             }
 
-            var files = new[]
+            if (status?.OutputFileName is { } output && output != inputFile?.ProviderFileName)
+            {
+                try
                 {
-                    status?.OutputFileName,
-                    inputFile?.ProviderFileName,
+                    await batchProvider.DeleteFileAsync(boundedConnection, credentialUtf8,
+                        output, cleanupTimeout.Token).ConfigureAwait(false);
                 }
-                .Where(item => item is not null)
-                .Distinct(StringComparer.Ordinal)
-                .Cast<string>();
-            foreach (var file in files)
+                catch (AiProviderException exception) when (
+                    GeminiBatchClient.IsProviderManagedOutput(receipt?.ProviderBatchName, output, exception))
+                {
+                    providerManagedOutput = true;
+                }
+                catch (AiProviderException)
+                {
+                    cleanupSucceeded = false;
+                }
+                catch (OperationCanceledException)
+                {
+                    cleanupSucceeded = false;
+                }
+            }
+
+            if (inputFile is not null)
             {
                 cleanupSucceeded &= await TryCleanupAsync(() =>
                     batchProvider.DeleteFileAsync(
                         boundedConnection,
                         credentialUtf8,
-                        file,
+                        inputFile.ProviderFileName,
                         cleanupTimeout.Token));
             }
         }
@@ -259,14 +281,16 @@ public sealed class GeminiBatchCapabilityProbe(
             available = false;
             safeErrorCode = "gemini_batch_probe_cleanup_failed";
         }
+        else if (available && providerManagedOutput)
+        {
+            safeErrorCode = "gemini_batch_probe_provider_managed_output";
+        }
 
         return new GeminiBatchCapabilityProbeResult(
             available,
-            cleanupSucceeded,
+            cleanupSucceeded && !providerManagedOutput,
             available ? "passed" : "failed",
-            available
-                ? null
-                : safeErrorCode ?? "gemini_batch_probe_failed",
+            safeErrorCode ?? (available ? null : "gemini_batch_probe_failed"),
             stopwatch.Elapsed);
     }
 
@@ -322,13 +346,13 @@ public sealed class GeminiBatchCapabilityProbe(
             var unique = matches
                 .DistinctBy(item => item.ProviderBatchName)
                 .ToArray();
-            if (unique.Length != 1)
+            if (unique.Length != 1 || !string.IsNullOrEmpty(pageToken))
             {
                 throw new AiProviderException(
                     AiFailureKind.InvalidResponse,
-                    unique.Length == 0
-                        ? "gemini_batch_probe_create_ambiguous"
-                        : "gemini_batch_probe_multiple_matches",
+                    unique.Length > 1
+                        ? "gemini_batch_probe_multiple_matches"
+                        : "gemini_batch_probe_create_ambiguous",
                     isTransient: false,
                     innerException: exception);
             }

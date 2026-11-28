@@ -15,11 +15,10 @@ describe("StatusBadge", () => {
     expect(screen.getByText("画像削除済み")).toBeInTheDocument();
   });
 
-  it("presents legacy batch work as ordinary AI grading", () => {
+  it("identifies asynchronous batch grading", () => {
     render(<StatusBadge status="geminiBatchRunning" />);
 
-    expect(screen.getByText("AI採点中")).toBeInTheDocument();
-    expect(screen.queryByText(/一括|Batch/)).not.toBeInTheDocument();
+    expect(screen.getByText("まとめ採点中")).toBeInTheDocument();
   });
 
   it("localizes durable submission states returned by the API", () => {

@@ -279,6 +279,8 @@ export interface TemplateValidation {
   issues: ValidationIssue[];
 }
 
+export type SessionGradingMode = "standard" | "batch";
+
 export interface TestSessionSummary {
   maximumMistakesToPass?: number | null;
   id: string;
@@ -297,6 +299,7 @@ export interface TestSessionSummary {
   course?: string | null;
   templateCourse?: string | null;
   priority: "economy" | "expedite";
+  gradingMode?: SessionGradingMode;
   state: "draft" | "open" | "closed" | "archived" | string;
   creationSource?: "template_publish" | "manual" | string;
   expectedStudentCount?: number;
@@ -316,6 +319,7 @@ export interface SubmissionSummary {
   studentDisplayName?: string | null;
   studentNumber?: string | null;
   state: SubmissionState;
+  initialGradingBatchState?: string | null;
   scanPayloadState?: "scan_available" | "deletion_pending" | "scan_deleted";
   scanDeletedAt?: string;
   scanDeletionReason?: string;

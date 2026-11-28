@@ -189,6 +189,8 @@ public sealed class GeminiDirectClientTests
     [Theory]
     [InlineData("gemini-3.7-flash", "LOW")]
     [InlineData("gemini-3.7-flash-preview", "LOW")]
+    [InlineData("gemini-3.1-pro-preview", "LOW")]
+    [InlineData("gemini-3-pro-preview", "LOW")]
     [InlineData("gemini-3.8-flash", "LOW")]
     [InlineData("gemini-3.8-flash-preview", "LOW")]
     [InlineData("gemini-3.8-flash-001", "LOW")]
@@ -286,11 +288,11 @@ public sealed class GeminiDirectClientTests
         Assert.Equal("template-extract-v2.1.0", bundle.PromptVersion);
         Assert.Equal("template_extract_v6", bundle.SchemaVersion);
         Assert.Contains(
-            "If any page needs a non-zero\nturn, return action=rotate",
+            "Always return action=extract",
             bundle.SystemInstruction,
             StringComparison.Ordinal);
         Assert.Contains(
-            "Do not return questions, answers, names, grades",
+            "Horizontal Japanese on a landscape",
             bundle.SystemInstruction,
             StringComparison.Ordinal);
         Assert.Contains(
@@ -329,13 +331,9 @@ public sealed class GeminiDirectClientTests
             "Do not use web search or external knowledge.",
             bundle.SystemInstruction,
             StringComparison.Ordinal);
-        var metadataProperties = bundle.ResponseJsonSchema
-            .GetProperty("properties")
-            .GetProperty("metadata")
-            .GetProperty("anyOf");
-        Assert.Contains(metadataProperties.EnumerateArray(), item =>
-            item.TryGetProperty("$ref", out var reference)
-            && reference.GetString() == "#/$defs/metadata");
+        var schemaProperties = bundle.ResponseJsonSchema.GetProperty("properties");
+        Assert.Equal("#/$defs/metadata", schemaProperties.GetProperty("metadata").GetProperty("$ref").GetString());
+        Assert.Equal("extract", Assert.Single(schemaProperties.GetProperty("action").GetProperty("enum").EnumerateArray()).GetString());
         var rootProperties = bundle.ResponseJsonSchema.GetProperty("properties");
         Assert.True(rootProperties.TryGetProperty("action", out _));
         Assert.True(rootProperties.TryGetProperty("orientation", out _));
@@ -493,8 +491,11 @@ public sealed class GeminiDirectClientTests
             StringComparison.Ordinal);
     }
 
-    [Fact]
-    public async Task GenerateAsyncSendsStrictStructuredMultimodalRequest()
+    [Theory]
+    [InlineData(AiTaskTypes.InitialGrading, 0, 1)]
+    [InlineData(AiTaskTypes.TemplateExtraction, 1, 0)]
+    public async Task GenerateAsyncSendsStrictStructuredMultimodalRequest(
+        string taskType, int textIndex, int imageIndex)
     {
         string? body = null;
         string? apiKey = null;
@@ -530,7 +531,7 @@ public sealed class GeminiDirectClientTests
             Encoding.UTF8.GetBytes("test-key"),
             new AiProviderRequest(
                 "request-1",
-                AiTaskTypes.InitialGrading,
+                taskType,
                 "prompt-v1",
                 "schema-v1",
                 "system",
@@ -566,14 +567,9 @@ public sealed class GeminiDirectClientTests
         Assert.Equal(
             JsonValueKind.Object,
             configuration.GetProperty("responseJsonSchema").ValueKind);
-        Assert.Equal(
-            JsonValueKind.String,
-            requestJson.RootElement
-                .GetProperty("contents")[0]
-                .GetProperty("parts")[0]
-                .GetProperty("inline_data")
-                .GetProperty("data")
-                .ValueKind);
+        var parts = requestJson.RootElement.GetProperty("contents")[0].GetProperty("parts");
+        Assert.Equal("user", parts[textIndex].GetProperty("text").GetString());
+        Assert.Equal(media, parts[imageIndex].GetProperty("inline_data").GetProperty("data").GetBytesFromBase64());
     }
 
     [Fact]

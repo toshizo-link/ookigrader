@@ -22,7 +22,8 @@ public partial class _0023_ConfigurableGeminiModel : Migration
         RebuildAiBatchTable(migrationBuilder, constrainModel: true);
     }
 
-    private static void RebuildAiBatchTable(MigrationBuilder migrationBuilder, bool constrainModel)
+    internal static void RebuildAiBatchTable(
+        MigrationBuilder migrationBuilder, bool constrainModel, bool allowProviderManagedOutput = false)
     {
         // SQLite cannot add or remove a CHECK constraint in place. Rebuild the parent table
         // with foreign-key enforcement temporarily disabled so existing batch requests and
@@ -32,6 +33,7 @@ public partial class _0023_ConfigurableGeminiModel : Migration
         var modelConstraint = constrainModel
             ? "CONSTRAINT \"ck_ai_batch_model\" CHECK (model_id = 'gemini-3.5-flash-lite'),"
             : string.Empty;
+        var extraCleanupState = allowProviderManagedOutput ? ",'provider_managed_output'" : string.Empty;
 
         migrationBuilder.Sql($$"""
             CREATE TABLE "ai_batch__0023" (
@@ -76,7 +78,7 @@ public partial class _0023_ConfigurableGeminiModel : Migration
                 "updated_at" INTEGER NOT NULL,
                 "completed_at" INTEGER NULL,
                 "revision" INTEGER NOT NULL,
-                CONSTRAINT "ck_ai_batch_cleanup" CHECK (cleanup_state IN ('not_started','pending','completed','failed','expired')),
+                CONSTRAINT "ck_ai_batch_cleanup" CHECK (cleanup_state IN ('not_started','pending','completed','failed','expired'{{extraCleanupState}})),
                 CONSTRAINT "ck_ai_batch_counts" CHECK (submission_epoch > 0 AND create_attempt_count >= 0 AND request_count > 0 AND input_json_lines_bytes >= 0 AND successful_request_count >= 0 AND failed_request_count >= 0 AND pending_request_count >= 0 AND reconciliation_attempt_count >= 0),
                 CONSTRAINT "ck_ai_batch_create_attempt" CHECK (create_attempt_count <= 1),
                 {{modelConstraint}}

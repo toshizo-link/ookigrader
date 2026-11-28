@@ -47,151 +47,6 @@ internal static class TemplateExtractionResponseValidator
         "minor_question_label",
     ];
 
-    private static readonly HashSet<string> SlotStructureIssueCodes =
-    [
-        "template.answer_slot_inventory_mismatch",
-        "template.duplicate_source_key",
-        "question.duplicate_answer_slot_ordinal",
-        "question.answer_slot_inventory_mismatch",
-        "question.answer_slots_not_separated",
-        "question.additional_placeholders_redacted",
-        "question.fill_blank_placeholder_invalid",
-    ];
-
-    /// <summary>
-    /// Decides whether a second, image-grounded inventory pass is warranted.
-    /// A page containing multiple embedded blanks is always audited because a
-    /// self-consistent omission (for example, nine objects and a declared count
-    /// of nine) cannot be detected from one model response alone.
-    /// </summary>
-    internal static bool RequiresIndependentSlotAudit(
-        ValidatedTemplateExtraction extraction)
-    {
-        ArgumentNullException.ThrowIfNull(extraction);
-        return extraction.Pages.Any(page =>
-                page.DetectedAnswerSlotCount != page.Questions.Sum(
-                    question => question.AnswerSlotCount)
-                || (page.Questions.Count > 1
-                    && page.Questions.Any(question =>
-                        question.IsEmbeddedFillBlank)))
-            || HasRepairableSlotStructureIssue(extraction)
-            || HasAnswerAuthorityIssue(extraction);
-    }
-
-    /// <summary>
-    /// Detects answers that could not be tied to the declared authoritative
-    /// source. These cases need another image-grounded pass; changing only the
-    /// provenance label would turn a potentially inferred or hallucinated answer
-    /// into false source evidence.
-    /// </summary>
-    internal static bool HasAnswerAuthorityIssue(
-        ValidatedTemplateExtraction extraction)
-    {
-        ArgumentNullException.ThrowIfNull(extraction);
-        return extraction.ReviewIssues.Any(IsAnswerAuthorityIssue)
-            || extraction.Pages.Any(page => page.Questions.Any(question =>
-                question.ReviewIssues.Any(IsAnswerAuthorityIssue)));
-
-        static bool IsAnswerAuthorityIssue(
-            TemplateExtractionReviewIssue issue) =>
-            issue.Code is
-                "answer.source_conflict_or_ambiguity"
-                or "answer.supplied_answer_missing";
-    }
-
-    /// <summary>
-    /// Compares only the slot inventory, not prose punctuation or confidence.
-    /// This makes two independently generated candidates comparable while still
-    /// detecting omitted, merged, invented, reordered, or relabelled slots.
-    /// </summary>
-    internal static bool SlotInventoriesAgree(
-        ValidatedTemplateExtraction first,
-        ValidatedTemplateExtraction second)
-    {
-        ArgumentNullException.ThrowIfNull(first);
-        ArgumentNullException.ThrowIfNull(second);
-        var firstPages = first.Pages
-            .OrderBy(page => page.SourceId, StringComparer.Ordinal)
-            .ThenBy(page => page.PageNumber)
-            .ToArray();
-        var secondPages = second.Pages
-            .OrderBy(page => page.SourceId, StringComparer.Ordinal)
-            .ThenBy(page => page.PageNumber)
-            .ToArray();
-        if (firstPages.Length != secondPages.Length)
-        {
-            return false;
-        }
-
-        for (var pageIndex = 0; pageIndex < firstPages.Length; pageIndex++)
-        {
-            var firstPage = firstPages[pageIndex];
-            var secondPage = secondPages[pageIndex];
-            if (!string.Equals(
-                    firstPage.SourceId,
-                    secondPage.SourceId,
-                    StringComparison.Ordinal)
-                || firstPage.PageNumber != secondPage.PageNumber
-                || firstPage.DetectedAnswerSlotCount
-                    != secondPage.DetectedAnswerSlotCount
-                || firstPage.Questions.Count != secondPage.Questions.Count)
-            {
-                return false;
-            }
-
-            for (var questionIndex = 0;
-                 questionIndex < firstPage.Questions.Count;
-                 questionIndex++)
-            {
-                var firstQuestion = firstPage.Questions[questionIndex];
-                var secondQuestion = secondPage.Questions[questionIndex];
-                if (firstQuestion.AnswerSlotOrdinal
-                        != secondQuestion.AnswerSlotOrdinal
-                    || firstQuestion.AnswerSlotCount
-                        != secondQuestion.AnswerSlotCount
-                    || firstQuestion.IsEmbeddedFillBlank
-                        != secondQuestion.IsEmbeddedFillBlank
-                    || !string.Equals(
-                        firstQuestion.AnswerProvenance,
-                        secondQuestion.AnswerProvenance,
-                        StringComparison.Ordinal)
-                    || !string.Equals(
-                        firstQuestion.ExpectedAnswer,
-                        secondQuestion.ExpectedAnswer,
-                        StringComparison.Ordinal)
-                    || !string.Equals(
-                        firstQuestion.DisplayLabel,
-                        secondQuestion.DisplayLabel,
-                        StringComparison.Ordinal)
-                    || CountOccurrences(
-                            firstQuestion.QuestionText,
-                            CanonicalBlankToken)
-                        != CountOccurrences(
-                            secondQuestion.QuestionText,
-                            CanonicalBlankToken))
-                {
-                    return false;
-                }
-            }
-        }
-
-        return true;
-    }
-
-    internal static bool HasRepairableSlotStructureIssue(
-        ValidatedTemplateExtraction extraction)
-    {
-        ArgumentNullException.ThrowIfNull(extraction);
-        return extraction.Pages.Any(page =>
-                page.DetectedAnswerSlotCount != page.Questions.Sum(
-                    question => question.AnswerSlotCount))
-            || extraction.ReviewIssues.Any(issue =>
-                SlotStructureIssueCodes.Contains(issue.Code))
-            || extraction.Pages.Any(page => page.Questions.Any(question =>
-                question.ReviewIssues.Any(issue =>
-                    SlotStructureIssueCodes.Contains(issue.Code))));
-    }
-
     public static ValidatedTemplateExtraction Validate(
         JsonElement root,
         string expectedRequestKey,
@@ -780,6 +635,8 @@ internal static class TemplateExtractionResponseValidator
             questionText,
             isEmbeddedFillBlank,
             filledAnswerRemoved,
+            answerSlotCount,
+            questionType,
             expectedAnswer,
             acceptedVariants);
         questionText = blankAnalysis.QuestionText;
@@ -1022,9 +879,34 @@ internal static class TemplateExtractionResponseValidator
         string questionText,
         bool declaredFillBlank,
         bool filledAnswerRemoved,
+        int answerSlotCount,
+        string questionType,
         string? expectedAnswer,
         IReadOnlyCollection<string> acceptedVariants)
     {
+        var explicitTargets = CountOccurrences(questionText, CanonicalBlankToken);
+        if (filledAnswerRemoved && explicitTargets > 0 && explicitTargets == answerSlotCount)
+        {
+            // The extraction contract marks this row's target explicitly. Ordinary
+            // empty parentheses and printed solutions in neighboring slots are context.
+            if (declaredFillBlank)
+            {
+                return new EmbeddedBlankAnalysis(questionText, true, false, explicitTargets);
+            }
+
+            // An answer box after a complete free-response question is a separate
+            // writing field, even when the provider represents it with the same token.
+            var text = questionText.AsSpan().TrimEnd();
+            if (questionType == "semantic_short_text" && explicitTargets == 1 && text.EndsWith(CanonicalBlankToken))
+            {
+                var prompt = text[..^CanonicalBlankToken.Length].TrimEnd();
+                if (!prompt.IsEmpty && prompt[^1] is '。' or '？' or '?' or '！' or '!')
+                {
+                    return new EmbeddedBlankAnalysis(questionText, false, false, explicitTargets);
+                }
+            }
+        }
+
         var answerCandidates = acceptedVariants
             .Append(expectedAnswer)
             .Where(value => !string.IsNullOrWhiteSpace(value))

@@ -43,6 +43,22 @@ import type {
 type ViewerMode = "pdf" | "pages";
 type ResultListMode = "all" | "incorrect";
 
+const gradingReasonLabels: Record<string, string> = {
+  ai_always_review: "ひな形で、この設問は毎回先生が確認する設定になっています。",
+  ai_low_confidence: "AIの確信度が50%未満です。元の答案を確認してください。",
+  ai_judgment_uncertain: "AIが採点基準から点数を決められませんでした。",
+  ai_manual_question: "この設問は先生が採点する設定です。",
+  ai_nontext_answer_review: "記入された図や印を文字として読み取れませんでした。",
+  ai_invalid_point_award: "AIの点数がこの設問の配点や採点単位と一致しません。",
+  ai_deterministic_review_required: "登録された採点ルールだけでは判定できませんでした。",
+  ai_deterministic_recomputed: "登録された採点ルールによる判定とAIの判定が異なります。",
+  ai_complete_answer_required: "完答が必要な設問のため、AIの部分点を0点に修正しました。",
+  ai_layout_line_wrap_reconciled: "改行を除くと登録された正答と一致しています。",
+  ai_chunk_observation_conflict: "同じ設問について、答案の読み取り結果が複数ありました。",
+  ai_missing_question: "答案上の解答欄を見つけられませんでした。",
+  ai_unexpected_content: "答案に想定外の内容が検出されました。",
+};
+
 interface WorkspaceEnvelope {
   workspace: SubmissionGradingWorkspace;
   etag?: string;
@@ -158,6 +174,17 @@ function SubmissionGradingWorkspaceView({
   const selectedResult =
     visibleResults.find((result) => result.resultId === selectedResultId) ||
     visibleResults[0];
+  const gradingReason = selectedResult?.reason
+    ? gradingReasonLabels[selectedResult.reason]
+    : undefined;
+  const gradingExplanation =
+    gradingReason || selectedResult?.explanation ||
+    (selectedResult?.reason === "ai_pilot_proposal" ? undefined : selectedResult?.reason);
+  const confidenceBasisPoints = selectedResult?.confidenceBasisPoints;
+  const confidenceLabel = confidenceBasisPoints == null ? undefined
+    : selectedResult?.reason === "ai_low_confidence" && confidenceBasisPoints === 5000
+      ? "50%未満"
+      : `${confidenceBasisPoints / 100}%`;
   const [selectedPageNumber, setSelectedPageNumber] = useState(
     () => selectedResult?.pageNumbers[0] || sortedPages[0]?.pageNumber || 1,
   );
@@ -734,18 +761,13 @@ function SubmissionGradingWorkspaceView({
                   </Badge>
                 ) : null}
               </div>
-              {selectedResult.explanation || selectedResult.reason ? (
+              {gradingExplanation || confidenceLabel ? (
                 <InlineAlert
                   tone={isUnresolved(selectedResult) ? "warning" : "info"}
-                  title="AIの判断"
+                  title="採点の詳細"
                 >
-                  <p>
-                    {selectedResult.explanation || selectedResult.reason}
-                    {selectedResult.confidenceBasisPoints !== null &&
-                    selectedResult.confidenceBasisPoints !== undefined
-                      ? `（確信度 ${Math.round(selectedResult.confidenceBasisPoints / 100)}%）`
-                      : ""}
-                  </p>
+                  {gradingExplanation && <p>{gradingExplanation}</p>}
+                  {confidenceLabel && <p>確信度 {confidenceLabel}</p>}
                 </InlineAlert>
               ) : null}
               {editError ? (

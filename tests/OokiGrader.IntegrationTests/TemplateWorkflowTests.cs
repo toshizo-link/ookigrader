@@ -14,6 +14,9 @@ using Microsoft.AspNetCore.TestHost;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Configuration;
+using OokiGrader.Ai.Abstractions;
+using OokiGrader.Ai.Gemini;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -81,6 +84,75 @@ public sealed class TemplateWorkflowTests
         });
         Assert.Equal(HttpStatusCode.Conflict,
             (await application.SendAsync(HttpMethod.Put, url, "teacher", update)).StatusCode);
+    }
+
+    [Fact]
+    public async Task NewSessionsDefaultToVerifiedBatchAndPreserveTheChosenModeOnReplay()
+    {
+        await using var app = await TemplateTestApplication.CreateAsync(enableSemantic: true);
+        var (templateId, versionId) = await CreateTemplateAndVersionAsync(app);
+        var version = $"/api/v1/templates/{templateId}/versions/{versionId}";
+        Assert.Equal(HttpStatusCode.Created, (await app.SendAsync(HttpMethod.Post, version + "/questions", "teacher",
+            ExactQuestionRequest("一を漢字で書きなさい。", 1_000))).StatusCode);
+        var etag = RequiredEtag(await app.SendAsync(HttpMethod.Get, version, "teacher"));
+        var batch = new { gradingMode = "batch" };
+        var unavailable = await app.SendAsync(HttpMethod.Post, version + ":publish", "teacher", batch, etag);
+        Assert.Equal(HttpStatusCode.Conflict, unavailable.StatusCode);
+        Assert.Equal("GEMINI_BATCH_UNAVAILABLE", RequiredString(await ReadJsonAsync(unavailable), "code"));
+        await app.WithDatabaseAsync(async db =>
+        {
+            var now = DateTimeOffset.UtcNow;
+            var connection = new AiConnectionEntity
+            {
+                Id = UlidId.New(now), State = "active", LastCapabilityProbeState = "passed",
+                LastBatchCapabilityProbeState = "passed", LastBatchCapabilityProbeCredentialRevision = 1,
+                CreatedByStaffUserId = TestAuthenticationHandler.StaffId, CreatedAt = now, UpdatedAt = now,
+            };
+            using var catalog = new ApprovedPromptBundleCatalog();
+            db.AiConnections.Add(connection);
+            db.AiTaskProfiles.Add(CapabilitiesEndpointsTests.Profile(AiTaskTypes.InitialGrading, "queued_standard",
+                connection, catalog.GetRequired(AiTaskTypes.InitialGrading), now));
+            await db.SaveChangesAsync();
+        });
+        var created = await app.SendAsync(HttpMethod.Post, version + ":publish", "teacher", new { }, etag);
+        Assert.Equal(HttpStatusCode.OK, created.StatusCode);
+        var session = (await ReadJsonAsync(created)).GetProperty("testSession");
+        Assert.Equal("batch", RequiredString(session, "gradingMode"));
+        var sessionUrl = "/api/v1/test-sessions/" + RequiredString(session, "id");
+        var standard = new { gradingMode = "standard", revision = session.GetProperty("revision").GetInt64() };
+        Assert.Equal(HttpStatusCode.Forbidden, (await app.SendAsync(HttpMethod.Patch, sessionUrl, "scanOperator", standard)).StatusCode);
+        var update = await app.SendAsync(HttpMethod.Patch, sessionUrl, "teacher", standard);
+        Assert.Equal(HttpStatusCode.OK, update.StatusCode);
+        Assert.Equal("standard", RequiredString(await ReadJsonAsync(await app.SendAsync(HttpMethod.Get, sessionUrl, "teacher")), "gradingMode"));
+
+        foreach (var selection in new[] { "standard", "batch" })
+        {
+            var manual = await app.SendAsync(HttpMethod.Post, "/api/v1/test-sessions", "teacher",
+                new { templateVersionId = versionId, gradingMode = selection, openImmediately = true }, idempotencyKey: UlidId.New());
+            Assert.Equal(HttpStatusCode.Created, manual.StatusCode);
+            Assert.Equal(selection, RequiredString(await ReadJsonAsync(manual), "gradingMode"));
+        }
+        var key = UlidId.New();
+        var automatic = new { templateVersionId = versionId, openImmediately = true };
+        var sessionsUrl = "/api/v1/test-sessions";
+        var newSession = await app.SendAsync(HttpMethod.Post, sessionsUrl, "teacher", automatic, idempotencyKey: key);
+        Assert.Equal(HttpStatusCode.Created, newSession.StatusCode);
+        var previous = await ReadJsonAsync(newSession);
+        Assert.Equal("batch", RequiredString(previous, "gradingMode"));
+        await app.WithDatabaseAsync(async db =>
+        {
+            var connection = await db.AiConnections.SingleAsync();
+            connection.LastBatchCapabilityProbeState = "failed";
+            await db.SaveChangesAsync();
+        });
+        var replay = await ReadJsonAsync(await app.SendAsync(HttpMethod.Post, sessionsUrl, "teacher", automatic, idempotencyKey: key));
+        Assert.Equal(RequiredString(previous, "id"), RequiredString(replay, "id"));
+        Assert.Equal("batch", RequiredString(replay, "gradingMode"));
+        var different = await app.SendAsync(HttpMethod.Post, sessionsUrl, "teacher",
+            new { templateVersionId = versionId, gradingMode = "standard", openImmediately = true }, idempotencyKey: key);
+        Assert.Equal(HttpStatusCode.Conflict, different.StatusCode);
+        var fallback = await ReadJsonAsync(await app.SendAsync(HttpMethod.Post, sessionsUrl, "teacher", automatic, idempotencyKey: UlidId.New()));
+        Assert.Equal("standard", RequiredString(fallback, "gradingMode"));
     }
 
     [Fact]
@@ -3513,12 +3585,17 @@ public sealed class TemplateWorkflowTests
         public HttpClient Client { get; }
         private TestContentStore ContentStore { get; }
 
-        public static async Task<TemplateTestApplication> CreateAsync()
+        public static async Task<TemplateTestApplication> CreateAsync(bool enableSemantic = false)
         {
             var connection = new SqliteConnection("Data Source=:memory:");
             await connection.OpenAsync();
 
             var hostBuilder = new HostBuilder()
+                .ConfigureAppConfiguration(builder => builder.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["Features:Ai.GeminiDirect"] = enableSemantic.ToString(),
+                    ["Features:Grading.Semantic"] = enableSemantic.ToString(),
+                }))
                 .UseEnvironment(Environments.Development)
                 .ConfigureWebHost(webBuilder =>
                 {
@@ -3529,6 +3606,7 @@ public sealed class TemplateWorkflowTests
                         services.AddDataProtection();
                         services.AddSingleton<ProtectedCursorCodec>();
                         services.AddSingleton(TimeProvider.System);
+                        services.AddSingleton<IAiPromptBundleCatalog, ApprovedPromptBundleCatalog>();
                         services.AddSingleton<TestContentStore>();
                         services.AddSingleton<ContentObjectLockProvider>();
                         services.AddSingleton<IContentStore>(provider =>

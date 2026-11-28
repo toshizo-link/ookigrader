@@ -1,3 +1,4 @@
+using OokiGrader.Ai.Gemini;
 using Microsoft.EntityFrameworkCore;
 using OokiGrader.Ai.Abstractions;
 using OokiGrader.Host.Jobs;
@@ -67,14 +68,21 @@ internal static class TemplateExtractionAiProfilePolicy
                 == profile.AiConnection.CredentialRevision
             && profile.PromptVersion == bundle.PromptVersion
             && profile.SchemaVersion == bundle.SchemaVersion
-            && profile.PromptContentHash == bundle.ContentHash
-            && profile.ThinkingLevel == AiProviderRuntime.DefaultThinkingLevel(
-                profile.AiConnection.Provider,
-                profile.ModelId,
-                profile.TaskType)
+            && MatchesTemplateBundle(profile.PromptContentHash, bundle)
+            && HasUsableThinkingLevel(profile)
             && profile.ProcessingStrategy is
                 "queued_standard" or "expedite_standard";
     }
+
+    public static bool MatchesTemplateBundle(string profileHash, AiPromptBundle bundle) =>
+        profileHash == bundle.ContentHash || ApprovedPromptBundleCatalog.IsLegacyTemplateExtractionContentHash(profileHash);
+
+    // Approved profiles retain their historical configuration. New requests
+    // use the current model-specific extraction effort.
+    public static bool HasUsableThinkingLevel(AiTaskProfileEntity profile) =>
+        profile.ThinkingLevel is "low" or "medium"
+        || profile.ThinkingLevel == AiProviderCatalog.DefaultThinkingLevel(
+            profile.AiConnection.Provider, profile.ModelId, profile.TaskType);
 }
 
 internal sealed record TemplateExtractionAiProfileSelection(

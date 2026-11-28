@@ -531,9 +531,9 @@ supported question type. A teacher MAY explicitly change an individual question
 to exact/variant matching, numeric comparison, choice comparison, or manual
 grading. Regardless of the selected method, local code validates score bounds,
 point increments, Kanji/complete-answer constraints, and computes the test total.
-Low-confidence, ambiguous, partial, unreadable, conflicting, unsupported, or
-explicitly `always review` results require teacher review; a clear valid AI
-proposal does not require review merely because AI produced it.
+Low-confidence, ambiguous, unreadable, conflicting, unsupported, and explicitly
+`always review` results require teacher review. A clear wrong answer, a visibly
+empty answer, or valid partial credit can proceed to paper finalization.
 
 The grading request MUST receive every independently complete accepted answer
 and the structured `完答`, `順不同`, and `漢字必須` options for the actual
@@ -571,7 +571,7 @@ Partial credit is allowed only if the published rubric defines it. Awarded point
 
 A result enters the review queue when any of the following is true:
 
-- confidence is below its question-type threshold;
+- the reported confidence in reading and grading this answer is below 50%;
 - model output fails schema or consistency checks;
 - answer crop is low quality or misaligned;
 - the model marks unreadable/ambiguous;

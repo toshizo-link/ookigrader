@@ -1,4 +1,6 @@
+using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -261,35 +263,97 @@ public sealed class AiInitialGradingJobWorkerTests
     }
 
     [Fact]
-    public async Task SendsOnlyDisclosureApprovedAnswerCropsOutsideWriteLock()
+    public async Task SameTemplateUsesSameJapaneseRubricPrefixForDifferentStudentPapers()
+    {
+        const string question = "「日本」の首都は？";
+        const string rubric = "「東京」と書く。\n引用符 \" と逆斜線 \\ を区別。";
+        await using var first = await AiWorkerFixture.CreateAsync();
+        await using var second = await AiWorkerFixture.CreateAsync();
+        var firstStudent = await first.SeedAsync(questionText: question, rubricText: rubric, assignedStudent: true,
+            answerPageContent: "student-one-page");
+        var secondStudent = await second.SeedAsync(questionText: question, rubricText: rubric, assignedStudent: true,
+            sharedTemplate: firstStudent, answerPageContent: "student-two-page");
+
+        Assert.True(await first.Worker.ProcessNextAsync());
+        Assert.True(await second.Worker.ProcessNextAsync());
+        var firstRequest = Assert.Single(first.Provider.Requests);
+        var secondRequest = Assert.Single(second.Provider.Requests);
+        Assert.NotEqual(firstRequest.RequestKey, secondRequest.RequestKey);
+        Assert.NotEqual(firstRequest.Media[0].Sha256, secondRequest.Media[0].Sha256);
+        Assert.Equal(firstRequest.SystemInstruction, secondRequest.SystemInstruction);
+        const string requestField = ",\"request_key\":";
+        var prefixLength = firstRequest.UserInstruction.IndexOf(requestField, StringComparison.Ordinal);
+        Assert.True(prefixLength > 0);
+        var prefix = firstRequest.UserInstruction[..prefixLength];
+        Assert.StartsWith(prefix + requestField, secondRequest.UserInstruction, StringComparison.Ordinal);
+        Assert.Contains(question, prefix, StringComparison.Ordinal);
+        Assert.Contains("東京", prefix, StringComparison.Ordinal);
+        Assert.DoesNotContain(firstStudent.SubmissionId, prefix, StringComparison.Ordinal);
+        Assert.DoesNotContain(secondStudent.SubmissionId, prefix, StringComparison.Ordinal);
+        Assert.DoesNotContain(firstStudent.StudentId!, prefix, StringComparison.Ordinal);
+        Assert.DoesNotContain(secondStudent.StudentId!, prefix, StringComparison.Ordinal);
+        AiProviderRequest[] requests = [firstRequest, secondRequest];
+        using var http = new HttpClient();
+        var jsonLines = new GeminiBatchClient(http).BuildJsonLines(requests);
+        var lines = Encoding.UTF8.GetString(jsonLines).Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        Assert.Equal(requests.Length, lines.Length);
+        foreach (var (request, line) in requests.Zip(lines))
+        {
+            using var wire = JsonDocument.Parse(line);
+            var parts = wire.RootElement.GetProperty("request").GetProperty("contents")[0].GetProperty("parts");
+            Assert.Equal(request.UserInstruction, parts[0].GetProperty("text").GetString());
+            Assert.Equal(request.Media[0].Bytes.ToArray(), parts[1].GetProperty("inline_data").GetProperty("data").GetBytesFromBase64());
+            Assert.DoesNotContain(request.RequestKey, prefix, StringComparison.Ordinal);
+            Assert.DoesNotContain(request.Media[0].Sha256, prefix, StringComparison.Ordinal);
+            Assert.DoesNotContain(Convert.ToBase64String(request.Media[0].Bytes.Span), prefix, StringComparison.Ordinal);
+            using var instruction = JsonDocument.Parse(request.UserInstruction[request.UserInstruction.IndexOf('{')..]);
+            var data = instruction.RootElement;
+            Assert.Equal(request.RequestKey, data.GetProperty("request_key").GetString());
+            var item = Assert.Single(data.GetProperty("questions").EnumerateArray());
+            Assert.Equal(1, item.GetProperty("q").GetInt32());
+            Assert.Equal(question, item.GetProperty("text").GetString());
+            Assert.Equal(rubric, item.GetProperty("rubric").GetString());
+            Assert.Equal("東京", Assert.Single(item.GetProperty("a").EnumerateArray()).GetString());
+            Assert.DoesNotContain(firstStudent.QuestionId, request.UserInstruction, StringComparison.Ordinal);
+            Assert.DoesNotContain(firstStudent.QuestionId, request.ResponseJsonSchema.GetRawText(), StringComparison.Ordinal);
+        }
+    }
+
+    [Theory]
+    [InlineData("high", "MEDIA_RESOLUTION_HIGH")]
+    [InlineData("medium", "MEDIA_RESOLUTION_MEDIUM")]
+    public async Task SendsApprovedPageBytesAtSelectedDetailOutsideWriteLock(
+        string mediaResolution, string providerResolution)
     {
         await using var fixture = await AiWorkerFixture.CreateAsync();
         var seeded = await fixture.SeedAsync(
             includePrivateNameCrop: true,
-            gradingRuleFlags: true);
+            gradingRuleFlags: true,
+            mediaResolution: mediaResolution);
 
         Assert.True(await fixture.Worker.ProcessNextAsync());
 
         var providerRequest = Assert.Single(fixture.Provider.Requests);
+        Assert.Equal(providerResolution, providerRequest.MediaResolution);
         Assert.Contains(
-            "\"requires_complete_answer\":true",
+            "\"complete\":true",
             providerRequest.UserInstruction,
             StringComparison.Ordinal);
         Assert.Contains(
-            "\"answer_order_insensitive\":true",
+            "\"unordered\":true",
             providerRequest.UserInstruction,
             StringComparison.Ordinal);
         Assert.Contains(
-            "directly from the original page pixels in one integrated",
-            providerRequest.UserInstruction,
+            "directly from the original supplied",
+            providerRequest.SystemInstruction,
             StringComparison.Ordinal);
         Assert.Contains(
             "every visible line boundary as \\n",
             providerRequest.UserInstruction,
             StringComparison.Ordinal);
         Assert.Contains(
-            "not the sole input to grading",
-            providerRequest.UserInstruction,
+            "never be the sole input to the grading decision",
+            providerRequest.SystemInstruction,
             StringComparison.Ordinal);
         Assert.Single(providerRequest.Media);
         Assert.Equal(
@@ -304,6 +368,57 @@ public sealed class AiInitialGradingJobWorkerTests
             "name_crop",
             providerRequest.UserInstruction,
             StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CompactBatchRubricPreservesQuestionOverridesAndEveryAcceptedAnswer()
+    {
+        await using var fixture = await AiWorkerFixture.CreateAsync(enableBatch: true);
+        var seeded = await fixture.SeedAsync(questionCount: 2, gradingRuleFlags: true,
+            processingStrategy: "gemini_batch");
+        await using (var db = await fixture.CreateDbContextAsync())
+        {
+            var second = await db.Questions.SingleAsync(x => x.OrderIndex == 1);
+            second.QuestionType = "subjective";
+            second.GradingMode = "ai_rubric";
+            second.MaxPointsMilli = 2_000;
+            second.PointIncrementMilli = 500;
+            second.AllowNonKanji = true;
+            second.RubricText = "根拠を記す。\n例を含める。";
+            var firstAnswer = await db.AcceptedAnswers.SingleAsync();
+            db.AcceptedAnswers.Add(new AcceptedAnswerEntity
+            {
+                Id = UlidId.New(DateTimeOffset.UtcNow), QuestionId = seeded.QuestionId,
+                AnswerText = "東京都", NormalizedText = "東京都", VariantType = "equivalent",
+                AnswerProvenance = firstAnswer.AnswerProvenance, TeacherVerified = true,
+                CreatedAt = firstAnswer.CreatedAt, UpdatedAt = firstAnswer.UpdatedAt,
+            });
+            await db.SaveChangesAsync();
+        }
+
+        Assert.True(await fixture.Worker.ProcessNextAsync());
+        var request = Assert.Single(fixture.BatchProvider!.Requests);
+        using var data = JsonDocument.Parse(request.UserInstruction[request.UserInstruction.IndexOf('{')..]);
+        var defaults = data.RootElement.GetProperty("grading_defaults");
+        Assert.True(defaults.GetProperty("unordered").GetBoolean());
+        Assert.True(defaults.GetProperty("complete").GetBoolean());
+        var rows = data.RootElement.GetProperty("questions");
+        var first = rows[0];
+        Assert.Equal(1, first.GetProperty("q").GetInt32());
+        Assert.Equal(["東京", "東京都"], first.GetProperty("a").EnumerateArray()
+            .Select(x => x.GetString()).Order(StringComparer.Ordinal));
+        var secondRow = rows[1];
+        Assert.Equal(2, secondRow.GetProperty("q").GetInt32());
+        Assert.Equal(1, secondRow.GetProperty("i").GetInt32());
+        Assert.Equal("subjective", secondRow.GetProperty("type").GetString());
+        Assert.Equal("ai_rubric", secondRow.GetProperty("mode").GetString());
+        Assert.Equal(2_000, secondRow.GetProperty("max").GetInt32());
+        Assert.Equal(500, secondRow.GetProperty("step").GetInt32());
+        Assert.True(secondRow.GetProperty("kana").GetBoolean());
+        Assert.False(secondRow.GetProperty("unordered").GetBoolean());
+        Assert.False(secondRow.GetProperty("complete").GetBoolean());
+        Assert.Equal("根拠を記す。\n例を含める。", secondRow.GetProperty("rubric").GetString());
+        Assert.Empty(secondRow.GetProperty("a").EnumerateArray());
     }
 
     [Fact]
@@ -417,23 +532,27 @@ public sealed class AiInitialGradingJobWorkerTests
     }
 
     [Theory]
-    [InlineData("大阪", "incorrect", false)]
-    [InlineData("", "blank", true)]
-    public async Task NegativeInitialResultAlwaysWaitsForTeacherReview(
+    [InlineData("大阪", "incorrect", false, false)]
+    [InlineData("", "blank", true, false)]
+    [InlineData("大阪", "incorrect", false, true)]
+    [InlineData("", "blank", true, true)]
+    public async Task ClearNegativeInitialResultCanBeFinalized(
         string transcription,
         string outcome,
-        bool blank)
+        bool blank,
+        bool batch)
     {
-        await using var fixture = await AiWorkerFixture.CreateAsync(
-            request => CreateResponse(
-                request,
-                proposedPointsMilli: 0,
-                proposedOutcome: outcome,
-                transcription: transcription,
-                blank: blank));
-        var seeded = await fixture.SeedAsync();
+        AiProviderResponse Response(AiProviderRequest request) => CreateResponse(
+            request, proposedPointsMilli: 0, proposedOutcome: outcome, transcription: transcription, blank: blank);
+        await using var fixture = await AiWorkerFixture.CreateAsync(Response, enableBatch: batch);
+        var seeded = await fixture.SeedAsync(processingStrategy: batch ? "gemini_batch" : "expedite_standard");
 
         Assert.True(await fixture.Worker.ProcessNextAsync());
+        if (batch)
+        {
+            await fixture.StoreLatestBatchResponseAndQueueApplyAsync(seeded, true, responseFactory: Response);
+            Assert.True(await fixture.Worker.ProcessNextAsync());
+        }
 
         await using var db = await fixture.CreateDbContextAsync();
         var submission = await db.Submissions
@@ -444,13 +563,16 @@ public sealed class AiInitialGradingJobWorkerTests
             .Include(item => item.QuestionResults)
             .SingleAsync(item => item.SubmissionId == seeded.SubmissionId);
 
-        Assert.Equal("needs_grade_review", submission.State);
-        Assert.Equal("needs_grade_review", run.State);
+        Assert.Equal("ready_to_finalize", submission.State);
+        Assert.Equal("ready_to_finalize", run.State);
         var result = Assert.Single(run.QuestionResults);
         Assert.Equal(outcome, result.Outcome);
         Assert.Equal(0, result.ProposedPointsMilli);
-        Assert.True(result.ReviewRequired);
-        Assert.Equal("pending", result.ReviewStatus);
+        Assert.False(result.ReviewRequired);
+        Assert.Equal("not_required", result.ReviewStatus);
+        var request = Assert.Single(batch ? fixture.BatchProvider!.Requests : fixture.Provider.Requests);
+        Assert.Contains("including when the answer is wrong or blank", request.UserInstruction);
+        Assert.False(await db.BackgroundJobs.AnyAsync(job => job.Type == AiAdjudicationJobWorker.JobType));
     }
 
     [Fact]
@@ -522,6 +644,129 @@ public sealed class AiInitialGradingJobWorkerTests
             reservation.ActualUsdMicros);
     }
 
+    [Theory]
+    [InlineData("batch", true)]
+    [InlineData("standard", false)]
+    public async Task PerTestModeRoutesInitialGradingOnTheSameStandardProfile(string mode, bool batch)
+    {
+        await using var fixture = await AiWorkerFixture.CreateAsync(enableBatch: true);
+        var seeded = await fixture.SeedAsync(processingStrategy: "queued_standard",
+            sessionPriority: "expedite", queuedGradingMode: mode);
+        await using (var setup = await fixture.CreateDbContextAsync())
+        {
+            var profile = await setup.AiTaskProfiles.SingleAsync();
+            profile.MaxOutputTokens = 32_768;
+            await setup.SaveChangesAsync();
+        }
+        Assert.True(await fixture.Worker.ProcessNextAsync());
+
+        await using var db = await fixture.CreateDbContextAsync();
+        var request = await db.AiRequests.AsNoTracking().SingleAsync();
+        Assert.Equal(mode, request.GradingMode);
+        Assert.Equal(batch ? 1 : 0, await db.AiBatchRequests.CountAsync());
+        Assert.Equal(batch ? 0 : 1, fixture.Provider.Requests.Count);
+        Assert.Equal(batch ? 1 : 0, fixture.BatchProvider!.Requests.Count);
+        var dispatched = Assert.Single(batch ? fixture.BatchProvider!.Requests : fixture.Provider.Requests);
+        Assert.Equal("LOW", dispatched.ThinkingLevel);
+        Assert.Equal(32_768, dispatched.MaxOutputTokens);
+        if (batch)
+        {
+            await fixture.StoreBatchResponseAndQueueApplyAsync(seeded,
+                actualModel: AiInitialGradingJobWorker.ModelId + "-001");
+            Assert.True(await fixture.Worker.ProcessNextAsync());
+            Assert.True(await db.GradingRuns.AnyAsync(run => run.SubmissionId == seeded.SubmissionId));
+        }
+    }
+
+    [Fact]
+    public async Task BatchReservesHalfTheStandardEstimateAndDoesNotResendAfterProfileRevisionChanges()
+    {
+        await using var standard = await AiWorkerFixture.CreateAsync();
+        await standard.SeedAsync(processingStrategy: "queued_standard", queuedGradingMode: "standard");
+        Assert.True(await standard.Worker.ProcessNextAsync());
+        await using var standardDb = await standard.CreateDbContextAsync();
+        var standardCost = (await standardDb.AiBudgetReservations.SingleAsync()).ReservedUsdMicros;
+
+        await using var batch = await AiWorkerFixture.CreateAsync(enableBatch: true);
+        var seeded = await batch.SeedAsync(processingStrategy: "queued_standard", queuedGradingMode: "batch");
+        Assert.True(await batch.Worker.ProcessNextAsync());
+        await using var db = await batch.CreateDbContextAsync();
+        var reservation = await db.AiBudgetReservations.SingleAsync();
+        Assert.Equal((standardCost + 1) / 2, reservation.ReservedUsdMicros);
+
+        var profile = await db.AiTaskProfiles.SingleAsync();
+        profile.Name += " revised";
+        await db.SaveChangesAsync();
+        await batch.RequeueAsync(seeded.JobId);
+        Assert.True(await batch.Worker.ProcessNextAsync());
+        Assert.Equal("ai_batch_previous_profile_in_progress",
+            (await db.BackgroundJobs.AsNoTracking().SingleAsync(item => item.Id == seeded.JobId)).ErrorCode);
+        Assert.Equal(1, await db.AiRequests.CountAsync());
+        Assert.Single(batch.BatchProvider!.Requests);
+        Assert.Empty(batch.Provider.Requests);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DiscoverySkipsInFlightBatchesAndExistingJobsBeforeItsPageLimit(bool responseReady)
+    {
+        await using var fixture = await AiWorkerFixture.CreateAsync(enableBatch: true, queueBatchSize: 1);
+        var original = await fixture.SeedAsync(processingStrategy: "queued_standard", queuedGradingMode: "batch");
+        Assert.True(await fixture.Worker.ProcessNextAsync());
+        if (responseReady)
+            await fixture.StoreBatchResponseAndQueueApplyAsync(original, AiInitialGradingJobWorker.ModelId + "-001");
+
+        await using var db = await fixture.CreateDbContextAsync();
+        var profile = await db.AiTaskProfiles.SingleAsync();
+        profile.Name += " revised";
+        var laterPaperKeys = new List<string>();
+        for (var later = 1; later <= 2; later++)
+        {
+            var paper = await db.Submissions.AsNoTracking().Include(item => item.Pages)
+                .SingleAsync(item => item.Id == original.SubmissionId);
+            paper.Id = UlidId.New();
+            paper.UploadCompletedAt = paper.UploadCompletedAt!.Value.AddMinutes(later);
+            var page = Assert.Single(paper.Pages);
+            page.Id = UlidId.New();
+            page.SubmissionId = paper.Id;
+            db.Submissions.Add(paper);
+            await db.SaveChangesAsync();
+            laterPaperKeys.Add(AiInitialGradingJobWorker.RootJobDeduplicationKey(paper.Id,
+                paper.PreprocessingManifestHash!, profile.Id, profile.Revision, profile.PromptContentHash));
+        }
+
+        for (var scan = 0; scan < 3; scan++)
+        {
+            await fixture.Worker.EnsureQueuedJobsAsync(CancellationToken.None);
+            var newRoots = await db.BackgroundJobs.AsNoTracking().Where(item =>
+                    item.Type == AiInitialGradingJobWorker.JobType && item.Id != original.JobId)
+                .OrderBy(item => item.CreatedAt).ThenBy(item => item.Id)
+                .Select(item => item.DeduplicationKey).ToArrayAsync();
+            Assert.Equal(laterPaperKeys.Take(scan + 1), newRoots);
+        }
+        Assert.Single(fixture.BatchProvider!.Requests);
+        Assert.Empty(fixture.Provider.Requests);
+    }
+
+    [Fact]
+    public async Task StaleBatchProbeBlocksQueuedBatchWithoutStandardDispatch()
+    {
+        await using var fixture = await AiWorkerFixture.CreateAsync(enableBatch: true);
+        var seeded = await fixture.SeedAsync(processingStrategy: "queued_standard", queuedGradingMode: "batch");
+        await using var db = await fixture.CreateDbContextAsync();
+        var connection = await db.AiConnections.SingleAsync();
+        connection.LastBatchCapabilityProbeCredentialRevision = null;
+        await db.SaveChangesAsync();
+
+        Assert.True(await fixture.Worker.ProcessNextAsync());
+        var job = await db.BackgroundJobs.AsNoTracking().SingleAsync(item => item.Id == seeded.JobId);
+        Assert.Equal("blocked", job.State);
+        Assert.Equal("ai_batch_connection_not_ready", job.ErrorCode);
+        Assert.Empty(fixture.Provider.Requests);
+        Assert.Empty(fixture.BatchProvider!.Requests);
+    }
+
     [Fact]
     public async Task BatchProfileStagesImmutableRequestWithoutStandardDispatch()
     {
@@ -553,6 +798,83 @@ public sealed class AiInitialGradingJobWorkerTests
                 && item.State == "queued");
         Assert.Empty(fixture.Provider.Requests);
         Assert.Single(fixture.BatchProvider!.Requests);
+    }
+
+    [Theory]
+    [InlineData("unchanged", true)]
+    [InlineData("media", false)]
+    [InlineData("rubric", false)]
+    [InlineData("settings", false)]
+    [InlineData("digest", false)]
+    [InlineData("size", false)]
+    public async Task InterruptedLegacyBatchStagingReusesOnlyTheExactGradingInputs(
+        string change, bool shouldResume)
+    {
+        await using var fixture = await AiWorkerFixture.CreateAsync(enableBatch: true);
+        var seeded = await fixture.SeedAsync(processingStrategy: "gemini_batch", activeBudget: true,
+            dailyHardUsdMicros: 1, monthlyHardUsdMicros: 1);
+        Assert.True(await fixture.Worker.ProcessNextAsync());
+        await using (var db = await fixture.CreateDbContextAsync())
+        {
+            var pending = await db.AiRequests.SingleAsync();
+            Assert.Equal("budget_blocked", pending.State);
+            pending.RequestKey = $"grade_{pending.Id}"; // Prepared on the previous release.
+            (await db.AiBudgetPolicies.SingleAsync()).Active = false;
+            await db.SaveChangesAsync();
+        }
+        await fixture.RequeueAsync(seeded.JobId);
+        Assert.True(await fixture.Worker.ProcessNextAsync());
+        string frozenLine;
+        string frozenHash;
+        await using (var db = await fixture.CreateDbContextAsync())
+        {
+            var mapping = await db.AiBatchRequests.SingleAsync();
+            var old = JsonNode.Parse(mapping.ProviderRequestJson!)!;
+            var parts = old["request"]!["contents"]![0]!["parts"]!.AsArray();
+            var textPart = parts[0]!;
+            var instruction = textPart["text"]!.GetValue<string>();
+            var start = instruction.IndexOf('{');
+            var payload = JsonNode.Parse(instruction[start..])!.AsObject();
+            var questions = payload["questions"]!;
+            payload.Remove("questions");
+            payload.Add("questions", questions);
+            if (change == "rubric") questions[0]!["accepted_answers"]![0] = "大阪";
+            textPart["text"] = instruction[..start] + payload.ToJsonString();
+            parts.RemoveAt(0);
+            parts.Add(textPart);
+            if (change == "media") parts[0]!["inline_data"]!["data"] = "AQID";
+            if (change == "settings") old["request"]!["generationConfig"]!["mediaResolution"] = "MEDIA_RESOLUTION_LOW";
+            frozenLine = old.ToJsonString();
+            var bytes = Encoding.UTF8.GetBytes(frozenLine);
+            frozenHash = change == "digest" ? new string('a', 64)
+                : Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(bytes));
+            mapping.ProviderRequestJson = frozenLine;
+            mapping.ProviderRequestBytes = change == "size" ? bytes.Length + 1 : bytes.Length;
+            mapping.ProviderRequestHash = frozenHash;
+            // Recreate the committed staging transaction before the grading job's completion.
+            db.OutboxEvents.Remove(await db.OutboxEvents.SingleAsync(item => item.EventType == "ai.request.batch_staged"));
+            await db.SaveChangesAsync();
+        }
+
+        await fixture.RequeueAsync(seeded.JobId);
+        Assert.True(await fixture.Worker.ProcessNextAsync());
+        await using var verified = await fixture.CreateDbContextAsync();
+        var saved = await verified.AiBatchRequests.SingleAsync();
+        Assert.Equal(frozenLine, saved.ProviderRequestJson);
+        Assert.Equal(frozenHash, saved.ProviderRequestHash);
+        Assert.Single(await verified.BackgroundJobs.Where(item => item.Type == AiBatchJobWorker.PrepareJobType).ToListAsync());
+        var job = await verified.BackgroundJobs.SingleAsync(item => item.Id == seeded.JobId);
+        Assert.Equal(shouldResume ? "succeeded" : "retry_waiting", job.State);
+        Assert.Equal(shouldResume, await verified.OutboxEvents.AnyAsync(item => item.EventType == "ai.request.batch_staged"));
+        Assert.Empty(fixture.Provider.Requests);
+        if (shouldResume)
+        {
+            await fixture.StoreLatestBatchResponseAndQueueApplyAsync(seeded, includeObservation: true);
+            Assert.True(await fixture.Worker.ProcessNextAsync());
+            var result = await verified.QuestionResults.AsNoTracking().SingleAsync();
+            Assert.Equal(seeded.QuestionId, result.QuestionId);
+            Assert.Equal(1_000, result.ProposedPointsMilli);
+        }
     }
 
     [Fact]
@@ -684,7 +1006,7 @@ public sealed class AiInitialGradingJobWorkerTests
         Assert.True(await fixture.Worker.ProcessNextAsync());
 
         Assert.Contains(
-            "\"grading_mode\":\"ai_rubric\"",
+            "\"mode\":\"ai_rubric\"",
             Assert.Single(fixture.Provider.Requests).UserInstruction,
             StringComparison.Ordinal);
         await using var db = await fixture.CreateDbContextAsync();
@@ -1244,6 +1566,71 @@ public sealed class AiInitialGradingJobWorkerTests
                 .SumAsync(item => item.EstimatedUsdMicros));
     }
 
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public async Task HistoricalBatchContinuesOnlyUnpaidChunksWithItsOriginalProfile(
+        bool oldPayload, bool changeCredentials)
+    {
+        await using var fixture = await AiWorkerFixture.CreateAsync(enableBatch: true, maximumMediaBytes: 1_024);
+        var seeded = await fixture.SeedAsync(processingStrategy: "gemini_batch", pageCount: 4, additionalPageBytes: 700);
+        await using (var db = await fixture.CreateDbContextAsync())
+        {
+            var profile = await db.AiTaskProfiles.SingleAsync();
+            profile.ThinkingLevel = "medium";
+            profile.MaxOutputTokens = 8_192;
+            await db.SaveChangesAsync();
+        }
+        fixture.BatchProvider!.SimulatePreviousMediumDefault = true;
+        Assert.True(await fixture.Worker.ProcessNextAsync());
+        fixture.BatchProvider.SimulatePreviousMediumDefault = false;
+        var first = Assert.Single(fixture.BatchProvider.Requests);
+        Assert.Equal("MEDIUM", first.ThinkingLevel);
+        using var instruction = JsonDocument.Parse(first.UserInstruction[first.UserInstruction.IndexOf('{')..]);
+        var total = instruction.RootElement.GetProperty("chunk_count").GetInt32();
+        Assert.InRange(total, 2, 4);
+        await fixture.StoreLatestBatchResponseAndQueueApplyAsync(seeded, includeObservation: true);
+        await fixture.SwitchModelWithHistoricalBatchAsync(seeded, changeModel: false);
+        Assert.True(await fixture.Worker.ProcessNextAsync());
+        await using (var db = await fixture.CreateDbContextAsync())
+        {
+            if (oldPayload)
+            {
+                var continuation = await db.BackgroundJobs.SingleAsync(job =>
+                    job.State == "queued" && job.Type == AiInitialGradingJobWorker.JobType);
+                var json = System.Text.Json.Nodes.JsonNode.Parse(continuation.PayloadJson)!.AsObject();
+                json.Remove("continuationOfRequestId");
+                continuation.PayloadJson = json.ToJsonString();
+            }
+            if (changeCredentials) (await db.AiConnections.SingleAsync()).CredentialRevision++;
+            await db.SaveChangesAsync();
+        }
+        for (var index = 1; index < total; index++)
+        {
+            Assert.True(await fixture.Worker.ProcessNextAsync());
+            if (changeCredentials)
+            {
+                Assert.Single(fixture.BatchProvider.Requests);
+                await using var db = await fixture.CreateDbContextAsync();
+                Assert.Equal("succeeded", (await db.AiRequests.SingleAsync()).State);
+                return;
+            }
+            var staged = fixture.BatchProvider.Requests[^1];
+            Assert.Equal(index + 1, RequestChunkIndex(staged));
+            Assert.Equal("MEDIUM", staged.ThinkingLevel);
+            Assert.Equal(8_192, staged.MaxOutputTokens);
+            await fixture.StoreLatestBatchResponseAndQueueApplyAsync(seeded, includeObservation: false);
+            await fixture.AttachSettledBatchSnapshotAsync(seeded);
+            Assert.True(await fixture.Worker.ProcessNextAsync());
+        }
+        await using var finalDb = await fixture.CreateDbContextAsync();
+        Assert.Equal(total, fixture.BatchProvider.Requests.Count);
+        Assert.Equal(total, await finalDb.AiUsage.CountAsync());
+        Assert.Equal(1, await finalDb.AiRequests.Select(r => new { r.AiTaskProfileId, r.TaskProfileRevision }).Distinct().CountAsync());
+        Assert.Single(await finalDb.GradingRuns.ToListAsync());
+    }
+
     [Fact]
     public async Task MoreThanThreeHundredQuestionsFailBeforeMediaOrProvider()
     {
@@ -1268,7 +1655,7 @@ public sealed class AiInitialGradingJobWorkerTests
     {
         await using var fixture = await AiWorkerFixture.CreateAsync();
         var seeded = await fixture.SeedAsync(
-            questionText: new string('問', 20_000));
+            questionText: new string('問', 100_000));
 
         Assert.True(await fixture.Worker.ProcessNextAsync());
 
@@ -1291,6 +1678,15 @@ public sealed class AiInitialGradingJobWorkerTests
         string transcription = "東京",
         bool blank = false)
     {
+        if (InitialGradingWire.IsCompact(request.RequestKey))
+        {
+            return CreateCombinedResponse(request, includeObservation, transcription: transcription,
+                blank: blank, outcome: proposedOutcome, points: proposedPointsMilli) with
+            {
+                ProviderResponseId = "response-1",
+                Usage = new AiUsage(240, 0, 16, 0, 256),
+            };
+        }
         var questionId = ExtractQuestionId(request.UserInstruction);
         var results = includeObservation
             ? new object[]
@@ -1343,9 +1739,12 @@ public sealed class AiInitialGradingJobWorkerTests
         AiProviderRequest request,
         bool includeObservation = true,
         bool invalidIdentity = false,
-        int evidenceMediaIndex = 0)
+        int evidenceMediaIndex = 0,
+        string transcription = "東京",
+        bool blank = false,
+        string outcome = "correct",
+        long points = 1_000)
     {
-        var questionId = ExtractQuestionId(request.UserInstruction);
         var identityRequired = RequestIdentityRequired(request);
         object? identity = identityRequired
             ? invalidIdentity
@@ -1371,27 +1770,27 @@ public sealed class AiInitialGradingJobWorkerTests
             {
                 new
                 {
-                    question_id = questionId,
-                    evidence_media_index = evidenceMediaIndex,
-                    transcription = "東京",
-                    legibility = "clear",
-                    blank = false,
-                    proposed_outcome = "correct",
-                    proposed_points_milli = 1_000,
-                    confidence = 0.99,
+                    q = 1,
+                    m = evidenceMediaIndex,
+                    t = transcription,
+                    l = "clear",
+                    b = blank,
+                    o = outcome,
+                    p = points,
+                    c = 0.99,
                 },
             }
             : [];
         using var document = JsonDocument.Parse(
             JsonSerializer.Serialize(new
             {
-                schema_version = "submission_analysis_v2",
+                schema_version = request.SchemaVersion,
                 request_key = request.RequestKey,
                 identity,
                 results,
                 missing_question_ids = includeObservation
-                    ? Array.Empty<string>()
-                    : [questionId],
+                    ? Array.Empty<int>()
+                    : [1],
                 unexpected_content = false,
             }));
         return new AiProviderResponse(
@@ -1545,7 +1944,8 @@ public sealed class AiInitialGradingJobWorkerTests
             string providerId = AiProviders.GeminiDirect,
             string modelId = AiInitialGradingJobWorker.ModelId,
             IAiProviderFeaturePolicy? providerFeaturePolicy = null,
-            int maximumMediaBytes = 17 * 1024 * 1024)
+            int maximumMediaBytes = 17 * 1024 * 1024,
+            int queueBatchSize = 25)
         {
             var connection = new SqliteConnection("Data Source=:memory:");
             await connection.OpenAsync();
@@ -1587,6 +1987,7 @@ public sealed class AiInitialGradingJobWorkerTests
                 Options.Create(new AiInitialGradingJobWorkerOptions
                 {
                     MaximumMediaBytes = maximumMediaBytes,
+                    QueueBatchSize = queueBatchSize,
                 }));
             services.AddDbContextFactory<OokiGraderDbContext>(
                 options => options.UseSqlite(connection));
@@ -1639,6 +2040,7 @@ public sealed class AiInitialGradingJobWorkerTests
             string processingStrategy = "expedite_standard",
             string sessionPriority = "economy",
             bool forceExpedite = false,
+            string? queuedGradingMode = null,
             int pageCount = 1,
             int additionalPageBytes = 700,
             int questionCount = 1,
@@ -1650,7 +2052,10 @@ public sealed class AiInitialGradingJobWorkerTests
             bool requiresReviewAlways = false,
             bool requiresIdentityReview = false,
             bool includeRosterStudent = false,
-            bool assignedStudent = false)
+            bool assignedStudent = false,
+            SeededAiWorkflow? sharedTemplate = null,
+            string answerPageContent = "answer-only-crop",
+            string mediaResolution = "high")
         {
             var now = DateTimeOffset.UtcNow;
             var bundle = _services
@@ -1658,8 +2063,8 @@ public sealed class AiInitialGradingJobWorkerTests
                 .GetRequired(AiTaskTypes.InitialGrading);
             var staffId = UlidId.New(now);
             var templateId = UlidId.New(now);
-            var versionId = UlidId.New(now);
-            var questionId = UlidId.New(now);
+            var versionId = sharedTemplate?.TemplateVersionId ?? UlidId.New(now);
+            var questionId = sharedTemplate?.QuestionId ?? UlidId.New(now);
             var answerId = UlidId.New(now);
             var sessionId = UlidId.New(now);
             var submissionId = UlidId.New(now);
@@ -1671,7 +2076,7 @@ public sealed class AiInitialGradingJobWorkerTests
             var answerReferenceId = UlidId.New(now);
             var pageReferenceId = UlidId.New(now);
             var thumbnailReferenceId = UlidId.New(now);
-            var answerBytes = "answer-only-crop"u8.ToArray();
+            var answerBytes = Encoding.UTF8.GetBytes(answerPageContent);
             var answerHash = Convert.ToHexString(
                     System.Security.Cryptography.SHA256.HashData(answerBytes))
                 .ToLowerInvariant();
@@ -2091,7 +2496,7 @@ public sealed class AiInitialGradingJobWorkerTests
                     _modelId)
                         ? "minimal"
                         : "low",
-                MediaResolution = "high",
+                MediaResolution = mediaResolution,
                 MaxOutputTokens = 1_024,
                 ConcurrencyLimit = 1,
                 ApprovalState = "pilot_approved",
@@ -2144,6 +2549,7 @@ public sealed class AiInitialGradingJobWorkerTests
                     templateVersionId = versionId,
                     manifestHash = new string('c', 64),
                     forceExpedite,
+                    gradingMode = queuedGradingMode,
                 }),
                 State = "queued",
                 MaxAttempts = 8,
@@ -2181,12 +2587,13 @@ public sealed class AiInitialGradingJobWorkerTests
         public async Task StoreLatestBatchResponseAndQueueApplyAsync(
             SeededAiWorkflow seeded,
             bool includeObservation,
-            string? actualModel = null)
+            string? actualModel = null,
+            Func<AiProviderRequest, AiProviderResponse>? responseFactory = null)
         {
             var providerRequest = BatchProvider!.Requests[^1];
-            var response = CreateResponse(
+            var response = (responseFactory?.Invoke(providerRequest) ?? CreateResponse(
                 providerRequest,
-                includeObservation: includeObservation) with
+                includeObservation: includeObservation)) with
             {
                 ActualModel = actualModel
                     ?? AiInitialGradingJobWorker.ModelId,
@@ -2268,50 +2675,14 @@ public sealed class AiInitialGradingJobWorkerTests
         }
 
         public async Task SwitchModelWithHistoricalBatchAsync(
-            SeededAiWorkflow seeded)
+            SeededAiWorkflow seeded, bool changeModel = true)
         {
+            await AttachSettledBatchSnapshotAsync(seeded);
             await using var db = await CreateDbContextAsync();
             var connection = await db.AiConnections.SingleAsync();
             var historicalProfile = await db.AiTaskProfiles.SingleAsync();
-            var request = await db.AiRequests
-                .Include(item => item.BatchRequest)
-                .SingleAsync(item => item.EntityId == seeded.SubmissionId);
-            var mapping = request.BatchRequest
-                ?? throw new InvalidOperationException(
-                    "The staged batch mapping is missing.");
             var now = DateTimeOffset.UtcNow;
-            var batch = new AiBatchEntity
-            {
-                Id = UlidId.New(now),
-                Provider = AiProviders.GeminiDirect,
-                ModelId = historicalProfile.ModelId,
-                AiConnectionId = connection.Id,
-                ConnectionRevision = connection.CredentialRevision,
-                AiTaskProfileId = historicalProfile.Id,
-                TaskProfileRevision = request.TaskProfileRevision,
-                CompatibilityKey = mapping.CompatibilityKey,
-                ManifestJson = "{}",
-                ManifestHash = new string('e', 64),
-                DisplayName = $"ooki-test-history-{request.Id}",
-                State = "succeeded",
-                SubmissionEpoch = 1,
-                CreateAttemptCount = 1,
-                ProviderBatchName = $"batches/history-{request.Id}",
-                InputJsonLinesSha256 = mapping.ProviderRequestHash,
-                InputJsonLinesBytes = 1,
-                RequestCount = 1,
-                SuccessfulRequestCount = 1,
-                PendingRequestCount = 0,
-                CleanupState = "completed",
-                CreatedAt = now,
-                UpdatedAt = now,
-                CompletedAt = now,
-            };
-            db.AiBatches.Add(batch);
-            mapping.AiBatchId = batch.Id;
-            mapping.Ordinal = 0;
-
-            connection.ModelId = "gemini-3.7-flash-preview";
+            if (changeModel) connection.ModelId = "gemini-3.7-flash-preview";
             connection.UpdatedAt = now;
             historicalProfile.Active = false;
             historicalProfile.UpdatedAt = now;
@@ -2331,7 +2702,7 @@ public sealed class AiInitialGradingJobWorkerTests
                 PromptContentHash = historicalProfile.PromptContentHash,
                 ThinkingLevel = "low",
                 MediaResolution = historicalProfile.MediaResolution,
-                MaxOutputTokens = historicalProfile.MaxOutputTokens,
+                MaxOutputTokens = 32_768,
                 ConcurrencyLimit = historicalProfile.ConcurrencyLimit,
                 ApprovalState = "capability_passed",
                 Active = true,
@@ -2342,6 +2713,32 @@ public sealed class AiInitialGradingJobWorkerTests
                 CreatedAt = now,
                 UpdatedAt = now,
             });
+            await db.SaveChangesAsync();
+        }
+
+        public async Task AttachSettledBatchSnapshotAsync(SeededAiWorkflow seeded)
+        {
+            await using var db = await CreateDbContextAsync();
+            var request = await db.AiRequests.Include(item => item.AiTaskProfile).Include(item => item.BatchRequest)
+                .SingleAsync(item => item.EntityId == seeded.SubmissionId && item.State == "response_ready");
+            var mapping = request.BatchRequest!;
+            var profile = request.AiTaskProfile;
+            var now = DateTimeOffset.UtcNow;
+            var batch = new AiBatchEntity
+            {
+                Id = UlidId.New(now), Provider = AiProviders.GeminiDirect, ModelId = profile.ModelId,
+                AiConnectionId = profile.AiConnectionId, ConnectionRevision = profile.ConnectionRevision,
+                AiTaskProfileId = profile.Id, TaskProfileRevision = request.TaskProfileRevision,
+                CompatibilityKey = mapping.CompatibilityKey, ManifestJson = "{}", ManifestHash = new string('e', 64),
+                DisplayName = $"ooki-test-history-{request.Id}", State = "succeeded", SubmissionEpoch = 1,
+                CreateAttemptCount = 1, ProviderBatchName = $"batches/history-{request.Id}",
+                InputJsonLinesSha256 = mapping.ProviderRequestHash, InputJsonLinesBytes = 1, RequestCount = 1,
+                SuccessfulRequestCount = 1, PendingRequestCount = 0, CleanupState = "completed",
+                CreatedAt = now, UpdatedAt = now, CompletedAt = now,
+            };
+            db.AiBatches.Add(batch);
+            mapping.AiBatchId = batch.Id;
+            mapping.Ordinal = 0;
             await db.SaveChangesAsync();
         }
 
@@ -2560,6 +2957,8 @@ public sealed class AiInitialGradingJobWorkerTests
 
     private sealed class FakeBatchProvider : IAiBatchProviderClient, IDisposable
     {
+        public bool SimulatePreviousMediumDefault { get; set; }
+
         private readonly HttpClient _httpClient = new();
         private readonly GeminiBatchClient _serializer;
 
@@ -2572,10 +2971,12 @@ public sealed class AiInitialGradingJobWorkerTests
         public List<AiProviderRequest> Requests { get; } = [];
 
         public byte[] BuildJsonLines(
-            IReadOnlyList<AiProviderRequest> requests)
+            IReadOnlyList<AiProviderRequest> requests, string modelId = AiProviderCatalog.GeminiDefaultModelId)
         {
+            if (SimulatePreviousMediumDefault)
+                requests = requests.Select(request => request with { ThinkingLevel = "MEDIUM" }).ToArray();
             Requests.AddRange(requests);
-            return _serializer.BuildJsonLines(requests);
+            return _serializer.BuildJsonLines(requests, modelId);
         }
 
         public Task<AiBatchInputFile> UploadJsonLinesAsync(

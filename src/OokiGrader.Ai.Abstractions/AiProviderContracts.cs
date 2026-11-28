@@ -89,10 +89,30 @@ public static partial class AiProviderCatalog
         string modelId) =>
         !(provider == AiProviders.GeminiDirect
             && (IsGemini37FlashFamily(modelId)
-                || IsModelFamily(modelId, "gemini-3.8-flash")));
+                || IsModelFamily(modelId, "gemini-3.8-flash")
+                || IsModelFamily(modelId, "gemini-3-pro")
+                || IsModelFamily(modelId, "gemini-3.1-pro")
+                || IsModelFamily(modelId, "gemini-2.5-pro")));
 
     public static bool IsGemini37FlashFamily(string modelId) =>
         IsModelFamily(modelId, "gemini-3.7-flash");
+
+    public static string DefaultThinkingLevel(string provider, string modelId, string taskType)
+    {
+        if (taskType is not (AiTaskTypes.TemplateExtraction or AiTaskTypes.InitialGrading))
+            return SupportsMinimalThinking(provider, modelId) ? "minimal" : "low";
+
+        if (provider == AiProviders.OpenRouter
+            && modelId.StartsWith("google/", StringComparison.OrdinalIgnoreCase))
+        {
+            modelId = modelId["google/".Length..].Split(':')[0];
+        }
+
+        // The original 3 Pro accepts LOW/HIGH. The image model accepts MINIMAL/HIGH.
+        if (IsModelFamily(modelId, "gemini-3.1-flash-lite-image")) return "minimal";
+        return taskType == AiTaskTypes.TemplateExtraction && !IsModelFamily(modelId, "gemini-3-pro")
+            ? "medium" : "low";
+    }
 
     private static bool IsModelFamily(string modelId, string family) =>
         string.Equals(
@@ -335,7 +355,8 @@ public interface IAiBatchProviderClient
 {
     string Provider { get; }
 
-    byte[] BuildJsonLines(IReadOnlyList<AiProviderRequest> requests);
+    byte[] BuildJsonLines(IReadOnlyList<AiProviderRequest> requests,
+        string modelId = AiProviderCatalog.GeminiDefaultModelId);
 
     Task<AiBatchInputFile> UploadJsonLinesAsync(
         AiConnectionSettings connection,

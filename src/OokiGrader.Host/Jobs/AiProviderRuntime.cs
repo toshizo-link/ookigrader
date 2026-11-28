@@ -1,6 +1,7 @@
 using OokiGrader.Ai.Abstractions;
 using System.Numerics;
 using OokiGrader.Infrastructure.Persistence;
+using OokiGrader.Infrastructure.Persistence.Entities;
 
 namespace OokiGrader.Host.Jobs;
 
@@ -121,15 +122,9 @@ internal static class AiProviderRuntime
         _ => provider,
     };
 
-    public static string DefaultThinkingLevel(
-        string provider,
-        string modelId,
-        string taskType) =>
-        taskType == AiTaskTypes.TemplateExtraction
-            ? "medium"
-            : AiProviderCatalog.SupportsMinimalThinking(provider, modelId)
-                ? "minimal"
-                : "low";
+    public static string CurrentProviderThinkingLevel(AiTaskProfileEntity profile) =>
+        ToProviderThinkingLevel(AiProviderCatalog.DefaultThinkingLevel(
+            profile.AiConnection.Provider, profile.ModelId, profile.TaskType));
 
     public static string ToProviderThinkingLevel(string value) => value switch
     {

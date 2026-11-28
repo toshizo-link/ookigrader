@@ -82,7 +82,7 @@ public sealed class GeminiBatchCapabilityProbeTests
             AiBatchRemoteState.Pending));
         provider.Statuses.Enqueue(provider.Status(
             AiBatchRemoteState.Cancelled));
-        provider.ReturnMatchingListItem = true;
+        provider.MatchingListItems = 1;
         var probe = new GeminiBatchCapabilityProbe(
             provider,
             TimeProvider.System);
@@ -92,10 +92,61 @@ public sealed class GeminiBatchCapabilityProbeTests
             Encoding.UTF8.GetBytes("test-key"));
 
         Assert.Equal("passed", result.State);
+        Assert.True(result.CleanupSucceeded);
         Assert.Equal(1, provider.CreateCalls);
         Assert.Equal(1, provider.ListCalls);
         Assert.Equal(1, provider.CancelCalls);
         Assert.Equal(1, provider.DeleteBatchCalls);
+    }
+
+    [Theory]
+    [InlineData(0, false, false)]
+    [InlineData(2, false, false)]
+    [InlineData(0, true, false)]
+    [InlineData(1, false, true)]
+    public async Task AmbiguousCreateWithNoUniqueReceiptReportsUnconfirmedCleanup(
+        int matches, bool timeout, bool incompleteList)
+    {
+        var provider = new ProbeBatchProvider
+        {
+            CreateFailure = new AiBatchCreateException(
+                AiBatchCreateFailureKind.AmbiguousAfterSend, "gemini_batch_create_network_unknown", true),
+            MatchingListItems = matches,
+            TimeoutOnList = timeout,
+            MoreListPages = incompleteList,
+        };
+        var probe = new GeminiBatchCapabilityProbe(provider, TimeProvider.System);
+
+        var result = await probe.ProbeAsync(Connection(), "test-key"u8.ToArray());
+
+        Assert.Equal("failed", result.State);
+        Assert.False(result.Available);
+        Assert.False(result.CleanupSucceeded);
+        Assert.Equal("gemini_batch_probe_cleanup_failed", result.SafeErrorCode);
+        Assert.Equal(1, provider.CreateCalls);
+        Assert.Equal(incompleteList ? 3 : 1, provider.ListCalls);
+        Assert.Equal(0, provider.CancelCalls);
+        Assert.Equal(0, provider.DeleteBatchCalls);
+        Assert.Equal(["files/probe-input"], provider.DeletedFiles);
+    }
+
+    [Theory]
+    [InlineData(AiBatchCreateFailureKind.DefinitePreSend)]
+    [InlineData(AiBatchCreateFailureKind.DefiniteRemoteRejection)]
+    public async Task DefiniteCreateFailureNeedsOnlyInputFileCleanup(AiBatchCreateFailureKind failure)
+    {
+        var provider = new ProbeBatchProvider
+        {
+            CreateFailure = new AiBatchCreateException(failure, "gemini_batch_create_invalid", false),
+        };
+        var probe = new GeminiBatchCapabilityProbe(provider, TimeProvider.System);
+
+        var result = await probe.ProbeAsync(Connection(), "test-key"u8.ToArray());
+
+        Assert.False(result.Available);
+        Assert.True(result.CleanupSucceeded);
+        Assert.Equal("gemini_batch_create_invalid", result.SafeErrorCode);
+        Assert.Equal(["upload", "create", "delete-file"], provider.Calls);
     }
 
     [Fact]
@@ -119,6 +170,26 @@ public sealed class GeminiBatchCapabilityProbeTests
         Assert.Equal(
             ["files/probe-output", "files/probe-input"],
             provider.DeletedFiles);
+    }
+
+    [Theory]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    public async Task ProviderManagedOutputAllowsBatchOnlyAfterAllOtherCleanupSucceeds(
+        bool inputDeletionFailed, bool expectedAvailable)
+    {
+        var provider = new ProbeBatchProvider { FailFileCleanup = inputDeletionFailed };
+        provider.CompleteWithProviderManagedOutput();
+        var result = await new GeminiBatchCapabilityProbe(provider, TimeProvider.System)
+            .ProbeAsync(Connection(), "test-key"u8.ToArray());
+
+        Assert.Equal(expectedAvailable, result.Available);
+        Assert.False(result.CleanupSucceeded);
+        Assert.Equal(expectedAvailable ? "passed" : "failed", result.State);
+        Assert.Equal(expectedAvailable ? "gemini_batch_probe_provider_managed_output" : "gemini_batch_probe_cleanup_failed",
+            result.SafeErrorCode);
+        Assert.Equal(1, provider.DeleteBatchCalls);
+        Assert.Equal([Assert.IsType<string>(provider.RetainedOutput), "files/probe-input"], provider.DeletedFiles);
     }
 
     [Fact]
@@ -156,7 +227,7 @@ public sealed class GeminiBatchCapabilityProbeTests
             GeminiBatchClient.SelectedModel,
             TimeSpan.FromSeconds(30));
 
-    private sealed class ProbeBatchProvider : IAiBatchProviderClient
+    internal sealed class ProbeBatchProvider : IAiBatchProviderClient
     {
         private string? _displayName;
         private string? _requestKey;
@@ -166,8 +237,19 @@ public sealed class GeminiBatchCapabilityProbeTests
         public List<string> Calls { get; } = [];
         public List<string> DeletedFiles { get; } = [];
         public AiBatchCreateException? CreateFailure { get; set; }
-        public bool ReturnMatchingListItem { get; set; }
+        public int MatchingListItems { get; set; }
+        public bool TimeoutOnList { get; set; }
+        public bool MoreListPages { get; set; }
         public bool FailFileCleanup { get; set; }
+        private string BatchId { get; set; } = "probe-1";
+        public string? RetainedOutput { get; private set; }
+
+        public void CompleteWithProviderManagedOutput()
+        {
+            BatchId = "00000000-0000-0000-0000-000000000001";
+            RetainedOutput = "files/batch-" + BatchId;
+            Statuses.Enqueue(Status(AiBatchRemoteState.Succeeded, RetainedOutput));
+        }
         public int CreateCalls { get; private set; }
         public int ListCalls { get; private set; }
         public int CancelCalls { get; private set; }
@@ -176,7 +258,7 @@ public sealed class GeminiBatchCapabilityProbeTests
         public AiProviderRequest? Request { get; private set; }
 
         public byte[] BuildJsonLines(
-            IReadOnlyList<AiProviderRequest> requests)
+            IReadOnlyList<AiProviderRequest> requests, string modelId = AiProviderCatalog.GeminiDefaultModelId)
         {
             Request = Assert.Single(requests);
             _requestKey = Request.RequestKey;
@@ -215,7 +297,7 @@ public sealed class GeminiBatchCapabilityProbeTests
             }
 
             return Task.FromResult(new AiBatchCreateReceipt(
-                "batches/probe-1",
+                "batches/" + BatchId,
                 request.DisplayName,
                 DateTimeOffset.UtcNow));
         }
@@ -264,11 +346,10 @@ public sealed class GeminiBatchCapabilityProbeTests
             cancellationToken.ThrowIfCancellationRequested();
             Calls.Add("list");
             ListCalls++;
-            IReadOnlyList<AiBatchStatus> batches =
-                ReturnMatchingListItem
-                    ? [Status(AiBatchRemoteState.Pending)]
-                    : [];
-            return Task.FromResult(new AiBatchListPage(batches, null));
+            if (TimeoutOnList) throw new OperationCanceledException();
+            var batches = Enumerable.Range(1, MatchingListItems).Select(index =>
+                Status(AiBatchRemoteState.Pending) with { ProviderBatchName = $"batches/probe-{index}" }).ToArray();
+            return Task.FromResult(new AiBatchListPage(batches, MoreListPages ? $"page-{ListCalls + 1}" : null));
         }
 
         public Task<IReadOnlyList<AiBatchItemResult>> ReadResultsAsync(
@@ -308,6 +389,9 @@ public sealed class GeminiBatchCapabilityProbeTests
             cancellationToken.ThrowIfCancellationRequested();
             Calls.Add("delete-file");
             DeletedFiles.Add(providerFileName);
+            if (providerFileName == RetainedOutput)
+                throw new AiProviderException(AiFailureKind.RequestRejected,
+                    "gemini_delete_file_id_too_long", isTransient: false);
             if (FailFileCleanup)
             {
                 throw new AiProviderException(
@@ -325,7 +409,7 @@ public sealed class GeminiBatchCapabilityProbeTests
         {
             using var raw = JsonDocument.Parse("{}");
             return new AiBatchStatus(
-                "batches/probe-1",
+                "batches/" + BatchId,
                 _displayName,
                 state,
                 DateTimeOffset.UtcNow,

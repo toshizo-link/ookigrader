@@ -328,7 +328,7 @@ namespace OokiGrader.Infrastructure.Persistence.Migrations
 
                     b.ToTable("ai_batch", null, t =>
                         {
-                            t.HasCheckConstraint("ck_ai_batch_cleanup", "cleanup_state IN ('not_started','pending','completed','failed','expired')");
+                            t.HasCheckConstraint("ck_ai_batch_cleanup", "cleanup_state IN ('not_started','pending','completed','failed','expired','provider_managed_output')");
 
                             t.HasCheckConstraint("ck_ai_batch_counts", "submission_epoch > 0 AND create_attempt_count >= 0 AND request_count > 0 AND input_json_lines_bytes >= 0 AND successful_request_count >= 0 AND failed_request_count >= 0 AND pending_request_count >= 0 AND reconciliation_attempt_count >= 0");
 
@@ -710,6 +710,14 @@ namespace OokiGrader.Infrastructure.Persistence.Migrations
                         .HasColumnType("TEXT")
                         .HasColumnName("endpoint_profile");
 
+                    b.Property<string>("InitialGradingMediaResolution")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("medium")
+                        .HasColumnName("initial_grading_media_resolution");
+
                     b.Property<string>("KeyFingerprint")
                         .IsRequired()
                         .HasMaxLength(100)
@@ -952,6 +960,11 @@ namespace OokiGrader.Infrastructure.Persistence.Migrations
                         .HasColumnType("TEXT")
                         .HasColumnName("id")
                         .IsFixedLength();
+
+                    b.Property<string>("GradingMode")
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT")
+                        .HasColumnName("grading_mode");
 
                     b.Property<string>("AcceptedResponseHash")
                         .HasMaxLength(64)
@@ -5676,6 +5689,14 @@ namespace OokiGrader.Infrastructure.Persistence.Migrations
                     b.Property<bool>("ExpectedRosterEnabled")
                         .HasColumnType("INTEGER")
                         .HasColumnName("expected_roster_enabled");
+
+                    b.Property<string>("GradingMode")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("standard")
+                        .HasColumnName("grading_mode");
 
                     b.Property<string>("Priority")
                         .IsRequired()

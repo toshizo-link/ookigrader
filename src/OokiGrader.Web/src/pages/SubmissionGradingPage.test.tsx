@@ -59,6 +59,43 @@ afterEach(() => {
 });
 
 describe("SubmissionGradingPage workflow", () => {
+  it.each([
+    ["ai_always_review", 9900, "ひな形で、この設問は毎回先生が確認する設定になっています。", "確信度 99%"],
+    ["ai_low_confidence", 5000, "AIの確信度が50%未満です。元の答案を確認してください。", "確信度 50%未満"],
+  ] as const)("explains the recorded review reason %s", (reason, confidenceBasisPoints, message, confidence) => {
+    const workspace = makeWorkspace();
+    Object.assign(workspace.results[0]!, { reason, explanation: null, confidenceBasisPoints });
+    queryState.data = { workspace, etag: '"12"' };
+    renderPage();
+    expect(screen.getByText(message)).toBeVisible();
+    expect(screen.getByText(confidence)).toBeVisible();
+  });
+
+  it("shows why a result needs review and keeps a clear incorrect answer in the optional filter", () => {
+    const workspace = makeWorkspace();
+    Object.assign(workspace.results[0]!, {
+      reason: "ai_pilot_proposal",
+      explanation: null,
+      confidenceBasisPoints: 9900,
+      reviewRequired: false,
+      reviewStatus: "not_required",
+    });
+    Object.assign(workspace.results[1]!, {
+      reason: "ai_low_confidence",
+      explanation: null,
+      confidenceBasisPoints: 4999,
+    });
+    workspace.unresolvedSnapshot = workspace.unresolvedSnapshot.slice(1);
+    queryState.data = { workspace, etag: '"12"' };
+    renderPage();
+
+    expect(screen.getByText("AIの確信度が50%未満です。元の答案を確認してください。")).toBeVisible();
+    expect(screen.getByText("確信度 49.99%")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "不正解のみ 1" }));
+    expect(screen.getByRole("button", { name: /大問1.*AI採点/ })).toBeVisible();
+    expect(screen.queryByText("ai_pilot_proposal")).not.toBeInTheDocument();
+  });
+
   it("shows a two-page STEP PDF and follows each result's evidence page", () => {
     const { container } = renderPage();
 

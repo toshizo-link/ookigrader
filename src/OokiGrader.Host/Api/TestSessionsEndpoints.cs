@@ -384,6 +384,7 @@ public static class TestSessionsEndpoints
                 templateCourse = session.TemplateCourseSnapshot
                     ?? session.TemplateVersion.TestTemplate.Course,
                 session.Priority,
+                session.GradingMode,
                 session.State,
                 session.CreationSource,
                 expectedStudentCount = session.RosterMembers.Count(member => member.Expected),
@@ -465,6 +466,7 @@ public static class TestSessionsEndpoints
                     session.Course,
                     session.templateCourse,
                     session.Priority,
+                    session.GradingMode,
                     session.State,
                     session.CreationSource,
                     session.submissionCount,
@@ -603,6 +605,7 @@ public static class TestSessionsEndpoints
                     templateCourse = item.TemplateCourseSnapshot
                         ?? item.TemplateVersion.TestTemplate.Course,
                     item.Priority,
+                    item.GradingMode,
                     item.State,
                     item.CreationSource,
                     submissionCount = item.Submissions.Count,
@@ -653,6 +656,7 @@ public static class TestSessionsEndpoints
                 templateCourse = item.TemplateCourseSnapshot
                     ?? item.TemplateVersion.TestTemplate.Course,
                 item.Priority,
+                item.GradingMode,
                 item.State,
                 item.CreationSource,
                 expectedStudentCount = item.RosterMembers.Count(member => member.Expected),
@@ -747,14 +751,16 @@ public static class TestSessionsEndpoints
         var requestKey = context.Request.Headers["Idempotency-Key"].Count == 1
             ? TrimOrNull(context.Request.Headers["Idempotency-Key"][0])
             : null;
-        var requestFingerprint = ComputeCreateSessionFingerprint(
+        string Fingerprint(string? mode) => ComputeCreateSessionFingerprint(
             request.TemplateVersionId,
             request.TestDate,
             sessionName,
             classLabel,
             course,
             priority,
-            request.OpenImmediately == true);
+            request.OpenImmediately == true, mode);
+        var requestFingerprint = Fingerprint(request.GradingMode);
+        var legacyFingerprint = request.GradingMode is null ? Fingerprint("standard") : null;
         if (requestKey is not null)
         {
             var replay = await db.TestSessions
@@ -770,9 +776,13 @@ public static class TestSessionsEndpoints
                 return ReplayOrRejectCreateSession(
                     context,
                     replay,
-                    requestFingerprint);
+                    requestFingerprint, legacyFingerprint);
             }
         }
+
+        var grading = await CapabilitiesEndpoints.ResolveGradingModeAsync(
+            request.GradingMode, context, db, cancellationToken);
+        if (grading.Error is not null) return grading.Error;
 
         var version = await db.TemplateVersions
             .AsNoTracking()
@@ -815,6 +825,7 @@ public static class TestSessionsEndpoints
             Course = course ?? version.TestTemplate.Course,
             ClassLabel = classLabel,
             Priority = priority,
+            GradingMode = grading.Mode,
             State = request.OpenImmediately == true ? "open" : "draft",
             CreatedByStaffUserId = staffId,
             CreatedAt = now,
@@ -849,7 +860,7 @@ public static class TestSessionsEndpoints
                 return ReplayOrRejectCreateSession(
                     context,
                     replay,
-                    requestFingerprint);
+                    requestFingerprint, legacyFingerprint);
             }
 
             return SessionStartFailed(context);
@@ -885,7 +896,8 @@ public static class TestSessionsEndpoints
         TimeProvider timeProvider,
         CancellationToken cancellationToken)
     {
-        if (request.Priority is not ("economy" or "expedite"))
+        if ((request.Priority is null && request.GradingMode is null)
+            || request.Priority is not (null or "economy" or "expedite"))
         {
             return ApiHelpers.Problem(
                 context,
@@ -922,13 +934,21 @@ public static class TestSessionsEndpoints
                 "最新の状態を読み込み直してから変更してください。");
         }
 
-        session.Priority = request.Priority;
+        if (request.GradingMode is not null)
+        {
+            var grading = await CapabilitiesEndpoints.ResolveGradingModeAsync(
+                request.GradingMode, context, db, cancellationToken);
+            if (grading.Error is not null) return grading.Error;
+            session.GradingMode = grading.Mode;
+        }
+
+        session.Priority = request.Priority ?? session.Priority;
         AddAudit(
             db,
             timeProvider.GetUtcNow(),
             principal,
             context,
-            "test_session.priority_updated",
+            request.GradingMode is null ? "test_session.priority_updated" : "test_session.grading_mode_updated",
             session.Id);
         await db.SaveChangesAsync(cancellationToken);
         ApiHelpers.SetRevisionEtag(context.Response, session.Revision);
@@ -936,6 +956,7 @@ public static class TestSessionsEndpoints
         {
             session.Id,
             session.Priority,
+            session.GradingMode,
             session.Revision,
         });
     }
@@ -1545,12 +1566,14 @@ public static class TestSessionsEndpoints
     private static IResult ReplayOrRejectCreateSession(
         HttpContext context,
         TestSessionEntity session,
-        string requestFingerprint)
+        string requestFingerprint,
+        string? legacyFingerprint)
     {
         if (!string.Equals(
                 session.RequestFingerprint,
                 requestFingerprint,
-                StringComparison.Ordinal))
+                StringComparison.Ordinal)
+            && (legacyFingerprint is null || session.RequestFingerprint != legacyFingerprint))
         {
             return ApiHelpers.Problem(
                 context,
@@ -1594,6 +1617,7 @@ public static class TestSessionsEndpoints
                     ?? version.TestTemplate.Course,
                 session.TemplateCourseSnapshot ?? version.TestTemplate.Course,
                 session.Priority,
+                session.GradingMode,
                 session.State,
                 session.CreationSource,
                 0,
@@ -1610,7 +1634,8 @@ public static class TestSessionsEndpoints
         string? classLabel,
         string? course,
         string priority,
-        bool openImmediately)
+        bool openImmediately,
+        string? gradingMode)
     {
         var canonical = string.Join(
             '\n',
@@ -1621,6 +1646,9 @@ public static class TestSessionsEndpoints
             course ?? "<null>",
             priority,
             openImmediately ? "open" : "draft");
+        // Earlier clients omitted the mode for standard grading. Keep its old
+        // fingerprint and distinguish new automatic selections on replay.
+        if (gradingMode != "standard") canonical += "\n" + (gradingMode ?? "default");
         return Convert.ToHexString(
                 SHA256.HashData(Encoding.UTF8.GetBytes(canonical)))
             .ToLowerInvariant();
@@ -1713,11 +1741,13 @@ public static class TestSessionsEndpoints
         string? ClassLabel,
         string? Course,
         string? Priority,
-        bool? OpenImmediately);
+        bool? OpenImmediately,
+        string? GradingMode = null);
 
     private sealed record UpdateSessionBody(
-        string Priority,
-        long? Revision);
+        string? Priority = null,
+        long? Revision = null,
+        string? GradingMode = null);
 
     private sealed record ReplaceRosterBody(IReadOnlyList<string> StudentIds);
 
@@ -1739,6 +1769,7 @@ public static class TestSessionsEndpoints
         string? Course,
         string? TemplateCourse,
         string Priority,
+        string GradingMode,
         string State,
         string CreationSource,
         int ExpectedStudentCount,

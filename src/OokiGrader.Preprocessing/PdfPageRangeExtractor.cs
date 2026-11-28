@@ -8,17 +8,28 @@ namespace OokiGrader.Preprocessing;
 public sealed class PdfPageRangeExtractor(
     IPreprocessingService preprocessingService) : IPdfPageRangeExtractor
 {
-    public async Task<DerivedPdfResult> ExtractAsync(
+    public Task<DerivedPdfResult> ExtractAsync(
         Stream source,
         string sourceName,
         int firstPage,
         int lastPage,
         IReadOnlyDictionary<int, int> rotations,
+        CancellationToken cancellationToken = default) =>
+        ExtractForProviderAsync(source, sourceName, firstPage, lastPage, rotations, 0, cancellationToken);
+
+    public async Task<DerivedPdfResult> ExtractForProviderAsync(
+        Stream source,
+        string sourceName,
+        int firstPage,
+        int lastPage,
+        IReadOnlyDictionary<int, int> rotations,
+        int maximumProviderMediaBytes,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(source);
         ArgumentException.ThrowIfNullOrWhiteSpace(sourceName);
         ArgumentNullException.ThrowIfNull(rotations);
+        ArgumentOutOfRangeException.ThrowIfNegative(maximumProviderMediaBytes);
         if (firstPage < 1 || lastPage < firstPage)
         {
             throw new ArgumentOutOfRangeException(
@@ -84,6 +95,10 @@ public sealed class PdfPageRangeExtractor(
             selectedPages.Count,
             firstPage,
             lastPage,
-            applied);
+            applied)
+        {
+            BookSpreadDetails = BookSpreadViews.Create(
+                selectedPages, firstPage, maximumProviderMediaBytes - pdf.Length, cancellationToken),
+        };
     }
 }

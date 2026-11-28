@@ -225,8 +225,8 @@ public sealed class DuplicateSubmissionWorkflowTests
             Assert.NotNull(run.ActivatedAt);
             Assert.Equal(TestAuthenticationHandler.StaffId,
                 run.ActivatedByStaffUserId);
-            Assert.Equal("queued", adjudication.State);
-            Assert.Null(adjudication.ErrorCode);
+            Assert.Equal("blocked", adjudication.State);
+            Assert.Equal("awaiting_identity", adjudication.ErrorCode);
         });
     }
 

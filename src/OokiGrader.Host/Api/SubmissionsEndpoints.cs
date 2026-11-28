@@ -630,6 +630,10 @@ public static partial class SubmissionsEndpoints
             db,
             submissionIds,
             cancellationToken);
+        var pendingIds = submissions.Where(item => item.CurrentGradingRunId is null && item.VoidedAt is null
+                && !item.GradingRuns.Any(run => run.State == "awaiting_identity"))
+            .Select(item => item.Id).ToArray();
+        var batchStates = await LoadInitialGradingBatchStatesAsync(db, pendingIds, cancellationToken);
         var nextCursor = submissions.Count == 0
             ? null
             : CursorPagination.Next(
@@ -676,11 +680,76 @@ public static partial class SubmissionsEndpoints
         {
             items = submissions.Select(submission => ToListItem(
                 submission,
-                exportStates.GetValueOrDefault(submission.Id))),
+                exportStates.GetValueOrDefault(submission.Id),
+                batchStates.GetValueOrDefault(submission.Id))),
             nextCursor,
             totalApproximate = total,
             facets,
         });
+    }
+
+    private static async Task<Dictionary<string, string?>> LoadInitialGradingBatchStatesAsync(
+        OokiGraderDbContext db, string[] submissionIds, CancellationToken cancellationToken)
+    {
+        var states = new Dictionary<string, string?>(StringComparer.Ordinal);
+        if (submissionIds.Length == 0) return states;
+
+        var requests = await db.AiRequests.AsNoTracking()
+            .Where(item => item.EntityType == "submission" && item.Purpose == AiTaskTypes.InitialGrading
+                && submissionIds.Contains(item.EntityId))
+            .OrderByDescending(item => item.CreatedAt).ThenByDescending(item => item.Id)
+            .Select(item => new
+            {
+                item.EntityId, item.GradingMode, item.State,
+                Mapped = item.BatchRequest != null,
+                BatchState = item.BatchRequest != null && item.BatchRequest.AiBatch != null
+                    ? item.BatchRequest.AiBatch.State : null,
+            }).ToListAsync(cancellationToken);
+        foreach (var item in requests.DistinctBy(item => item.EntityId))
+        {
+            states[item.EntityId] = item.GradingMode != "batch" && !item.Mapped ? null
+                : item.State switch
+                {
+                    "failed" or "cancelled" or "invalid_output" or "safety_blocked" => "failed",
+                    "budget_blocked" => "manual_review",
+                    "response_ready" or "succeeded" => "applying",
+                    _ => item.BatchState switch
+                    {
+                        "delayed" or "running" => item.BatchState,
+                        "submitted" or "pending" => "submitted",
+                        "manual_review" or "reconcile_required" => "manual_review",
+                        "failed" or "expired" or "cancelled" => "failed",
+                        _ => item.Mapped ? "prepared" : "queued",
+                    },
+                };
+        }
+
+        var withoutRequests = submissionIds.Where(id => !states.ContainsKey(id)).ToArray();
+        if (withoutRequests.Length == 0) return states;
+        var queued = await (
+            from submission in db.Submissions.AsNoTracking()
+            from job in db.BackgroundJobs
+            where withoutRequests.Contains(submission.Id) && job.Type == AiInitialGradingJobWorker.JobType
+                && job.DeduplicationKey.StartsWith("submission:" + submission.Id + ":gemini-analyze:")
+            orderby job.CreatedAt descending, job.Id descending
+            select new { submission.Id, Payload = job.PayloadJson, job.State }).ToListAsync(cancellationToken);
+        foreach (var row in queued.DistinctBy(item => item.Id))
+        {
+            try
+            {
+                using var payload = JsonDocument.Parse(row.Payload);
+                if (payload.RootElement.ValueKind == JsonValueKind.Object
+                    && payload.RootElement.TryGetProperty("gradingMode", out var mode)
+                    && mode.ValueKind == JsonValueKind.String && mode.GetString() == "batch")
+                    states[row.Id] = row.State is "blocked" or "failed" or "cancelled" ? "failed" : "queued";
+            }
+            catch (JsonException)
+            {
+                // A malformed historical job has no usable mode snapshot.
+            }
+        }
+
+        return states;
     }
 
     private sealed record SubmissionCursorPosition(
@@ -1196,12 +1265,7 @@ public static partial class SubmissionsEndpoints
         string? gradingQueueReason = null;
         if (submission.CurrentGradingRunId is null)
         {
-            var stagedRun = await ActivateStagedCombinedRunAsync(
-                db,
-                submission,
-                ApiHelpers.StaffId(principal),
-                now,
-                cancellationToken);
+            var stagedRun = ActivateStagedCombinedRun(submission, ApiHelpers.StaffId(principal), now);
             if (stagedRun is not null)
             {
                 gradingQueueReason = "combined_analysis_activated";
@@ -1425,12 +1489,7 @@ public static partial class SubmissionsEndpoints
         {
             submission.AssignmentEvidenceJson =
                 """{"disposition":"unidentified"}""";
-            var stagedRun = await ActivateStagedCombinedRunAsync(
-                db,
-                submission,
-                ApiHelpers.StaffId(principal),
-                now,
-                cancellationToken);
+            var stagedRun = ActivateStagedCombinedRun(submission, ApiHelpers.StaffId(principal), now);
             GradingJobSelection? grading = null;
             if (stagedRun is null)
             {
@@ -1682,17 +1741,7 @@ public static partial class SubmissionsEndpoints
                         || item.AiConnection.ModelId
                             != AiProviderCatalog.DeepSeekV4FlashModelId)
                     && item.AiConnection.State == "active"
-                    && item.AiConnection.LastCapabilityProbeState == "passed"
-                    && (item.ProcessingStrategy != "gemini_batch"
-                        || (item.AiConnection.Provider
-                                == AiProviders.GeminiDirect
-                            && item.ModelId
-                                == AiInitialGradingJobWorker.ModelId
-                            && item.AiConnection
-                                .LastBatchCapabilityProbeState == "passed"
-                            && item.AiConnection
-                                    .LastBatchCapabilityProbeCredentialRevision
-                                == item.AiConnection.CredentialRevision)))
+                    && item.AiConnection.LastCapabilityProbeState == "passed")
                 .OrderByDescending(item => item.ActivatedAt)
                 .ThenBy(item => item.Id)
                 .FirstOrDefaultAsync(cancellationToken);
@@ -1785,6 +1834,7 @@ public static partial class SubmissionsEndpoints
                 {
                     submissionId = submission.Id,
                     templateVersionId = version.Id,
+                    gradingMode = submission.TestSession.GradingMode,
                     manifestHash,
                 }),
                 State = "queued",
@@ -1901,12 +1951,8 @@ public static partial class SubmissionsEndpoints
         }
     }
 
-    private static async Task<GradingRunEntity?> ActivateStagedCombinedRunAsync(
-        OokiGraderDbContext db,
-        SubmissionEntity submission,
-        string actorStaffUserId,
-        DateTimeOffset now,
-        CancellationToken cancellationToken)
+    private static GradingRunEntity? ActivateStagedCombinedRun(
+        SubmissionEntity submission, string actorStaffUserId, DateTimeOffset now)
     {
         if (submission.CurrentGradingRunId is not null
             || submission.VoidedAt is not null)
@@ -1936,29 +1982,6 @@ public static partial class SubmissionsEndpoints
         submission.CurrentGradingRunId = staged.Id;
         submission.State = staged.State;
         submission.UpdatedAt = now;
-        var resultPrefixes = staged.QuestionResults.Select(result =>
-                $"question-result:{result.Id}:adjudication:")
-            .ToArray();
-        if (resultPrefixes.Length > 0)
-        {
-            var waiting = await db.BackgroundJobs
-                .Where(job => job.Type == AiAdjudicationJobWorker.JobType
-                    && job.State == "blocked"
-                    && job.ErrorCode == "awaiting_identity")
-                .ToListAsync(cancellationToken);
-            foreach (var job in waiting.Where(job => resultPrefixes.Any(prefix =>
-                         job.DeduplicationKey.StartsWith(
-                             prefix,
-                             StringComparison.Ordinal))))
-            {
-                job.State = "queued";
-                job.NextAttemptAt = now;
-                job.ErrorCode = null;
-                job.SafeErrorDetail = null;
-                job.CompletedAt = null;
-            }
-        }
-
         return staged;
     }
 
@@ -2017,7 +2040,8 @@ public static partial class SubmissionsEndpoints
 
     private static object ToListItem(
         SubmissionEntity submission,
-        string? exportState)
+        string? exportState,
+        string? initialGradingBatchState)
     {
         var currentRun = submission.GradingRuns.SingleOrDefault(
             run => run.Id == submission.CurrentGradingRunId);
@@ -2067,6 +2091,7 @@ public static partial class SubmissionsEndpoints
             qualityWarnings = SubmissionQualityWarnings.Build(
                 submission.QualitySummaryJson),
             blockingReview = currentRun?.State == "needs_grade_review",
+            initialGradingBatchState,
             exportState,
             submission.FinalizedAt,
             submission.UpdatedAt,

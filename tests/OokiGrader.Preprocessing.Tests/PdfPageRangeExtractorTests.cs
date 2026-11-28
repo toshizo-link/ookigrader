@@ -97,7 +97,8 @@ public sealed class PdfPageRangeExtractorTests
             "source.pdf",
             1,
             1,
-            new Dictionary<int, int>());
+            new Dictionary<int, int>(),
+            CancellationToken.None);
 
         Assert.Equal(1, result.PageCount);
         Assert.Equal(1, result.FirstPage);
@@ -115,6 +116,49 @@ public sealed class PdfPageRangeExtractorTests
             2,
             3,
             new Dictionary<int, int> { [1] = 90 }));
+    }
+
+    [Theory]
+    [InlineData(true, false, 2)]
+    [InlineData(true, true, 0)]
+    [InlineData(false, false, 0)]
+    public async Task AttachesBothBookPanelsOnlyForASpreadThatFitsTheRequest(
+        bool hasGutter, bool tightBudget, int expectedViews)
+    {
+        var service = new PreprocessingService(new PreprocessingOptions { ImageDpi = 72, PdfDpi = 72 });
+        var png = CreatePng(1400, 900, canvas =>
+        {
+            canvas.Clear(SKColors.White);
+            using var paint = new SKPaint { Color = SKColors.Navy };
+            for (var y = 70; y < 840; y += 15)
+            {
+                canvas.DrawRect(new SKRect(45, y, hasGutter ? 645 : 740, y + 5), paint);
+                paint.Color = SKColors.Maroon;
+                canvas.DrawRect(new SKRect(740, y, 1355, y + 5), paint);
+                paint.Color = SKColors.Navy;
+            }
+        });
+        var page = await service.ProcessAsync(new MemoryStream(png), new PreprocessingInput("image/png", "spread.png"));
+        var pdf = PreprocessedDocumentEncoder.ToPdf(page.Pages);
+        var extractor = new PdfPageRangeExtractor(service);
+        var result = await extractor.ExtractForProviderAsync(new MemoryStream(pdf), "spread.pdf", 1, 1,
+            new Dictionary<int, int>(), maximumProviderMediaBytes: tightBudget ? 1 : 2 * 1024 * 1024);
+
+        Assert.Equal(1, result.PageCount);
+        Assert.Equal(expectedViews, result.BookSpreadDetails.Count);
+        if (expectedViews == 0) return;
+        Assert.Equal(["left", "right"], result.BookSpreadDetails.Select(view => view.Side));
+        Assert.All(result.BookSpreadDetails, view =>
+        {
+            Assert.Equal(1, view.OriginalPageNumber);
+            Assert.Equal("image/jpeg", view.Image.MimeType);
+            Assert.Equal(Fingerprinting.Sha256(view.Image.Bytes), view.Image.Sha256);
+            Assert.True(view.Image.Width < view.Image.Height);
+        });
+        using var left = SKBitmap.Decode(result.BookSpreadDetails[0].Image.Bytes);
+        using var right = SKBitmap.Decode(result.BookSpreadDetails[1].Image.Bytes);
+        Assert.True(left.GetPixel(200, 72).Blue > left.GetPixel(200, 72).Red);
+        Assert.True(right.GetPixel(200, 72).Red > right.GetPixel(200, 72).Blue);
     }
 
     private static PreprocessingService CreateService() => new(

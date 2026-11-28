@@ -2729,6 +2729,10 @@ public static class TemplatesEndpoints
         }
 
         var now = timeProvider.GetUtcNow();
+        var grading = await CapabilitiesEndpoints.ResolveGradingModeAsync(
+            request?.GradingMode, context, db, cancellationToken);
+        if (grading.Error is not null) return grading.Error;
+
         var autoVerified = AutoVerifySafeGeneratedProposals(version, now);
         if (autoVerified.QuestionCount > 0
             || autoVerified.AnswerCount > 0)
@@ -2907,6 +2911,7 @@ public static class TemplatesEndpoints
                 Course = template.Course,
                 ClassLabel = classLabel,
                 Priority = "expedite",
+                GradingMode = grading.Mode,
                 State = "open",
                 CreatedByStaffUserId = ApiHelpers.StaffId(principal),
                 CreatedAt = now,
@@ -3266,6 +3271,7 @@ public static class TemplatesEndpoints
             session.TestDate,
             session.ClassLabel,
             session.Priority,
+            session.GradingMode,
             session.State,
             session.CreationSource,
             session.Revision);
@@ -5995,6 +6001,8 @@ public static class TemplatesEndpoints
 
     private sealed record PublishTemplateApiRequest
     {
+        public string? GradingMode { get; init; }
+
         public long? Revision { get; init; }
 
         // Older clients omit the property to request today's date. An explicit null
@@ -6170,6 +6178,7 @@ public static class TemplatesEndpoints
         DateOnly? TestDate,
         string? ClassLabel,
         string Priority,
+        string GradingMode,
         string State,
         string CreationSource,
         long Revision);

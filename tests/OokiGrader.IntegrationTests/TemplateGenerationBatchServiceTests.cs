@@ -657,7 +657,7 @@ public sealed class TemplateGenerationBatchServiceTests
                 PromptVersion = bundle.PromptVersion,
                 SchemaVersion = bundle.SchemaVersion,
                 PromptContentHash = bundle.ContentHash,
-                ThinkingLevel = "medium",
+                ThinkingLevel = "low",
                 MediaResolution = "high",
                 MaxOutputTokens = 8_192,
                 ConcurrencyLimit = 1,

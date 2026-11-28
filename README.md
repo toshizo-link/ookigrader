@@ -41,7 +41,7 @@ uses its percentage filter only for sessions without a saved mistake limit.
 
 - `src/OokiGrader.Domain` — grading, template, student-matching, scoring, and retention rules;
 - `src/OokiGrader.Application` — application abstractions and orchestration;
-- `src/OokiGrader.Ai.*` — provider-neutral AI contracts, official Gemini and OpenRouter standard clients, and legacy Gemini Batch compatibility code;
+- `src/OokiGrader.Ai.*` — provider-neutral AI contracts, Gemini standard and Batch clients, and the OpenRouter standard client;
 - `src/OokiGrader.Infrastructure` — EF Core/SQLite persistence, migrations, durable jobs, audit, and content-addressed storage;
 - `src/OokiGrader.Preprocessing` — bounded PDF/image normalization, alignment, quality, thumbnails, and fingerprints;
 - `src/OokiGrader.Reports.Pdf` — deterministic Japanese result reports;
@@ -222,8 +222,8 @@ API key, and choose **接続を確認して有効化**. The host tests the suppl
 candidate before it changes any saved state. Authentication, exact-model,
 image-input, strict structured-output, usage-metadata, and representative image
 task checks must all pass. Only then does the host encrypt and persist the key
-and atomically make the exact current profiles for template extraction, name
-transcription, initial grading, and adjudication available. A failed or
+and activate the profiles for template extraction, name transcription, and
+grading. A failed or
 ambiguous replacement leaves the previous working key, connection, and task
 profiles unchanged.
 
@@ -232,11 +232,16 @@ development stores it in an authenticated encrypted file bound to the
 persistent ASP.NET Core Data Protection key ring under `Data:Root`, so a normal
 Host restart does not require the key to be entered again. This macOS store is
 development-only; moving the data root or restoring it on another machine still
-requires re-entry. The checked-in grading path uses the exact model identifier
-`gemini-3.7-flash` by default. For new Gemini 3.7 profile settings, the supported
-thinking levels are `LOW`, `MEDIUM`, and `HIGH`; `MINIMAL` is not accepted.
+requires re-entry. The default grading model is `gemini-3.8-flash`. Its
+template extraction profile uses `MEDIUM` thinking. Immediate and Batch grading
+use `LOW` thinking. Each template unit
+gets one extraction pass. Each answer sheet gets one grading pass, with separate
+chunks only when needed to fit the provider's input size limit. Clearly read
+wrong answers and visible blanks receive their scores directly. Confidence
+below 50%, missing or ambiguous evidence, scoring conflicts, and a question's
+always-review setting send the answer to the teacher.
 
-An administrator can change only the exact Gemini model ID on the same screen
+An administrator can change the exact Gemini model ID on the same screen
 and leave the API-key field blank. The host reuses the already encrypted key,
 runs the full authentication, exact-model, image, structured-output,
 usage-metadata, and representative-task capability checks, and atomically
@@ -247,13 +252,26 @@ Gemini Batch work is still in progress. Older evaluation/profile snapshots are
 retained as historical evidence; changing the default does not rewrite them or
 the model provenance of completed grading runs.
 
+In the Gemini connection editor, **初回採点の画像解像度** controls how much
+visual detail Gemini receives for the first grading pass, including the name
+on page one. **標準（既定）** uses medium detail for new connections.
+Existing active connections retain their selected resolution. Choose **高精細**
+if fine kanji, faint pencil marks, or names are hard to read. The host retains the
+full-resolution pages for teacher review.
+Each initial grading request puts the common questions and answer key first so
+Gemini can reuse that prefix across submissions. Google determines each cache
+hit. Each student's answer pages are sent for that student's grading.
+
 The normal Gemini screen does not ask a school administrator to create an
-evaluation record, approve a pilot, or activate four profiles by hand. Its
+evaluation record, approve a pilot, or activate profiles by hand. Its
 manual connection test repairs missing or stale current profiles after a full
 capability pass, and startup reconciles active Gemini profiles after a
-checked-in prompt/schema/hash revision change. New grading work does not expose a
-Batch/priority choice; the host queues it safely and teachers work from one
-consistent flow. Timeout, concurrency, pricing, and budget settings remain
+checked-in prompt/schema/hash revision change. After the administrator tests
+Batch on the Gemini connection, new test sessions default to Batch grading.
+Before Batch is ready, new sessions default to immediate grading. Teachers can
+choose immediate grading for urgent tests. Batch targets a 24-hour turnaround at half the
+standard token price.
+Timeout, concurrency, pricing, and budget settings remain
 under folded details. Advanced model evaluation and manual profile endpoints
 remain available for OpenRouter and backward-compatible technical operation.
 Never put a provider key in source, `appsettings`, a shell argument,
@@ -363,10 +381,11 @@ work or budget reservation. Class-placement and Other PDFs stay whole. There
 is no AI test-type, split, variation, subject, naming, grade, or
 orientation-preflight task.
 
-Template extraction uses one orientation-gated request. Upright media is
-extracted in that same response. A valid `rotate` response causes the host to
-apply per-page quarter turns locally and make exactly one corrected-media
-request; another rotation request is a blocking failure. Paper name and grade
+Each template extraction returns the questions and per-page orientation in a
+single request. The host applies the reported rotations to the derived PDF locally.
+For a landscape scan with two printed pages and a visible gutter, the request
+can include a magnified view of each side alongside the original page.
+Paper name and grade
 are returned with extraction, and filename grade is parsed locally. Final check
 resolves the grade first, then the host assigns immutable names to known types:
 HOP `{subject}{grade}年HOP{unitSequence}`, STEP
@@ -516,7 +535,7 @@ The specification is the target design; [Implementation status](docs/implementat
 - The application is for authorized school staff, not for student self-service.
 - Test images remain on the host except for approved, short-lived normalized
   pages sent to the active, image-capable Gemini or OpenRouter profile for
-  template creation, name reading, grading, or adjudication.
+  template creation, name reading, or grading.
 - The checked-in default uses a school-supplied official Gemini API key.
   An optional school-supplied OpenRouter connection is supported, but only a
   model that passes both the image capability probe and the school accuracy

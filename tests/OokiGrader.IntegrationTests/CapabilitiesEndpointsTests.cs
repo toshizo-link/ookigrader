@@ -122,6 +122,11 @@ public sealed class CapabilitiesEndpointsTests
         Assert.False(ready.Safety.AutomaticAssignment);
         Assert.False(ready.Safety.AutomaticFinalization);
 
+        var initialProfile = await db.AiTaskProfiles.SingleAsync(item => item.TaskType == AiTaskTypes.InitialGrading);
+        initialProfile.ProcessingStrategy = "queued_standard";
+        await db.SaveChangesAsync();
+        Assert.True((await CapabilitiesEndpoints.ReadAsync(db, configuration, promptCatalog, CancellationToken.None)).Ai.GeminiBatch.Ready);
+
         aiConnection.LastBatchCapabilityProbeState = "failed";
         aiConnection.LastBatchCapabilityProbeErrorCode =
             "gemini_batch_probe_failed";
@@ -132,7 +137,7 @@ public sealed class CapabilitiesEndpointsTests
             promptCatalog,
             CancellationToken.None);
         Assert.True(batchUnavailable.Ai.TemplateGeneration.Ready);
-        Assert.False(batchUnavailable.Ai.SemanticGrading.Ready);
+        Assert.True(batchUnavailable.Ai.SemanticGrading.Ready);
         Assert.False(batchUnavailable.Ai.GeminiBatch.Ready);
     }
 
@@ -246,7 +251,7 @@ public sealed class CapabilitiesEndpointsTests
         Assert.False(textOnlyModel.Ai.SemanticGrading.Ready);
     }
 
-    private static AiTaskProfileEntity Profile(
+    internal static AiTaskProfileEntity Profile(
         string taskType,
         string processingStrategy,
         AiConnectionEntity connection,

@@ -123,11 +123,11 @@ public sealed class OrientationGatedTemplateExtractionValidatorTests
     }
 
     [Fact]
-    public void RejectsExtractionWithNonZeroRotation()
+    public void AcceptsExtractionWithNonZeroRotation()
     {
-        var exception = Assert.Throws<InvalidDataException>(() =>
-            Validate(ExtractionResponse(270)));
-        Assert.Equal("ORIENTATION_RESPONSE_INVALID", exception.Message);
+        var result = Validate(ExtractionResponse(270));
+        Assert.Equal(270, Assert.Single(result.Orientation).ClockwiseDegreesToUpright);
+        Assert.NotEmpty(result.Extraction!.Pages);
     }
 
     [Fact]

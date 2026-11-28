@@ -42,11 +42,12 @@ public sealed record ValidatedAiGradingResponse(
 
 public static class AiGradingResponseValidator
 {
+    public const string CompactSchemaVersion = "submission_analysis_compact_v1";
     private const int MaximumResponseItems = 300;
     private const int MaximumRequestKeyLength = 200;
     private const int MaximumQuestionIdLength = 200;
     private const int MaximumTranscriptionLength = 20_000;
-    private const double MinimumAutomaticConfidence = 0.80;
+    private const double MinimumAutomaticConfidence = 0.50;
     private static readonly HashSet<string> AllowedOutcomes =
     [
         "correct",
@@ -60,7 +61,8 @@ public static class AiGradingResponseValidator
         JsonElement response,
         string expectedRequestKey,
         IReadOnlyDictionary<string, DomainQuestionDefinition> questions,
-        int? mediaPartCount = null)
+        int? mediaPartCount = null,
+        bool compact = false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(expectedRequestKey);
         ArgumentNullException.ThrowIfNull(questions);
@@ -68,8 +70,9 @@ public static class AiGradingResponseValidator
             ? RequiredString(response, "schema_version")
             : string.Empty;
         if (response.ValueKind is not JsonValueKind.Object
-            || schemaVersion is not (
-                "answer_transcribe_grade_v1" or "submission_analysis_v2")
+            || (compact
+                ? schemaVersion != CompactSchemaVersion
+                : schemaVersion is not ("answer_transcribe_grade_v1" or "submission_analysis_v2"))
             || expectedRequestKey.Length > MaximumRequestKeyLength
             || RequiredBoundedString(
                     response,
@@ -89,6 +92,17 @@ public static class AiGradingResponseValidator
 
         var observations = new List<ValidatedAiQuestionObservation>(
             results.GetArrayLength());
+        // This order is fixed by the immutable template and is also used when
+        // sending the rubric. Output array position never identifies a question.
+        var compactIds = compact
+            ? questions.Values.OrderBy(item => item.OrderIndex)
+                .ThenBy(item => item.Id, StringComparer.Ordinal)
+                .Select(item => item.Id).ToArray()
+            : null;
+        if (compact && (response.EnumerateObject().Count() != 6 || !response.TryGetProperty("identity", out _)))
+        {
+            throw Invalid("ai_response_field_invalid");
+        }
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var result in results.EnumerateArray())
         {
@@ -97,10 +111,13 @@ public static class AiGradingResponseValidator
                 throw Invalid("ai_response_field_invalid");
             }
 
-            var questionId = RequiredBoundedString(
-                result,
-                "question_id",
-                MaximumQuestionIdLength);
+            if (compact && result.EnumerateObject().Count() != 8)
+            {
+                throw Invalid("ai_response_field_invalid");
+            }
+            var questionId = compactIds is null
+                ? RequiredBoundedString(result, "question_id", MaximumQuestionIdLength)
+                : ResolveCompactId(RequiredProperty(result, "q"), compactIds);
             if (!seen.Add(questionId)
                 || !questions.TryGetValue(questionId, out var question))
             {
@@ -108,11 +125,11 @@ public static class AiGradingResponseValidator
             }
 
             int? evidenceMediaIndex = null;
-            if (schemaVersion == "submission_analysis_v2")
+            if (compact || schemaVersion == "submission_analysis_v2")
             {
                 var parsedIndex = RequiredInt32(
                     result,
-                    "evidence_media_index");
+                    compact ? "m" : "evidence_media_index");
                 if (parsedIndex < 0
                     || (mediaPartCount is not null
                         && parsedIndex >= mediaPartCount.Value))
@@ -125,18 +142,18 @@ public static class AiGradingResponseValidator
 
             var transcription = RequiredBoundedString(
                 result,
-                "transcription",
+                compact ? "t" : "transcription",
                 MaximumTranscriptionLength,
                 allowEmpty: true);
-            var legibility = RequiredString(result, "legibility");
-            var blank = RequiredBoolean(result, "blank");
-            var outcome = RequiredString(result, "proposed_outcome");
-            var proposedPoints = RequiredInt64(result, "proposed_points_milli");
-            var confidence = RequiredDouble(result, "confidence");
+            var legibility = RequiredString(result, compact ? "l" : "legibility");
+            var blank = RequiredBoolean(result, compact ? "b" : "blank");
+            var outcome = RequiredString(result, compact ? "o" : "proposed_outcome");
+            var proposedPoints = RequiredInt64(result, compact ? "p" : "proposed_points_milli");
+            var confidence = RequiredDouble(result, compact ? "c" : "confidence");
             var reviewRecommended = question.RequiresReviewAlways
                 || confidence < MinimumAutomaticConfidence
                 || legibility != "clear"
-                || outcome is "partial" or "review" or "unreadable";
+                || outcome is "review" or "unreadable";
             var pointAwardValid = proposedPoints >= 0
                 && proposedPoints <= question.MaximumPoints.Value
                 && question.PointPolicy.ValidateAward(
@@ -154,6 +171,7 @@ public static class AiGradingResponseValidator
             if (confidence is < 0 or > 1
                 || !AllowedOutcomes.Contains(outcome)
                 || (blank && transcription.Length > 0)
+                || (compact && blank && legibility != "clear")
                 || (blank && outcome != "blank")
                 || (!blank && outcome == "blank")
                 || (legibility is "unreadable" or "cropped" && outcome != "unreadable"))
@@ -181,9 +199,12 @@ public static class AiGradingResponseValidator
                 proposedPoints,
                 outcome,
                 reviewRecommended);
-            var requiresTeacherReview = reconciled.ReviewRecommended
-                || RequiresTeacherReviewForOutcome(
-                    reconciled.ProposedOutcome);
+            // A located diagram or mark can have no transcribable characters.
+            // A text rule cannot turn that evidence into a visibly empty field.
+            if (!blank && reconciled.ProposedOutcome == "blank")
+            {
+                reconciled = new ReconciledProposal(0, "review", true, "ai_nontext_answer_review");
+            }
             var canonicalItem = JsonSerializer.SerializeToUtf8Bytes(result);
             observations.Add(new ValidatedAiQuestionObservation(
                 questionId,
@@ -193,8 +214,12 @@ public static class AiGradingResponseValidator
                 checked((int)Math.Round(
                     confidence * 10_000,
                     MidpointRounding.AwayFromZero)),
-                requiresTeacherReview,
-                reconciled.ReasonCode,
+                reconciled.ReviewRecommended,
+                reconciled.ReasonCode
+                    ?? (question.RequiresReviewAlways ? "ai_always_review"
+                        : confidence < MinimumAutomaticConfidence ? "ai_low_confidence"
+                        : reconciled.ProposedOutcome is "review" or "unreadable" ? "ai_judgment_uncertain"
+                        : null),
                 null,
                 Convert.ToHexString(
                         System.Security.Cryptography.SHA256.HashData(canonicalItem))
@@ -209,7 +234,9 @@ public static class AiGradingResponseValidator
         }
 
         var reportedMissingValues = missing.EnumerateArray()
-            .Select(item => item.ValueKind is JsonValueKind.String
+            .Select(item => compactIds is not null
+                ? ResolveCompactId(item, compactIds)
+                : item.ValueKind is JsonValueKind.String
                 ? item.GetString() ?? string.Empty
                 : throw Invalid("ai_response_missing_ids_invalid"))
             .ToArray();
@@ -234,13 +261,11 @@ public static class AiGradingResponseValidator
             RequiredBoolean(response, "unexpected_content"));
     }
 
-    private static bool RequiresTeacherReviewForOutcome(string outcome) =>
-        outcome != "correct";
-
     public static AiIdentityComponentValidation ValidateIdentityComponent(
         JsonElement response,
         string expectedRequestKey,
-        bool identityExpected)
+        bool identityExpected,
+        bool compact = false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(expectedRequestKey);
         try
@@ -253,7 +278,7 @@ public static class AiGradingResponseValidator
             }
 
             var schemaVersion = RequiredString(response, "schema_version");
-            if (schemaVersion == "answer_transcribe_grade_v1")
+            if (!compact && schemaVersion == "answer_transcribe_grade_v1")
             {
                 return new AiIdentityComponentValidation(
                     IsApplicable: false,
@@ -262,7 +287,7 @@ public static class AiGradingResponseValidator
                     ErrorCode: null);
             }
 
-            if (schemaVersion != "submission_analysis_v2"
+            if (schemaVersion != (compact ? CompactSchemaVersion : "submission_analysis_v2")
                 || RequiredBoundedString(
                         response,
                         "request_key",
@@ -357,6 +382,19 @@ public static class AiGradingResponseValidator
         return result;
     }
 
+    private static string ResolveCompactId(JsonElement element, string[] ids)
+    {
+        if (element.ValueKind != JsonValueKind.Number || !element.TryGetInt32(out var id)
+            || id < 1 || id > ids.Length)
+        {
+            throw Invalid("ai_response_question_coverage_invalid");
+        }
+        return ids[id - 1];
+    }
+
+    private static JsonElement RequiredProperty(JsonElement result, string name) =>
+        result.TryGetProperty(name, out var value) ? value : throw Invalid("ai_response_field_invalid");
+
     private static string RequiredBoundedString(
         JsonElement value,
         string name,
@@ -387,6 +425,7 @@ public static class AiGradingResponseValidator
     private static long RequiredInt64(JsonElement value, string name)
     {
         if (!value.TryGetProperty(name, out var property)
+            || property.ValueKind != JsonValueKind.Number
             || !property.TryGetInt64(out var result))
         {
             throw Invalid("ai_response_field_invalid");
@@ -398,6 +437,7 @@ public static class AiGradingResponseValidator
     private static int RequiredInt32(JsonElement value, string name)
     {
         if (!value.TryGetProperty(name, out var property)
+            || property.ValueKind != JsonValueKind.Number
             || !property.TryGetInt32(out var result))
         {
             throw Invalid("ai_response_field_invalid");
@@ -435,6 +475,7 @@ public static class AiGradingResponseValidator
     private static double RequiredDouble(JsonElement value, string name)
     {
         if (!value.TryGetProperty(name, out var property)
+            || property.ValueKind != JsonValueKind.Number
             || !property.TryGetDouble(out var result)
             || !double.IsFinite(result))
         {
@@ -531,12 +572,17 @@ public static class AiGradingResponseValidator
         var providerContradictedLocalRules = !pointAwardValid
             || proposedPoints != deterministic.AwardedPoints.Value
             || proposedOutcome != expectedOutcome;
+        // A clear reading that exactly earns credit under the teacher's rules
+        // resolves a valid lower model score. An unexplained disagreement over
+        // lost credit, or an invalid award, still needs a teacher.
+        var unresolvedDisagreement = !pointAwardValid
+            || (providerContradictedLocalRules && expectedOutcome != "correct");
         return new ReconciledProposal(
             deterministic.AwardedPoints.Value,
             expectedOutcome,
             reviewRecommended
                 || deterministic.RequiresReview
-                || providerContradictedLocalRules,
+                || unresolvedDisagreement,
             providerContradictedLocalRules
                 ? "ai_deterministic_recomputed"
                 : null);

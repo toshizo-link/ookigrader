@@ -228,9 +228,10 @@ public sealed class GeminiGradingAccuracyEvaluationTests(ITestOutputHelper outpu
             return student identity. Transcribe each visible answer exactly,
             preserving the observed script. Grade only against the teacher-supplied
             rubric and accepted answers. Include every question ID either once
-            in results or once in missing_question_ids. Recommend review whenever
-            evidence is ambiguous, incomplete, subjective, unexpected, or
-            unreadable.
+            in results or once in missing_question_ids. Grade a clear wrong
+            answer, located empty field or rubric-supported partial answer
+            directly. Use review when the visible evidence or rubric genuinely
+            leaves the score uncertain. Report unreadable evidence as unreadable.
 
             """
             + JsonSerializer.Serialize(new
@@ -345,7 +346,7 @@ public sealed class GeminiGradingAccuracyEvaluationTests(ITestOutputHelper outpu
                 "Only 14 nonblank short answers have explicit teacher item scores.",
                 "The source CSV MCQ totals conflict with answer-key-derived totals for Student_18 and Student_19, so MCQ aggregate totals are excluded.",
                 "The Japanese sheet uses a handwriting-style font rather than genuine student handwriting.",
-                "All semantic short-answer proposals remain teacher-review-only in Ooki Grader.",
+                "This evaluation configures the semantic short-answer questions for teacher review.",
             ]);
     }
 

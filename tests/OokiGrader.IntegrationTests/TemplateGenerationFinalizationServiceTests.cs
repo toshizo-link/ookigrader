@@ -958,7 +958,7 @@ public sealed class TemplateGenerationFinalizationServiceTests
     }
 
     [Fact]
-    public async Task OrientationRetryExhaustionRequiresReuploadAndCreatesNoJob()
+    public async Task PreviouslyExhaustedOrientationCanBeRetriedWithTheUpdatedExtractor()
     {
         await using var fixture = await FinalizationFixture.CreateAsync();
         var seeded = await fixture.SeedBatchAsync(
@@ -969,24 +969,12 @@ public sealed class TemplateGenerationFinalizationServiceTests
             warnings: [Warning("ORIENTATION_RETRY_EXHAUSTED")],
             includeExtractionArtifacts: false);
 
-        var error = await Assert.ThrowsAsync<TemplateGenerationBatchServiceException>(() =>
-            fixture.Service.RetryAsync(
-                new RetryTemplateGenerationBatchCommand(
-                    seeded.BatchId,
-                    seeded.BatchRowVersion,
-                    fixture.StaffId,
-                    IsAdministrator: false,
-                    OperationId: "retry-orientation",
-                    CorrelationId: "retry-orientation"),
-                CancellationToken.None));
-
-        Assert.Equal("ORIENTATION_RETRY_EXHAUSTED", error.Code);
-        Assert.Empty(await fixture.Db.BackgroundJobs.AsNoTracking().ToArrayAsync());
-        Assert.Equal(
-            TemplateGenerationBatchStatus.Failed,
-            (await fixture.Db.TemplateGenerationBatches
-                .AsNoTracking()
-                .SingleAsync()).Status);
+        var retried = await fixture.Service.RetryAsync(
+            new RetryTemplateGenerationBatchCommand(seeded.BatchId, seeded.BatchRowVersion,
+                fixture.StaffId, IsAdministrator: false, OperationId: "retry-orientation", CorrelationId: "retry-orientation"),
+            CancellationToken.None);
+        Assert.Equal(TemplateGenerationBatchStatus.Generating, retried.Status);
+        Assert.Single(await fixture.Db.BackgroundJobs.AsNoTracking().ToArrayAsync());
     }
 
     [Fact]

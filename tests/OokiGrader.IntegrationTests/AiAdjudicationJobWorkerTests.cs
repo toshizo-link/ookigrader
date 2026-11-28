@@ -2,6 +2,8 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using OokiGrader.Ai.Abstractions;
@@ -19,6 +21,69 @@ namespace OokiGrader.IntegrationTests;
 
 public sealed class AiAdjudicationJobWorkerTests
 {
+    [Fact]
+    public async Task UpgradeRetiresOutstandingChecksWithoutLosingCompletedGradesOrDoubleCountingUsage()
+    {
+        await using var fixture = await AdjudicationFixture.CreateAsync(usePreviousSchema: true);
+        var seeded = await fixture.SeedAsync();
+        Assert.True(await fixture.Worker.ProcessNextAsync());
+        await using var db = await fixture.CreateDbContextAsync();
+        var completed = await db.AiRequests.AsNoTracking().SingleAsync();
+        var completedUsage = await db.AiUsage.AsNoTracking().SingleAsync();
+        var profile = await db.AiTaskProfiles.SingleAsync();
+        var result = await db.QuestionResults.AsNoTracking().SingleAsync();
+        var now = DateTimeOffset.UtcNow;
+        foreach (var state in new[] { "prepared", "retry_waiting", "dispatching" })
+        {
+            var request = new AiRequestEntity
+            {
+                Id = UlidId.New(now), RequestKey = "retired-" + state, AiTaskProfileId = profile.Id,
+                TaskProfileRevision = profile.Revision, Purpose = AiTaskTypes.Adjudication, EntityType = "questionResult",
+                EntityId = result.Id, EntityRevision = 1, InputManifestHash = new string(state[0], 64), State = state,
+                CreatedAt = now, UpdatedAt = now,
+            };
+            db.AiRequests.Add(request);
+            db.AiBudgetReservations.Add(new AiBudgetReservationEntity
+            {
+                Id = UlidId.New(now), AiRequestId = request.Id, UsageDay = DateOnly.FromDateTime(now.UtcDateTime),
+                UsageMonth = now.ToString("yyyy-MM", System.Globalization.CultureInfo.InvariantCulture),
+                ReservedUsdMicros = 100, State = "reserved", CreatedAt = now,
+            });
+        }
+        foreach (var state in new[] { "queued", "blocked", "leased", "retry_waiting" })
+        {
+            db.BackgroundJobs.Add(new BackgroundJobEntity
+            {
+                Id = UlidId.New(now), DeduplicationKey = "retired-" + state, Type = AiAdjudicationJobWorker.JobType,
+                State = state, SchemaVersion = 1, NextAttemptAt = now, CreatedAt = now, UpdatedAt = now,
+                LeaseOwner = state == "leased" ? "old-host" : null,
+                LeaseExpiresAt = state == "leased" ? now.AddMinutes(1) : null,
+            });
+        }
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+        await db.Database.MigrateAsync();
+        var retired = await db.AiRequests.Where(item => item.Id != completed.Id)
+            .Join(db.AiBudgetReservations, request => request.Id, reservation => reservation.AiRequestId,
+                (request, reservation) => new { Request = request, Reservation = reservation }).ToListAsync();
+        Assert.Equal(3, retired.Count);
+        foreach (var row in retired)
+        {
+            var unknown = row.Request.RequestKey == "retired-dispatching";
+            Assert.Equal(unknown ? "failed" : "cancelled", row.Request.State);
+            Assert.Equal(unknown, row.Request.PossibleDuplicate);
+            Assert.Equal(unknown ? "settled" : "released", row.Reservation.State);
+            Assert.Equal(unknown ? 100L : 0L, row.Reservation.ActualUsdMicros);
+        }
+        Assert.Equal(4, await db.BackgroundJobs.CountAsync(job => job.State == "cancelled" && job.LeaseOwner == null));
+        Assert.Equal("succeeded", (await db.BackgroundJobs.SingleAsync(job => job.Id == seeded.JobId)).State);
+        Assert.Equal(completed.AcceptedResponseHash, (await db.AiRequests.SingleAsync(a => a.Id == completed.Id)).AcceptedResponseHash);
+        Assert.Equal(completedUsage.EstimatedUsdMicros, (await db.AiUsage.SingleAsync()).EstimatedUsdMicros);
+        var preserved = await db.QuestionResults.AsNoTracking().SingleAsync();
+        Assert.Equal(result.CurrentRevisionId, preserved.CurrentRevisionId);
+        Assert.Equal(result.ReviewRequired, preserved.ReviewRequired);
+    }
+
     private static readonly string[] KanjiScript = ["kanji"];
 
     [Fact]
@@ -425,7 +490,8 @@ public sealed class AiAdjudicationJobWorkerTests
         public FakeContentStore ContentStore { get; }
 
         public static async Task<AdjudicationFixture> CreateAsync(
-            Func<AiProviderRequest, AiProviderResponse>? responseFactory = null)
+            Func<AiProviderRequest, AiProviderResponse>? responseFactory = null,
+            bool usePreviousSchema = false)
         {
             var connection = new SqliteConnection("Data Source=:memory:");
             await connection.OpenAsync();
@@ -464,7 +530,10 @@ public sealed class AiAdjudicationJobWorkerTests
                 await using var db = await serviceProvider
                     .GetRequiredService<IDbContextFactory<OokiGraderDbContext>>()
                     .CreateDbContextAsync();
-                await db.Database.EnsureCreatedAsync();
+                if (usePreviousSchema)
+                    await db.GetService<IMigrator>().MigrateAsync("20261125000100_0033_ProviderManagedBatchOutput");
+                else
+                    await db.Database.EnsureCreatedAsync();
                 return new AdjudicationFixture(
                     connection,
                     serviceProvider,

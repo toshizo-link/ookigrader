@@ -53,33 +53,10 @@ public sealed partial class TemplateExtractionJobWorker : BackgroundService
         "gemini-template-extraction-auto-detail-qc-v10";
 
     private const int JobSchemaVersion = 1;
-    private const int MaximumProviderPasses = 3;
+    private const int MaximumProviderPasses = 2;
     private const int QualityControlDetailViewCount = 4;
     private const int MaximumStoredResponseCharacters = 1_000_000;
     private const double MetadataApplicationConfidence = 0.85;
-    private const string IndependentSlotAuditInstruction =
-        """
-        INTERNAL QUALITY-CONTROL PASS. Independently inspect the attached page
-        pixels again; do not assume that a previous extraction count was right.
-        Make one visual sweep for physical writable curricular slots and a
-        separate sweep for printed prompts, then match the two inventories.
-        Pay special attention to several boxes inside one sentence and repeated
-        printed labels. A printed term, furigana, diagram caption, name field,
-        score field, or ordinary text without a visible writable boundary is not
-        a new answer slot. Conversely, every distinct visible writable boundary
-        answering a prompt is one slot. Return the complete schema exactly as in
-        the task below, with one object per visually confirmed slot. Do not select
-        a count because it is larger or smaller; use only visible page evidence.
-        For an authoritative filled slot, zoom into its detail view and copy each
-        visible kana or Kanji character exactly; never replace kana with a
-        semantically equivalent Kanji spelling. Never splice two alternative
-        spellings into one expected_answer. Before returning every question,
-        re-read its source_role from the source manifest. A readable answer on
-        contains_model_answers or separate_answer_key must be returned as
-        provided_model_answer with that exact source_id and page. If it cannot be
-        read or matched from those pixels, return unavailable; never substitute
-        ai_proposed for an authoritative source.
-        """;
     private const string ValidationRecoveryInstruction =
         """
         INTERNAL VALIDATION-RECOVERY PASS. A prior attempt could not be used
@@ -204,7 +181,6 @@ public sealed partial class TemplateExtractionJobWorker : BackgroundService
                         cancellationToken)
                     .ConfigureAwait(false);
                 providerResponses.Add(lastResponse);
-                var recoveredFromInvalidInitialResponse = false;
                 try
                 {
                     selected = ValidateCandidate(
@@ -214,7 +190,6 @@ public sealed partial class TemplateExtractionJobWorker : BackgroundService
                 }
                 catch (InvalidDataException)
                 {
-                    recoveredFromInvalidInitialResponse = true;
                     selected = await RecoverFromInvalidInitialResponseAsync(
                             claim,
                             preparedMedia,
@@ -222,107 +197,6 @@ public sealed partial class TemplateExtractionJobWorker : BackgroundService
                             providerResponses,
                             cancellationToken)
                         .ConfigureAwait(false);
-                }
-
-                if (!recoveredFromInvalidInitialResponse
-                    && TemplateExtractionResponseValidator
-                    .RequiresIndependentSlotAudit(selected.Validated))
-                {
-                    var auditRequest = CreateProviderRequest(
-                        claim,
-                        preparedMedia,
-                        IndependentSlotAuditInstruction);
-                    lastResponse = await _providerResolver
-                        .GetRequired(claim.Connection.Provider)
-                        .GenerateAsync(
-                            claim.Connection,
-                            secret.Utf8Bytes,
-                            auditRequest,
-                            cancellationToken)
-                        .ConfigureAwait(false);
-                    providerResponses.Add(lastResponse);
-                    var audit = ValidateCandidate(
-                        lastResponse,
-                        claim,
-                        preparedMedia);
-                    var inventoriesAgree =
-                        TemplateExtractionResponseValidator
-                            .SlotInventoriesAgree(
-                                selected.Validated,
-                                audit.Validated);
-                    var needsRepair =
-                        TemplateExtractionResponseValidator
-                            .HasRepairableSlotStructureIssue(
-                                selected.Validated)
-                        || TemplateExtractionResponseValidator
-                            .HasRepairableSlotStructureIssue(
-                                audit.Validated)
-                        || TemplateExtractionResponseValidator
-                            .HasAnswerAuthorityIssue(
-                                selected.Validated)
-                        || TemplateExtractionResponseValidator
-                            .HasAnswerAuthorityIssue(
-                                audit.Validated);
-                    if (inventoriesAgree && !needsRepair)
-                    {
-                        selected = PreferCandidate(selected, audit);
-                    }
-                    else
-                    {
-                        var reconciliationRequest = CreateProviderRequest(
-                            claim,
-                            preparedMedia,
-                            CreateSlotReconciliationInstruction(
-                                selected.Validated,
-                                audit.Validated));
-                        lastResponse = await _providerResolver
-                            .GetRequired(claim.Connection.Provider)
-                            .GenerateAsync(
-                                claim.Connection,
-                                secret.Utf8Bytes,
-                                reconciliationRequest,
-                                cancellationToken)
-                            .ConfigureAwait(false);
-                        providerResponses.Add(lastResponse);
-                        var reconciliation = ValidateCandidate(
-                            lastResponse,
-                            claim,
-                            preparedMedia);
-                        if (!TemplateExtractionResponseValidator
-                                .HasRepairableSlotStructureIssue(
-                                    reconciliation.Validated)
-                            && !TemplateExtractionResponseValidator
-                                .HasAnswerAuthorityIssue(
-                                    reconciliation.Validated)
-                            && TemplateExtractionResponseValidator
-                                .SlotInventoriesAgree(
-                                    selected.Validated,
-                                    reconciliation.Validated))
-                        {
-                            selected = PreferCandidate(
-                                selected,
-                                reconciliation);
-                        }
-                        else if (!TemplateExtractionResponseValidator
-                                     .HasRepairableSlotStructureIssue(
-                                         reconciliation.Validated)
-                                 && !TemplateExtractionResponseValidator
-                                     .HasAnswerAuthorityIssue(
-                                         reconciliation.Validated)
-                                 && TemplateExtractionResponseValidator
-                                     .SlotInventoriesAgree(
-                                         audit.Validated,
-                                         reconciliation.Validated))
-                        {
-                            selected = PreferCandidate(
-                                audit,
-                                reconciliation);
-                        }
-                        else
-                        {
-                            selected = reconciliation;
-                        }
-                    }
                 }
             }
             catch (OperationCanceledException)
@@ -813,7 +687,7 @@ public sealed partial class TemplateExtractionJobWorker : BackgroundService
                 inputManifestHash,
                 profile.MaxOutputTokens,
                 ToMediaResolution(profile.MediaResolution),
-                ToThinkingLevel(profile.ThinkingLevel),
+                AiProviderRuntime.CurrentProviderThinkingLevel(profile),
                 profile.AiConnection.SecretReference,
                 new AiConnectionSettings(
                     profile.AiConnection.Id,
@@ -1177,74 +1051,7 @@ public sealed partial class TemplateExtractionJobWorker : BackgroundService
             .ConfigureAwait(false);
         providerResponses.Add(recoveryResponse);
 
-        ExtractionCandidate recovery;
-        try
-        {
-            recovery = ValidateCandidate(
-                recoveryResponse,
-                claim,
-                preparedMedia);
-        }
-        catch (InvalidDataException)
-        {
-            var finalRecoveryRequest = CreateProviderRequest(
-                claim,
-                preparedMedia,
-                ValidationRecoveryInstruction + "\n\n"
-                    + IndependentSlotAuditInstruction);
-            var finalRecoveryResponse = await _providerResolver
-                .GetRequired(claim.Connection.Provider)
-                .GenerateAsync(
-                    claim.Connection,
-                    credentialUtf8,
-                    finalRecoveryRequest,
-                    cancellationToken)
-                .ConfigureAwait(false);
-            providerResponses.Add(finalRecoveryResponse);
-            _ = ValidateCandidate(
-                finalRecoveryResponse,
-                claim,
-                preparedMedia);
-            throw new InvalidDataException(
-                "template_extract_recovery_confirmation_missing");
-        }
-
-        var auditRequest = CreateProviderRequest(
-            claim,
-            preparedMedia,
-            IndependentSlotAuditInstruction);
-        var auditResponse = await _providerResolver
-            .GetRequired(claim.Connection.Provider)
-            .GenerateAsync(
-                claim.Connection,
-                credentialUtf8,
-                auditRequest,
-                cancellationToken)
-            .ConfigureAwait(false);
-        providerResponses.Add(auditResponse);
-        var audit = ValidateCandidate(
-            auditResponse,
-            claim,
-            preparedMedia);
-
-        var needsRepair = TemplateExtractionResponseValidator
-                .HasRepairableSlotStructureIssue(recovery.Validated)
-            || TemplateExtractionResponseValidator
-                .HasRepairableSlotStructureIssue(audit.Validated)
-            || TemplateExtractionResponseValidator
-                .HasAnswerAuthorityIssue(recovery.Validated)
-            || TemplateExtractionResponseValidator
-                .HasAnswerAuthorityIssue(audit.Validated);
-        if (needsRepair
-            || !TemplateExtractionResponseValidator.SlotInventoriesAgree(
-                recovery.Validated,
-                audit.Validated))
-        {
-            throw new InvalidDataException(
-                "template_extract_recovery_audit_disagreement");
-        }
-
-        return PreferCandidate(recovery, audit);
+        return ValidateCandidate(recoveryResponse, claim, preparedMedia);
     }
 
     private static ExtractionCandidate ValidateCandidate(
@@ -1323,74 +1130,6 @@ public sealed partial class TemplateExtractionJobWorker : BackgroundService
                 claim.TargetTotalPointsMilli);
         }
         return new ExtractionCandidate(response, responseJson, validated);
-    }
-
-    private static ExtractionCandidate PreferCandidate(
-        ExtractionCandidate primary,
-        ExtractionCandidate audit)
-    {
-        static (int BlockingIssues, double NegativeConfidence) Quality(
-            ValidatedTemplateExtraction candidate)
-        {
-            var questions = candidate.Pages
-                .SelectMany(page => page.Questions)
-                .ToArray();
-            var blockingIssues = candidate.ReviewIssues.Count(issue =>
-                    issue.Blocking)
-                + questions.Sum(question => question.ReviewIssues.Count(issue =>
-                    issue.Blocking));
-            var averageConfidence = questions.Length == 0
-                ? 0
-                : questions.Average(question => question.Confidence);
-            return (blockingIssues, -averageConfidence);
-        }
-
-        return Quality(audit.Validated).CompareTo(Quality(primary.Validated)) < 0
-            ? audit
-            : primary;
-    }
-
-    private static string CreateSlotReconciliationInstruction(
-        ValidatedTemplateExtraction primary,
-        ValidatedTemplateExtraction audit)
-    {
-        static string Summarize(ValidatedTemplateExtraction candidate) =>
-            string.Join(
-                "; ",
-                candidate.Pages.Select((page, index) =>
-                    string.Create(
-                        System.Globalization.CultureInfo.InvariantCulture,
-                        $"media-page-{index + 1}: declared="
-                        + $"{page.DetectedAnswerSlotCount}, objects="
-                        + $"{page.Questions.Count}, separated="
-                        + $"{page.Questions.Count(question =>
-                            question.AnswerSlotCount == 1)}, embedded="
-                        + $"{page.Questions.Count(question =>
-                            question.IsEmbeddedFillBlank)}")));
-
-        return string.Create(
-            System.Globalization.CultureInfo.InvariantCulture,
-            $"""
-            INTERNAL FINAL SLOT RECONCILIATION. Two independent extractions of
-            the same attached pages disagreed or retained a structural slot
-            warning. Candidate A inventory: {Summarize(primary)}. Candidate B
-            inventory: {Summarize(audit)}. Neither candidate count is authority.
-            Inspect the actual page pixels from scratch in visual reading order.
-            First mark only visible writable curricular boundaries; next match
-            each boundary to its printed prompt; finally exclude name, class,
-            number, date, score, diagram text, furigana, and printed terminology.
-            For a sentence with several real writable boxes, return one object per
-            box. Do not invent an extra box by splitting a printed compound word.
-            Re-resolve answer provenance from the source manifest for every
-            object. On contains_model_answers or separate_answer_key, visually
-            transcribe a readable supplied answer as provided_model_answer with
-            its exact source_id and page. If the supplied answer cannot be read,
-            matched, or reconciled from the pixels, return unavailable with a
-            warning; never use ai_proposed as a fallback. Do not change an answer
-            provenance label without independently checking the visible answer.
-            Return one complete corrected schema for the task below. Use only the
-            image, not majority vote, maximum count, or minimum count.
-            """);
     }
 
     private static AiProviderResponse AggregateProviderResponses(
@@ -2144,11 +1883,8 @@ public sealed partial class TemplateExtractionJobWorker : BackgroundService
                 != profile.AiConnection.CredentialRevision
             || profile.PromptVersion != bundle.PromptVersion
             || profile.SchemaVersion != bundle.SchemaVersion
-            || profile.PromptContentHash != bundle.ContentHash
-            || profile.ThinkingLevel != AiProviderRuntime.DefaultThinkingLevel(
-                profile.AiConnection.Provider,
-                profile.ModelId,
-                profile.TaskType)
+            || !TemplateExtractionAiProfilePolicy.MatchesTemplateBundle(profile.PromptContentHash, bundle)
+            || !TemplateExtractionAiProfilePolicy.HasUsableThinkingLevel(profile)
             || profile.ProcessingStrategy is not (
                 "queued_standard" or "expedite_standard"))
         {
@@ -3225,15 +2961,6 @@ public sealed partial class TemplateExtractionJobWorker : BackgroundService
         "high" => "MEDIA_RESOLUTION_HIGH",
         "ultra_high" => "MEDIA_RESOLUTION_ULTRA_HIGH",
         _ => throw Blocked("ai_media_resolution_invalid"),
-    };
-
-    private static string ToThinkingLevel(string value) => value switch
-    {
-        "minimal" => "MINIMAL",
-        "low" => "LOW",
-        "medium" => "MEDIUM",
-        "high" => "HIGH",
-        _ => throw Blocked("ai_thinking_level_invalid"),
     };
 
     private static PricingSnapshot ToPricingSnapshot(

@@ -1110,7 +1110,7 @@ public sealed partial class AiAdjudicationJobWorker : BackgroundService
             || profile.PromptVersion != bundle.PromptVersion
             || profile.SchemaVersion != bundle.SchemaVersion
             || profile.PromptContentHash != bundle.ContentHash
-            || profile.ThinkingLevel != AiProviderRuntime.DefaultThinkingLevel(
+            || profile.ThinkingLevel != AiProviderCatalog.DefaultThinkingLevel(
                 profile.AiConnection.Provider,
                 profile.ModelId,
                 profile.TaskType)

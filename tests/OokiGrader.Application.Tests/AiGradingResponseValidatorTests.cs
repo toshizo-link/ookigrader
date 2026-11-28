@@ -9,6 +9,86 @@ namespace OokiGrader.Application.Tests;
 public sealed class AiGradingResponseValidatorTests
 {
     [Fact]
+    public void CompactResultsUseExplicitTemplateKeysForUnorderedResultsAndMissingCoverage()
+    {
+        var questions = new[] { RubricQuestion(), ExactQuestion(), ChoiceQuestion() }
+            .ToDictionary(item => item.Id);
+        var results = new[]
+        {
+            new { q = 3, m = 0, t = "上段\n下段", l = "clear", b = false, o = "partial", p = 500, c = .75 },
+            new { q = 1, m = 1, t = "", l = "clear", b = true, o = "blank", p = 0, c = .99 },
+        };
+        int[] missing = [2];
+        var response = JsonSerializer.SerializeToElement(new
+        {
+            schema_version = AiGradingResponseValidator.CompactSchemaVersion, request_key = "grade_c1_test",
+            identity = (object?)null, results, missing_question_ids = missing, unexpected_content = true,
+        });
+
+        var validated = AiGradingResponseValidator.Validate(
+            response, "grade_c1_test", questions, mediaPartCount: 2, compact: true);
+
+        Assert.True(validated.UnexpectedContent);
+        Assert.Collection(validated.Observations, rubric =>
+        {
+            Assert.Equal("q-rubric", rubric.QuestionId);
+            Assert.Equal("上段\n下段", rubric.Observation.Transcription);
+            Assert.Equal(0, rubric.EvidenceMediaIndex);
+            Assert.Equal(500, rubric.ProposedPointsMilli);
+            Assert.Equal("partial", rubric.ProposedOutcome);
+            Assert.Equal(7500, rubric.ProviderConfidenceBasisPoints);
+            Assert.True(rubric.ProviderReviewRecommended);
+        }, blank =>
+        {
+            Assert.Equal("q-choice", blank.QuestionId);
+            Assert.True(blank.Observation.ExplicitlyBlank);
+            Assert.Equal(1, blank.EvidenceMediaIndex);
+            Assert.Equal("blank", blank.ProposedOutcome);
+            Assert.False(blank.ProviderReviewRecommended);
+        });
+        Assert.Throws<InvalidDataException>(() =>
+            AiGradingResponseValidator.Validate(response, "grade_c1_other", questions, 2, compact: true));
+    }
+
+    [Theory]
+    [InlineData("0", "[2]")]
+    [InlineData("3", "[2]")]
+    [InlineData("\"1\"", "[2]")]
+    [InlineData("1", "[]")]
+    [InlineData("1", "[1]")]
+    [InlineData("1", "[2,2]")]
+    [InlineData("1", "[\"2\"]")]
+    [InlineData("1", "[3]")]
+    public void CompactIdsRejectUnknownMistypedOverlappingOrIncompleteCoverage(string id, string missing)
+    {
+        var questions = new[] { RubricQuestion(), ExactQuestion() }.ToDictionary(item => item.Id);
+        using var json = JsonDocument.Parse($$"""
+            {"schema_version":"submission_analysis_compact_v1","request_key":"grade_c1_test",
+             "identity":null,"results":[{"q":{{id}},"m":0,"t":"漢字","l":"clear","b":false,"o":"correct","p":1000,"c":1}],
+             "missing_question_ids":{{missing}},"unexpected_content":false}
+            """);
+        Assert.Throws<InvalidDataException>(() =>
+            AiGradingResponseValidator.Validate(json.RootElement, "grade_c1_test", questions, 1, compact: true));
+    }
+
+    [Fact]
+    public void CompactNontextMarkIsNeverConvertedToBlankByTextScoring()
+    {
+        var question = ExactQuestion();
+        using var json = JsonDocument.Parse("""
+            {"schema_version":"submission_analysis_compact_v1","request_key":"grade_c1_test",
+             "identity":null,"results":[{"q":1,"m":0,"t":"","l":"clear","b":false,"o":"review","p":0,"c":0.3}],
+             "missing_question_ids":[],"unexpected_content":false}
+            """);
+        var result = Assert.Single(AiGradingResponseValidator.Validate(json.RootElement,
+            "grade_c1_test", new Dictionary<string, DomainQuestionDefinition> { [question.Id] = question },
+            1, compact: true).Observations);
+        Assert.False(result.Observation.ExplicitlyBlank);
+        Assert.Equal("review", result.ProposedOutcome);
+        Assert.True(result.ProviderReviewRecommended);
+    }
+
+    [Fact]
     public void ValidateAcceptsExactResultThatAgreesWithLocalRules()
     {
         var question = ExactQuestion();
@@ -55,7 +135,7 @@ public sealed class AiGradingResponseValidatorTests
         var observation = Assert.Single(validated.Observations);
         Assert.Equal(1_000, observation.ProposedPointsMilli);
         Assert.Equal("correct", observation.ProposedOutcome);
-        Assert.True(observation.ProviderReviewRecommended);
+        Assert.False(observation.ProviderReviewRecommended);
         Assert.Equal("ai_deterministic_recomputed", observation.ProviderReasonCode);
     }
 
@@ -87,9 +167,7 @@ public sealed class AiGradingResponseValidatorTests
         var observation = Assert.Single(validated.Observations);
         Assert.Equal(proposedOutcome, observation.ProposedOutcome);
         Assert.Equal(proposedPointsMilli, observation.ProposedPointsMilli);
-        Assert.Equal(
-            proposedOutcome != "correct",
-            observation.ProviderReviewRecommended);
+        Assert.False(observation.ProviderReviewRecommended);
         Assert.Null(observation.ProviderReasonCode);
     }
 
@@ -176,19 +254,21 @@ public sealed class AiGradingResponseValidatorTests
     }
 
     [Theory]
-    [InlineData("incorrect", "説明", false)]
-    [InlineData("blank", "", true)]
-    public void ValidateRequiresTeacherReviewForClearHighConfidenceNegativeResult(
+    [InlineData("incorrect", "説明", false, 0)]
+    [InlineData("blank", "", true, 0)]
+    [InlineData("partial", "理由の一部", false, 500)]
+    public void ValidateAcceptsClearScoredAnswersWithoutMandatoryReview(
         string outcome,
         string transcription,
-        bool blank)
+        bool blank,
+        int points)
     {
         var question = RubricQuestion(requiresReviewAlways: false);
         using var response = ParseResponse(
             question.Id,
             transcription,
             proposedOutcome: outcome,
-            proposedPointsMilli: 0,
+            proposedPointsMilli: points,
             reviewRecommended: false,
             blank: blank);
 
@@ -202,8 +282,8 @@ public sealed class AiGradingResponseValidatorTests
 
         var observation = Assert.Single(validated.Observations);
         Assert.Equal(outcome, observation.ProposedOutcome);
-        Assert.Equal(0, observation.ProposedPointsMilli);
-        Assert.True(observation.ProviderReviewRecommended);
+        Assert.Equal(points, observation.ProposedPointsMilli);
+        Assert.False(observation.ProviderReviewRecommended);
     }
 
     [Fact]
@@ -285,12 +365,16 @@ public sealed class AiGradingResponseValidatorTests
                 [question.Id] = question,
             });
 
-        Assert.True(Assert.Single(validated.Observations)
-            .ProviderReviewRecommended);
+        var observation = Assert.Single(validated.Observations);
+        Assert.True(observation.ProviderReviewRecommended);
+        Assert.Equal("ai_always_review", observation.ProviderReasonCode);
     }
 
-    [Fact]
-    public void ValidateRoutesLowConfidenceAiRubricToReview()
+    [Theory]
+    [InlineData(0.49999, true)]
+    [InlineData(0.50, false)]
+    [InlineData(0.79, false)]
+    public void ValidateAppliesStrictHalfConfidenceReviewFloor(double confidence, bool expectedReview)
     {
         var question = RubricQuestion(requiresReviewAlways: false);
         using var response = ParseResponse(
@@ -299,7 +383,7 @@ public sealed class AiGradingResponseValidatorTests
             proposedOutcome: "correct",
             proposedPointsMilli: 1_000,
             reviewRecommended: false,
-            confidence: 0.79);
+            confidence: confidence);
 
         var validated = AiGradingResponseValidator.Validate(
             response.RootElement,
@@ -309,8 +393,9 @@ public sealed class AiGradingResponseValidatorTests
                 [question.Id] = question,
             });
 
-        Assert.True(Assert.Single(validated.Observations)
-            .ProviderReviewRecommended);
+        var observation = Assert.Single(validated.Observations);
+        Assert.Equal(expectedReview, observation.ProviderReviewRecommended);
+        Assert.Equal(expectedReview ? "ai_low_confidence" : null, observation.ProviderReasonCode);
     }
 
     [Fact]
@@ -342,6 +427,18 @@ public sealed class AiGradingResponseValidatorTests
     }
 
     [Fact]
+    public void ExplicitUnresolvedRubricJudgmentRetainsAReviewReasonEvenWhenTextIsClear()
+    {
+        var question = RubricQuestion(requiresReviewAlways: false);
+        using var response = ParseResponse(question.Id, "説明", "review", 0, reviewRecommended: true);
+        var observation = Assert.Single(AiGradingResponseValidator.Validate(
+            response.RootElement, "grade-request-1",
+            new Dictionary<string, DomainQuestionDefinition> { [question.Id] = question }).Observations);
+        Assert.True(observation.ProviderReviewRecommended);
+        Assert.Equal("ai_judgment_uncertain", observation.ProviderReasonCode);
+    }
+
+    [Fact]
     public void ValidateLetsLocalCorrectAnswerOverrideCompleteAnswerPartialProposal()
     {
         var question = ExactQuestion(requiresCompleteAnswer: true);
@@ -363,7 +460,7 @@ public sealed class AiGradingResponseValidatorTests
         var observation = Assert.Single(validated.Observations);
         Assert.Equal(1_000, observation.ProposedPointsMilli);
         Assert.Equal("correct", observation.ProposedOutcome);
-        Assert.True(observation.ProviderReviewRecommended);
+        Assert.False(observation.ProviderReviewRecommended);
         Assert.Equal(
             "ai_deterministic_recomputed",
             observation.ProviderReasonCode);
@@ -518,7 +615,7 @@ public sealed class AiGradingResponseValidatorTests
         Assert.Equal(string.Empty, observation.Observation.Transcription);
         Assert.Equal("blank", observation.ProposedOutcome);
         Assert.Equal(0, observation.ProposedPointsMilli);
-        Assert.True(observation.ProviderReviewRecommended);
+        Assert.False(observation.ProviderReviewRecommended);
         Assert.Null(observation.ProviderReasonCode);
     }
 

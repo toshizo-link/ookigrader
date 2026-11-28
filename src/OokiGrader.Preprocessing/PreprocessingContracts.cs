@@ -140,7 +140,12 @@ public sealed record DerivedPdfResult(
     int LastPage,
     IReadOnlyList<AppliedPageRotation> AppliedRotations,
     string DerivationPolicyVersion =
-        PdfPageRangeDerivationPolicy.CurrentVersion);
+        PdfPageRangeDerivationPolicy.CurrentVersion)
+{
+    public IReadOnlyList<BookSpreadDetail> BookSpreadDetails { get; init; } = [];
+}
+
+public sealed record BookSpreadDetail(int OriginalPageNumber, string Side, ImageArtifact Image);
 
 public static class PdfPageRangeDerivationPolicy
 {
@@ -156,6 +161,16 @@ public interface IPdfPageRangeExtractor
         int lastPage,
         IReadOnlyDictionary<int, int> rotations,
         CancellationToken cancellationToken = default);
+
+    Task<DerivedPdfResult> ExtractForProviderAsync(
+        Stream source,
+        string sourceName,
+        int firstPage,
+        int lastPage,
+        IReadOnlyDictionary<int, int> rotations,
+        int maximumProviderMediaBytes,
+        CancellationToken cancellationToken = default) =>
+        ExtractAsync(source, sourceName, firstPage, lastPage, rotations, cancellationToken);
 }
 
 public sealed record PageAlignmentResult(

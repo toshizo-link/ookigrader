@@ -17,8 +17,8 @@ Ooki Grader MUST optimize for the following teacher workflow:
    otherwise exceptional proposals; descriptive type alone does not require
    individual review. Then publish the template.
 4. Upload completed papers in bulk.
-5. Let AI read the student's name and every answer from the complete normalized
-   pages, grade them, and independently recheck ambiguous answers.
+5. Let AI read the student's name and grade the answers in one pass over the
+   normalized pages. The teacher reviews uncertain answers.
 6. Assign an unresolved name, correct an exceptional grade, and finalize.
 
 Teachers MUST NOT draw rectangles, enter coordinates, tune crop margins, mask
@@ -36,8 +36,7 @@ publishing contingent on region completeness.
   to locate only printed name/student-number fields and ignore answers.
 - Initial grading receives every complete normalized page plus the logical
   question list and teacher-approved answers/rubrics.
-- Adjudication receives every complete normalized page for the paper plus the
-  one question to recheck.
+- Teachers resolve unclear answers using the original pages and the result from the grading pass.
 - Questions are matched by printed label, question text, visual reading order,
   and whole-page context.
 - Structured outputs contain logical content and confidence, not geometry.
@@ -81,7 +80,7 @@ workflow may depend on them.
   on the same page can become a publishable template without any coordinates.
 - Submission preprocessing persists normalized pages and zero submission crop
   artifacts.
-- Name, grading, and adjudication requests use complete pages.
+- Name and grading requests use complete pages.
 - The template editor contains no coordinate or rectangle controls.
 - Review screens show the complete answer page rather than a crop.
 - The Japanese user guide teaches only this coordinate-free workflow.

@@ -450,8 +450,7 @@ public sealed class TemplateExtractionJobWorkerTests
                     ExtractionReviewText(question),
                     StringComparison.Ordinal);
             });
-        Assert.Equal(2, fixture.Provider.Requests.Count);
-        var primaryRequest = fixture.Provider.Requests[0];
+        var primaryRequest = Assert.Single(fixture.Provider.Requests);
         Assert.Contains(
             "Use a unified hierarchy for every scoring unit:",
             primaryRequest.UserInstruction,
@@ -468,48 +467,8 @@ public sealed class TemplateExtractionJobWorkerTests
             "administrative or scoring fields",
             primaryRequest.UserInstruction,
             StringComparison.Ordinal);
-        Assert.StartsWith(
-            "INTERNAL QUALITY-CONTROL PASS",
-            fixture.Provider.Requests[1].UserInstruction,
-            StringComparison.Ordinal);
         Assert.Single(primaryRequest.Media);
-        var qualityControlRequest = fixture.Provider.Requests[1];
-        Assert.Equal(5, qualityControlRequest.Media.Count);
-        Assert.Contains(
-            "not five sources or five pages",
-            qualityControlRequest.UserInstruction,
-            StringComparison.Ordinal);
-        Assert.Contains(
-            "non-overlapping top-to-bottom quarters",
-            qualityControlRequest.UserInstruction,
-            StringComparison.Ordinal);
-        Assert.Contains(
-            "Return every physical curricular slot",
-            qualityControlRequest.UserInstruction,
-            StringComparison.Ordinal);
-        Assert.All(
-            fixture.Provider.Requests,
-            request => Assert.Equal("MEDIUM", request.ThinkingLevel));
-        Assert.All(
-            qualityControlRequest.Media.Skip(1),
-            detailView =>
-            {
-                Assert.Equal("image/png", detailView.MimeType);
-                Assert.True(detailView.Bytes.Span[..8].SequenceEqual(
-                    new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 }));
-                Assert.Equal(
-                    Convert.ToHexString(SHA256.HashData(detailView.Bytes.Span))
-                        .ToLowerInvariant(),
-                    detailView.Sha256);
-            });
-        Assert.Equal(
-            4,
-            fixture.Provider.BorrowedQualityControlDetailViews.Count);
-        Assert.All(
-            fixture.Provider.BorrowedQualityControlDetailViews,
-            detailView => Assert.All(
-                detailView.ToArray(),
-                value => Assert.Equal(0, value)));
+        Assert.Equal("MEDIUM", primaryRequest.ThinkingLevel);
     }
 
     [Theory]
@@ -517,75 +476,26 @@ public sealed class TemplateExtractionJobWorkerTests
     [InlineData(10)]
     [InlineData(12)]
     [InlineData(13)]
-    public async Task IndependentImageAuditRepairsVariableSlotInventory(
-        int initialQuestionCount)
+    public async Task DenseInventoriesPreserveTheFirstResponseAndItsUsage(int initialQuestionCount)
     {
-        var providerCall = 0;
-        AiProviderResponse Respond(AiProviderRequest request)
+        await using var fixture = await ExtractionFixture.CreateAsync(request =>
         {
-            var response = request.UserInstruction.StartsWith(
-                "INTERNAL QUALITY-CONTROL PASS",
-                StringComparison.Ordinal)
-                || request.UserInstruction.StartsWith(
-                    "INTERNAL FINAL SLOT RECONCILIATION",
-                    StringComparison.Ordinal)
-                ? CreateJapaneseScienceFillBlankResponse(request)
-                : CreateJapaneseScienceFillBlankResponse(
-                    request,
-                    questionCount: initialQuestionCount);
-            return response with
-            {
-                RoutedProvider = initialQuestionCount == 9
-                    && ++providerCall > 1
-                        ? "OtherRoute"
-                        : "Google",
-                Usage = response.Usage with
-                {
-                    ProviderCostUsdMicros = 100,
-                },
-            };
-        }
-
-        await using var fixture = await ExtractionFixture.CreateAsync(Respond);
-        var seeded = await fixture.SeedAsync(
-            sourceRole: "contains_non_model_answers",
-            sourceDisplayName: "小学校理科_光_記入済み.png");
-
+            var response = CreateJapaneseScienceFillBlankResponse(request, questionCount: initialQuestionCount);
+            return response with { RoutedProvider = "Google", Usage = response.Usage with { ProviderCostUsdMicros = 100 } };
+        });
+        var seeded = await fixture.SeedAsync(sourceRole: "contains_non_model_answers");
         Assert.True(await fixture.Worker.ProcessNextAsync());
-
         await using var db = await fixture.CreateDbContextAsync();
-        var questions = await db.Questions
-            .AsNoTracking()
-            .Where(item => item.TemplateVersionId == seeded.VersionId)
-            .OrderBy(item => item.OrderIndex)
-            .ToArrayAsync();
-        var usage = await db.AiUsage.AsNoTracking().SingleAsync();
-
-        Assert.Equal(11, questions.Length);
-        Assert.Equal(3, fixture.Provider.Requests.Count);
-        Assert.StartsWith(
-            "INTERNAL QUALITY-CONTROL PASS",
-            fixture.Provider.Requests[1].UserInstruction,
-            StringComparison.Ordinal);
-        Assert.StartsWith(
-            "INTERNAL FINAL SLOT RECONCILIATION",
-            fixture.Provider.Requests[2].UserInstruction,
-            StringComparison.Ordinal);
-        Assert.Single(fixture.Provider.Requests[0].Media);
-        Assert.Equal(5, fixture.Provider.Requests[1].Media.Count);
-        Assert.Equal(5, fixture.Provider.Requests[2].Media.Count);
-        Assert.All(
-            fixture.Provider.Requests,
-            request => Assert.Equal("MEDIUM", request.ThinkingLevel));
-        Assert.Equal(3_600, usage.InputTokens);
-        Assert.Equal(2_700, usage.OutputTokens);
-        Assert.Equal(6_300, usage.TotalTokens);
-        Assert.Equal(300, usage.EstimatedUsdMicros);
-        Assert.Equal(
-            initialQuestionCount == 9
-                ? AiProviders.GeminiDirect
-                : "Google",
-            usage.ActualProvider);
+        Assert.Equal(initialQuestionCount, await db.Questions.CountAsync(item => item.TemplateVersionId == seeded.VersionId));
+        var request = Assert.Single(fixture.Provider.Requests);
+        Assert.Single(request.Media);
+        Assert.Equal("MEDIUM", request.ThinkingLevel);
+        var usage = await db.AiUsage.SingleAsync();
+        Assert.Equal(1_200, usage.InputTokens);
+        Assert.Equal(900, usage.OutputTokens);
+        Assert.Equal(2_100, usage.TotalTokens);
+        Assert.Equal(100, usage.EstimatedUsdMicros);
+        Assert.Equal("Google", usage.ActualProvider);
     }
 
     [Fact]
@@ -601,7 +511,7 @@ public sealed class TemplateExtractionJobWorkerTests
 
         Assert.True(await fixture.Worker.ProcessNextAsync());
 
-        Assert.Equal(2, fixture.Provider.Requests.Count);
+        Assert.Single(fixture.Provider.Requests);
         Assert.All(
             fixture.Provider.Requests,
             request => Assert.Single(request.Media));
@@ -620,7 +530,7 @@ public sealed class TemplateExtractionJobWorkerTests
 
         Assert.True(await fixture.Worker.ProcessNextAsync());
 
-        Assert.Equal(2, fixture.Provider.Requests.Count);
+        Assert.Single(fixture.Provider.Requests);
         Assert.All(
             fixture.Provider.Requests,
             request => Assert.Single(request.Media));
@@ -628,7 +538,7 @@ public sealed class TemplateExtractionJobWorkerTests
     }
 
     [Fact]
-    public async Task InvalidInitialSchemaRecoversAfterIndependentAudit()
+    public async Task InvalidInitialSchemaRecoversWithOneUsableResponse()
     {
         var providerCall = 0;
         await using var fixture = await ExtractionFixture.CreateAsync(
@@ -659,27 +569,22 @@ public sealed class TemplateExtractionJobWorkerTests
         Assert.Equal(TemplateExtractionJobWorker.PipelineVersion,
             version.PipelineVersion);
         Assert.Single(await db.Questions.AsNoTracking().ToListAsync());
-        Assert.Equal(3, fixture.Provider.Requests.Count);
+        Assert.Equal(2, fixture.Provider.Requests.Count);
         Assert.Single(fixture.Provider.Requests[0].Media);
         Assert.Equal(5, fixture.Provider.Requests[1].Media.Count);
-        Assert.Equal(5, fixture.Provider.Requests[2].Media.Count);
         Assert.StartsWith(
             "INTERNAL VALIDATION-RECOVERY PASS",
             fixture.Provider.Requests[1].UserInstruction,
-            StringComparison.Ordinal);
-        Assert.StartsWith(
-            "INTERNAL QUALITY-CONTROL PASS",
-            fixture.Provider.Requests[2].UserInstruction,
             StringComparison.Ordinal);
         Assert.DoesNotContain(
             "template_extract_display_label_invalid",
             fixture.Provider.Requests[1].UserInstruction,
             StringComparison.Ordinal);
-        Assert.Equal(2_700, usage.InputTokens);
-        Assert.Equal(660, usage.OutputTokens);
-        Assert.Equal(3_360, usage.TotalTokens);
+        Assert.Equal(1_800, usage.InputTokens);
+        Assert.Equal(440, usage.OutputTokens);
+        Assert.Equal(2_240, usage.TotalTokens);
         Assert.Equal(
-            8,
+            4,
             fixture.Provider.BorrowedQualityControlDetailViews.Count);
         Assert.All(
             fixture.Provider.BorrowedQualityControlDetailViews,
@@ -689,7 +594,7 @@ public sealed class TemplateExtractionJobWorkerTests
     }
 
     [Fact]
-    public async Task RepeatedInvalidRecoveryRemainsBlockedAfterThreeCalls()
+    public async Task RepeatedInvalidRecoveryRemainsBlockedAfterTwoCalls()
     {
         await using var fixture = await ExtractionFixture.CreateAsync(
             request => CreateResponse(
@@ -714,64 +619,25 @@ public sealed class TemplateExtractionJobWorkerTests
         Assert.Equal("template_extract_display_label_invalid",
             request.ErrorCode);
         Assert.Equal("blocked", job.State);
-        Assert.Equal(3, fixture.Provider.Requests.Count);
+        Assert.Equal(2, fixture.Provider.Requests.Count);
         Assert.Single(fixture.Provider.Requests[0].Media);
         Assert.Equal(5, fixture.Provider.Requests[1].Media.Count);
-        Assert.Equal(5, fixture.Provider.Requests[2].Media.Count);
         Assert.StartsWith(
             "INTERNAL VALIDATION-RECOVERY PASS",
             fixture.Provider.Requests[1].UserInstruction,
             StringComparison.Ordinal);
-        Assert.StartsWith(
-            "INTERNAL VALIDATION-RECOVERY PASS",
-            fixture.Provider.Requests[2].UserInstruction,
-            StringComparison.Ordinal);
-        Assert.Contains(
-            "INTERNAL QUALITY-CONTROL PASS",
-            fixture.Provider.Requests[2].UserInstruction,
-            StringComparison.Ordinal);
         Assert.Empty(await db.Questions.AsNoTracking().ToListAsync());
-        Assert.Equal(2_700, usage.InputTokens);
-        Assert.Equal(660, usage.OutputTokens);
-        Assert.Equal(3_360, usage.TotalTokens);
+        Assert.Equal(1_800, usage.InputTokens);
+        Assert.Equal(440, usage.OutputTokens);
+        Assert.Equal(2_240, usage.TotalTokens);
         Assert.Equal(
-            8,
+            4,
             fixture.Provider.BorrowedQualityControlDetailViews.Count);
         Assert.All(
             fixture.Provider.BorrowedQualityControlDetailViews,
             detailView => Assert.All(
                 detailView.ToArray(),
                 value => Assert.Equal(0, value)));
-    }
-
-    [Fact]
-    public async Task RecoveryDoesNotBypassInvalidIndependentAudit()
-    {
-        var providerCall = 0;
-        await using var fixture = await ExtractionFixture.CreateAsync(
-            request => CreateResponse(
-                request,
-                warnings: Array.Empty<string>(),
-                displayLabel: ++providerCall == 2 ? "問1" : ""));
-        var seeded = await fixture.SeedAsync(
-            sourceRole: "contains_model_answers");
-
-        Assert.True(await fixture.Worker.ProcessNextAsync());
-
-        await using var db = await fixture.CreateDbContextAsync();
-        var request = await db.AiRequests
-            .AsNoTracking()
-            .SingleAsync(item => item.EntityId == seeded.VersionId);
-        var job = await db.BackgroundJobs
-            .AsNoTracking()
-            .SingleAsync(item => item.Id == seeded.JobId);
-
-        Assert.Equal("invalid_output", request.State);
-        Assert.Equal("template_extract_display_label_invalid",
-            request.ErrorCode);
-        Assert.Equal("blocked", job.State);
-        Assert.Equal(3, fixture.Provider.Requests.Count);
-        Assert.Empty(await db.Questions.AsNoTracking().ToListAsync());
     }
 
     [Fact]
@@ -1079,64 +945,11 @@ public sealed class TemplateExtractionJobWorkerTests
             ExtractionReviewText(question),
             StringComparison.Ordinal);
         Assert.Null(question.TeacherNote);
-        Assert.Equal(3, fixture.Provider.Requests.Count);
-        Assert.StartsWith(
-            "INTERNAL QUALITY-CONTROL PASS",
-            fixture.Provider.Requests[1].UserInstruction,
-            StringComparison.Ordinal);
-        Assert.StartsWith(
-            "INTERNAL FINAL SLOT RECONCILIATION",
-            fixture.Provider.Requests[2].UserInstruction,
-            StringComparison.Ordinal);
+        Assert.Single(fixture.Provider.Requests);
     }
 
     [Fact]
-    public async Task ReconcilesWrongAiProvenanceAgainstAuthoritativePixels()
-    {
-        await using var fixture = await ExtractionFixture.CreateAsync(
-            request => CreateResponse(
-                request,
-                warnings: Array.Empty<string>(),
-                aiProposed: !request.UserInstruction.StartsWith(
-                    "INTERNAL FINAL SLOT RECONCILIATION",
-                    StringComparison.Ordinal)));
-        var seeded = await fixture.SeedAsync(
-            sourceRole: "contains_model_answers");
-
-        Assert.True(await fixture.Worker.ProcessNextAsync());
-
-        await using var db = await fixture.CreateDbContextAsync();
-        var canonical = await db.AcceptedAnswers
-            .AsNoTracking()
-            .SingleAsync(item => item.VariantType == "canonical");
-
-        Assert.Equal("東京", canonical.AnswerText);
-        Assert.Equal(
-            "provided_model_answer",
-            canonical.AnswerProvenance);
-        Assert.Equal(seeded.FileReferenceId, canonical.SourceFileReferenceId);
-        Assert.Equal(1, canonical.SourcePageNumber);
-        Assert.Equal(3, fixture.Provider.Requests.Count);
-        Assert.Contains(
-            "never substitute",
-            fixture.Provider.Requests[1].UserInstruction,
-            StringComparison.Ordinal);
-        Assert.Contains(
-            "ai_proposed for an authoritative source",
-            fixture.Provider.Requests[1].UserInstruction,
-            StringComparison.Ordinal);
-        Assert.Contains(
-            "provenance label without independently checking the visible answer",
-            fixture.Provider.Requests[2].UserInstruction,
-            StringComparison.Ordinal);
-        Assert.Contains(
-            "FINAL SOURCE-ROLE GATE",
-            fixture.Provider.Requests[2].UserInstruction,
-            StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public async Task UnreadableAuthoritativeAnswerStaysUnavailableAfterAudit()
+    public async Task UnreadableAuthoritativeAnswerIsFlaggedForTheTeacher()
     {
         await using var fixture = await ExtractionFixture.CreateAsync(
             request => CreateResponse(
@@ -1160,7 +973,7 @@ public sealed class TemplateExtractionJobWorkerTests
             ExtractionReviewText(question),
             StringComparison.Ordinal);
         Assert.Null(question.TeacherNote);
-        Assert.Equal(3, fixture.Provider.Requests.Count);
+        Assert.Single(fixture.Provider.Requests);
     }
 
     [Fact]
@@ -2087,7 +1900,7 @@ public sealed class TemplateExtractionJobWorkerTests
                 PromptVersion = bundle.PromptVersion,
                 SchemaVersion = bundle.SchemaVersion,
                 PromptContentHash = bundle.ContentHash,
-                ThinkingLevel = "medium",
+                ThinkingLevel = "low",
                 MediaResolution = "high",
                 MaxOutputTokens = 4_096,
                 ConcurrencyLimit = 1,

@@ -755,7 +755,8 @@ internal static class AiBatchAdminEndpoints
                 var retry = new AiRequestEntity
                 {
                     Id = retryId,
-                    RequestKey = $"grade_{retryId}",
+                    RequestKey = InitialGradingWire.RetryKey(retryId, source.RequestKey),
+                    GradingMode = "standard",
                     AiTaskProfileId = source.AiTaskProfileId,
                     TaskProfileRevision = source.TaskProfileRevision,
                     Purpose = source.Purpose,

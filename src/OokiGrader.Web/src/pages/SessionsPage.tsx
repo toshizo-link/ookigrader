@@ -4,6 +4,7 @@ import { Link, useNavigate } from "../router";
 import { useSession } from "../auth/SessionContext";
 import { Icon } from "../components/Icon";
 import { CrossSessionScanIntake } from "../components/CrossSessionScanIntake";
+import { GradingModeField, useNewSessionGradingMode } from "../components/GradingModeField";
 import { TemplateSessionMetadata } from "../components/TemplateSessionMetadata";
 import {
   ActiveFilterSummary,
@@ -457,11 +458,13 @@ function CreateSessionDialog({
     classLabel: "",
   });
   const [working, setWorking] = useState(false);
+  const { gradingMode, setGradingMode, batchAvailability } = useNewSessionGradingMode(open);
   const [error, setError] = useState<string>();
   const idempotencyKeyRef = useRef("");
 
   function closeDialog() {
     idempotencyKeyRef.current = "";
+    setGradingMode(undefined);
     onClose();
   }
 
@@ -477,6 +480,8 @@ function CreateSessionDialog({
 
   async function submit(event: FormEvent) {
     event.preventDefault();
+    if (working || (gradingMode === "batch" && batchAvailability !== "ready")) return;
+    setGradingMode(gradingMode);
     setWorking(true);
     setError(undefined);
     try {
@@ -490,6 +495,7 @@ function CreateSessionDialog({
           testDate: values.testDate || null,
           classLabel: values.classLabel || undefined,
           openImmediately: true,
+          gradingMode,
         },
         { idempotencyKey },
       );
@@ -561,6 +567,11 @@ function CreateSessionDialog({
           {selectedTemplate ? (
             <TemplateSessionMetadata template={selectedTemplate} />
           ) : null}
+          <GradingModeField value={gradingMode} availability={batchAvailability}
+            disabled={working} onChange={(value) => {
+              idempotencyKeyRef.current = "";
+              setGradingMode(value);
+            }} />
           <div className="form-grid form-grid--2">
             <Field
               label="実施日（任意）"
@@ -607,7 +618,7 @@ function CreateSessionDialog({
             </Button>
             <Button
               type="submit"
-              disabled={working || !values.templateVersionId}
+              disabled={working || !values.templateVersionId || (gradingMode === "batch" && batchAvailability !== "ready")}
             >
               {working ? "開始しています…" : "答案受付を開始"}
             </Button>

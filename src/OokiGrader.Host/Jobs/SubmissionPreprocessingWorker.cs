@@ -855,10 +855,10 @@ public sealed partial class SubmissionPreprocessingWorker : BackgroundService
             return;
         }
 
-        var templateVersionId = await db.TestSessions
+        var session = await db.TestSessions
             .AsNoTracking()
             .Where(item => item.Id == submission.TestSessionId)
-            .Select(item => item.TemplateVersionId)
+            .Select(item => new { item.TemplateVersionId, item.GradingMode })
             .SingleAsync(cancellationToken)
             .ConfigureAwait(false);
         var manifestHash = submission.PreprocessingManifestHash!;
@@ -887,7 +887,8 @@ public sealed partial class SubmissionPreprocessingWorker : BackgroundService
             PayloadJson = JsonSerializer.Serialize(new
             {
                 submissionId = submission.Id,
-                templateVersionId,
+                templateVersionId = session.TemplateVersionId,
+                gradingMode = session.GradingMode,
                 manifestHash,
             }),
             State = "queued",

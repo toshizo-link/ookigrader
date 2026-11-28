@@ -352,6 +352,33 @@ public sealed class AiNameTranscriptionJobWorkerTests
         Assert.Empty(await db.AiRequests.AsNoTracking().ToArrayAsync());
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task NameOnlyFallbackDoesNotRereadACombinedGradeAwaitingIdentity(bool oldNameJob)
+    {
+        await using var fixture = await NameWorkerFixture.CreateAsync();
+        var seeded = await fixture.SeedAsync();
+        await using var db = await fixture.CreateDbContextAsync();
+        var version = await db.TestSessions.Select(item => item.TemplateVersionId).SingleAsync();
+        db.GradingRuns.Add(new GradingRunEntity
+        {
+            Id = UlidId.New(DateTimeOffset.UtcNow), SubmissionId = seeded.SubmissionId, RunNumber = 1,
+            TemplateVersionId = version, State = "awaiting_identity", Reason = "initial",
+            PipelineVersion = AiInitialGradingJobWorker.PipelineVersion, CanonicalInputManifestHash = new string('f', 64),
+            CreatedAt = DateTimeOffset.UtcNow,
+        });
+        await db.SaveChangesAsync();
+        if (oldNameJob) await fixture.AddLegacyJobAsync(seeded.SubmissionId, "queued");
+
+        Assert.Equal(oldNameJob, await fixture.Worker.ProcessNextAsync());
+        Assert.False(await fixture.Worker.ProcessNextAsync());
+        Assert.Empty(fixture.Provider.Requests);
+        Assert.Empty(fixture.ContentStore.OpenedHashes);
+        Assert.Empty(await db.AiRequests.ToListAsync());
+        Assert.Equal(oldNameJob ? 1 : 0, await db.BackgroundJobs.CountAsync(job => job.Type == AiNameTranscriptionJobWorker.JobType));
+    }
+
     private static AiProviderResponse CreateResponse(
         AiProviderRequest request,
         InvalidResponseKind invalid = InvalidResponseKind.None)

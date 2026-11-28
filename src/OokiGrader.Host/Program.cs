@@ -51,9 +51,6 @@ var standardAiEnabled = geminiDirectEnabled || openRouterEnabled;
 var semanticGradingEnabled = builder.Configuration.GetValue(
     "Features:Grading.Semantic",
     false);
-var adjudicationEnabled = builder.Configuration.GetValue(
-    "Features:Ai.Adjudication",
-    false);
 var templateGenerationEnabled = builder.Configuration.GetValue(
     "Features:Ai.TemplateGeneration",
     false);
@@ -107,26 +104,12 @@ builder.Services.AddHostedService(serviceProvider =>
     serviceProvider.GetRequiredService<SubmissionPreprocessingWorker>());
 builder.Services.Configure<AiInitialGradingJobWorkerOptions>(
     builder.Configuration.GetSection("Workers:AiInitialGrading"));
-builder.Services.Configure<AiAdjudicationJobWorkerOptions>(
-    builder.Configuration.GetSection("Workers:AiAdjudication"));
-if (adjudicationEnabled)
-{
-    builder.Services.AddSingleton<AiAdjudicationJobScheduler>();
-}
-
 builder.Services.AddSingleton<AiInitialGradingJobWorker>();
 if (standardAiEnabled && semanticGradingEnabled)
 {
     builder.Services.AddHostedService(serviceProvider =>
         serviceProvider.GetRequiredService<AiInitialGradingJobWorker>());
 }
-builder.Services.AddSingleton<AiAdjudicationJobWorker>();
-if (standardAiEnabled && semanticGradingEnabled && adjudicationEnabled)
-{
-    builder.Services.AddHostedService(serviceProvider =>
-        serviceProvider.GetRequiredService<AiAdjudicationJobWorker>());
-}
-
 builder.Services.Configure<AiNameTranscriptionJobWorkerOptions>(
     builder.Configuration.GetSection("Workers:AiNameTranscription"));
 builder.Services.AddSingleton<AiNameTranscriptionJobWorker>();

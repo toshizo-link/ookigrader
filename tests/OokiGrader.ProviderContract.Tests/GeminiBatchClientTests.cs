@@ -8,8 +8,80 @@ namespace OokiGrader.ProviderContract.Tests;
 
 public sealed class GeminiBatchClientTests
 {
+    [Theory]
+    [InlineData("INVALID_ARGUMENT", "DeleteFileRequest.name: File ID (name excluding 'files/') cannot be more than 40 characters.", true)]
+    [InlineData("INVALID_ARGUMENT", "Unrelated invalid file parameter.", false)]
+    [InlineData("PERMISSION_DENIED", "DeleteFileRequest.name: File ID cannot be more than 40 characters.", false)]
+    public async Task RecognizesOnlyCorrelatedGeneratedOutputWithVerifiedDeleteFileLengthError(
+        string status, string message, bool expected)
+    {
+        var id = new string('a', 40);
+        var output = "files/batch-" + id;
+        var handler = new DelegateHandler((request, _) =>
+        {
+            Assert.Equal(HttpMethod.Delete, request.Method);
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.BadRequest)
+            {
+                Content = new StringContent(JsonSerializer.Serialize(new { error = new { status, message } })),
+            });
+        });
+        using var http = new HttpClient(handler);
+        var failure = await Assert.ThrowsAsync<AiProviderException>(() => new GeminiBatchClient(http)
+            .DeleteFileAsync(Connection(), "test"u8.ToArray(), output));
+        Assert.Equal(expected, GeminiBatchClient.IsProviderManagedOutput("batches/" + id, output, failure));
+        Assert.False(GeminiBatchClient.IsProviderManagedOutput("batches/other", output, failure));
+        Assert.False(GeminiBatchClient.IsProviderManagedOutput("batches/a", "files/batch-a", failure));
+        Assert.False(GeminiBatchClient.IsProviderManagedOutput("batches/" + id, "files/" + id, failure));
+    }
+
     private const string DisplayName =
         "ooki-01K14P4A2GBB7W4K1M1M1M1M1M-0123456789ab";
+
+    [Theory]
+    [InlineData("gemini-3.8-flash", "MEDIUM")]
+    [InlineData("gemini-3.7-flash-preview", "MEDIUM")]
+    [InlineData("gemini-3.5-flash-lite", "MEDIUM")]
+    [InlineData("gemini-3.1-pro-preview", "MEDIUM")]
+    [InlineData("gemini-3-pro-preview", "LOW")]
+    [InlineData("gemini-3.1-flash-lite-image", "MINIMAL")]
+    [InlineData("gemini-2.5-flash", null)]
+    [InlineData("gemini-2.5-pro", null)]
+    public async Task StandardAndBatchUseTheSameTaskSpecificThinking(string modelId, string? templateLevel)
+    {
+        string? standardBody = null;
+        using var http = new HttpClient(new DelegateHandler(async (request, token) =>
+        {
+            standardBody = await request.Content!.ReadAsStringAsync(token);
+            return JsonResponse("""{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"{\"ok\":true}"}]}}]}""");
+        }));
+        var batch = new GeminiBatchClient(http);
+        var direct = new GeminiDirectClient(http);
+        foreach (var task in new[] { AiTaskTypes.TemplateExtraction, AiTaskTypes.InitialGrading })
+        {
+            var level = AiProviderCatalog.DefaultThinkingLevel(AiProviders.GeminiDirect, modelId, task);
+            Assert.Equal(level, AiProviderCatalog.DefaultThinkingLevel(AiProviders.OpenRouter, "google/" + modelId, task));
+            var request = Request("settings") with
+            {
+                TaskType = task, ThinkingLevel = level.ToUpperInvariant(), MaxOutputTokens = 32_768,
+            };
+            await direct.GenerateAsync(Connection() with { ModelId = modelId }, "test-key"u8.ToArray(), request);
+            using var standard = JsonDocument.Parse(standardBody!);
+            using var line = JsonDocument.Parse(batch.BuildJsonLines([request], modelId));
+            var config = line.RootElement.GetProperty("request").GetProperty("generationConfig").GetProperty("thinkingConfig");
+            Assert.Equal(standard.RootElement.GetProperty("generationConfig").GetProperty("thinkingConfig").GetRawText(), config.GetRawText());
+            if (templateLevel is null)
+            {
+                Assert.False(config.TryGetProperty("thinkingLevel", out _));
+                Assert.Equal(task == AiTaskTypes.TemplateExtraction ? 4_096 : 512, config.GetProperty("thinkingBudget").GetInt32());
+            }
+            else
+            {
+                Assert.False(config.TryGetProperty("thinkingBudget", out _));
+                var expected = task == AiTaskTypes.TemplateExtraction || templateLevel == "MINIMAL" ? templateLevel : "LOW";
+                Assert.Equal(expected, config.GetProperty("thinkingLevel").GetString());
+            }
+        }
+    }
 
     [Fact]
     public void BuildJsonLinesUsesStableKeysAndGemini35SafeConfiguration()
@@ -17,7 +89,7 @@ public sealed class GeminiBatchClientTests
         var client = new GeminiBatchClient(new HttpClient());
 
         var bytes = client.BuildJsonLines(
-            [Request("key-1"), Request("key-2")]);
+            [Request("key-1"), Request("key-2") with { TaskType = AiTaskTypes.Adjudication }]);
 
         var lines = Encoding.UTF8.GetString(bytes)
             .Split('\n', StringSplitOptions.RemoveEmptyEntries);
@@ -39,13 +111,14 @@ public sealed class GeminiBatchClientTests
         Assert.False(configuration.TryGetProperty("topP", out _));
         Assert.False(configuration.TryGetProperty("topK", out _));
         Assert.False(configuration.TryGetProperty("candidateCount", out _));
-        Assert.Equal(
-            JsonValueKind.String,
-            request.GetProperty("contents")[0]
-                .GetProperty("parts")[0]
-                .GetProperty("inline_data")
-                .GetProperty("data")
-                .ValueKind);
+        var parts = request.GetProperty("contents")[0].GetProperty("parts");
+        Assert.Equal("user", parts[0].GetProperty("text").GetString());
+        Assert.Equal("synthetic-image"u8.ToArray(),
+            parts[1].GetProperty("inline_data").GetProperty("data").GetBytesFromBase64());
+        using var second = JsonDocument.Parse(lines[1]);
+        var recheckParts = second.RootElement.GetProperty("request").GetProperty("contents")[0].GetProperty("parts");
+        Assert.Equal(JsonValueKind.Object, recheckParts[0].GetProperty("inline_data").ValueKind);
+        Assert.Equal("user", recheckParts[1].GetProperty("text").GetString());
     }
 
     [Fact]
@@ -176,13 +249,24 @@ public sealed class GeminiBatchClientTests
             exception.SafeErrorCode);
     }
 
-    [Fact]
-    public async Task CreateClassifiesHttpRejectionAsDefinite()
+    [Theory]
+    [InlineData(HttpStatusCode.BadRequest, AiBatchCreateFailureKind.DefiniteRemoteRejection)]
+    [InlineData(HttpStatusCode.TooManyRequests, AiBatchCreateFailureKind.DefiniteRemoteRejection)]
+    [InlineData(HttpStatusCode.RequestTimeout, AiBatchCreateFailureKind.AmbiguousAfterSend)]
+    [InlineData(HttpStatusCode.InternalServerError, AiBatchCreateFailureKind.AmbiguousAfterSend)]
+    [InlineData(HttpStatusCode.BadGateway, AiBatchCreateFailureKind.AmbiguousAfterSend)]
+    [InlineData(HttpStatusCode.ServiceUnavailable, AiBatchCreateFailureKind.AmbiguousAfterSend)]
+    [InlineData(HttpStatusCode.GatewayTimeout, AiBatchCreateFailureKind.AmbiguousAfterSend)]
+    public async Task CreateSeparatesExplicitRejectionsFromUncertainDispatch(
+        HttpStatusCode statusCode, AiBatchCreateFailureKind expectedOutcome)
     {
-        var client = new GeminiBatchClient(
-            new HttpClient(new DelegateHandler((_, _) =>
-                Task.FromResult(
-                    new HttpResponseMessage(HttpStatusCode.BadRequest)))));
+        var calls = 0;
+        using var http = new HttpClient(new DelegateHandler((_, _) =>
+        {
+            calls++;
+            return Task.FromResult(new HttpResponseMessage(statusCode));
+        }));
+        var client = new GeminiBatchClient(http);
 
         var exception = await Assert.ThrowsAsync<AiBatchCreateException>(() =>
             client.CreateAsync(
@@ -194,10 +278,29 @@ public sealed class GeminiBatchClientTests
                     "files/input-1",
                     1)));
 
-        Assert.Equal(
-            AiBatchCreateFailureKind.DefiniteRemoteRejection,
-            exception.Kind);
-        Assert.False(exception.IsTransient);
+        Assert.Equal(expectedOutcome, exception.Kind);
+        Assert.Equal(1, calls);
+    }
+
+    [Theory]
+    [InlineData(false, "gemini_batch_create_json_invalid")]
+    [InlineData(true, "gemini_batch_response_too_large")]
+    public async Task CreateTreatsUnreadableAcceptedReceiptAsAmbiguous(bool oversized, string expectedCode)
+    {
+        var calls = 0;
+        using var http = new HttpClient(new DelegateHandler((_, _) =>
+        {
+            calls++;
+            var response = JsonResponse("{");
+            if (oversized) response.Content.Headers.ContentLength = 16 * 1024 * 1024;
+            return Task.FromResult(response);
+        }));
+        var error = await Assert.ThrowsAsync<AiBatchCreateException>(() =>
+            new GeminiBatchClient(http).CreateAsync(Connection(), "fixture"u8.ToArray(),
+                new AiBatchCreateRequest(DisplayName, new string('a', 64), "files/input-1", 1)));
+        Assert.Equal(AiBatchCreateFailureKind.AmbiguousAfterSend, error.Kind);
+        Assert.Equal(expectedCode, error.SafeErrorCode);
+        Assert.Equal(1, calls);
     }
 
     [Fact]
@@ -211,7 +314,8 @@ public sealed class GeminiBatchClientTests
                   "metadata": {
                     "displayName": "{{DisplayName}}",
                     "state": "JOB_STATE_SUCCEEDED",
-                    "createTime": "2026-07-27T00:00:00Z"
+                    "createTime": "2026-07-27T00:00:00Z",
+                    "batchStats": {"requestCount":"1","successfulRequestCount":"1"}
                   },
                   "done": true,
                   "response": {
@@ -227,7 +331,7 @@ public sealed class GeminiBatchClientTests
                               "promptTokenCount": 10,
                               "candidatesTokenCount": 2,
                               "thoughtsTokenCount": 1,
-                              "totalTokenCount": 13
+                              "totalTokenCount": "13"
                             },
                             "modelVersion": "gemini-3.5-flash-lite-001",
                             "responseId": "response-2"
@@ -249,6 +353,7 @@ public sealed class GeminiBatchClientTests
             status);
 
         Assert.Equal(AiBatchRemoteState.Succeeded, status.State);
+        Assert.Equal(1, status.Stats?.RequestCount);
         var result = Assert.Single(results);
         Assert.Equal("key-2", result.RequestKey);
         Assert.NotNull(result.Response);
@@ -366,6 +471,21 @@ public sealed class GeminiBatchClientTests
         Assert.Equal(AiBatchRemoteState.Cancelled, status.State);
     }
 
+    [Theory]
+    [InlineData("""{"name":"batches/batch-1","done":true,"error":{"code":13}}""", AiBatchRemoteState.Failed)]
+    [InlineData("""{"name":"batches/batch-1","metadata":{"state":"BATCH_STATE_RUNNING"},"done":true,"error":{"code":13}}""", AiBatchRemoteState.Failed)]
+    [InlineData("""{"name":"batches/batch-1","done":true,"response":{"responsesFile":"files/output-1"}}""", AiBatchRemoteState.Succeeded)]
+    public async Task GetUsesTheTerminalOperationResultWhenMetadataIsMissingOrStillRunning(
+        string envelope, AiBatchRemoteState expected)
+    {
+        using var http = new HttpClient(new DelegateHandler((_, _) =>
+            Task.FromResult(JsonResponse(envelope))));
+        var status = await new GeminiBatchClient(http).GetAsync(
+            Connection(), "fixture"u8.ToArray(), "batches/batch-1");
+
+        Assert.Equal(expected, status.State);
+    }
+
     [Fact]
     public async Task DeleteBatchUsesOfficialOperationDeleteMethod()
     {
@@ -389,22 +509,16 @@ public sealed class GeminiBatchClientTests
     }
 
     [Fact]
-    public async Task ReadFileResultsGetsDownloadUriAndParsesJsonLines()
+    public async Task ReadFileResultsDownloadsTheOfficialMediaResourceDirectlyAndParsesJsonLines()
     {
         var calls = 0;
         var handler = new DelegateHandler((request, _) =>
         {
             calls++;
-            if (request.RequestUri!.AbsolutePath == "/v1beta/files/output-1")
-            {
-                return Task.FromResult(JsonResponse(
-                    """
-                    {
-                      "name": "files/output-1",
-                      "downloadUri": "https://generativelanguage.googleapis.com/download/v1beta/files/output-1:download?alt=media"
-                    }
-                    """));
-            }
+            Assert.Equal(HttpMethod.Get, request.Method);
+            Assert.Equal("https://generativelanguage.googleapis.com/download/v1beta/files/output-1:download?alt=media",
+                request.RequestUri!.AbsoluteUri);
+            Assert.Equal("test-key", Assert.Single(request.Headers.GetValues("x-goog-api-key")));
 
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
             {
@@ -442,10 +556,23 @@ public sealed class GeminiBatchClientTests
             Encoding.UTF8.GetBytes("test-key"),
             status);
 
-        Assert.Equal(2, calls);
+        Assert.Equal(1, calls);
         var item = Assert.Single(results);
         Assert.Equal("key-1", item.RequestKey);
         Assert.Equal("r1", item.Response!.ProviderResponseId);
+    }
+
+    [Theory]
+    [InlineData("https://example.invalid/")]
+    [InlineData("https://generativelanguage.googleapis.com:8443/")]
+    public async Task BatchClientRejectsOtherOriginsBeforeSendingCredentials(string baseAddress)
+    {
+        using var http = new HttpClient(new DelegateHandler((_, _) =>
+            throw new InvalidOperationException("Unexpected HTTP request.")));
+        var client = new GeminiBatchClient(http);
+        var error = await Assert.ThrowsAsync<AiProviderException>(() => client.GetAsync(
+            Connection() with { BaseAddress = new Uri(baseAddress) }, "fixture"u8.ToArray(), "batches/batch-1"));
+        Assert.Equal("gemini_batch_configuration_invalid", error.SafeErrorCode);
     }
 
     [Fact]

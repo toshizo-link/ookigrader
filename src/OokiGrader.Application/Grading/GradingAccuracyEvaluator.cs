@@ -7,7 +7,8 @@ public sealed record GradingAccuracySample(
     long ExpectedPointsMilli,
     string ActualOutcome,
     long ActualPointsMilli,
-    bool RequiresTeacherReview);
+    bool RequiresTeacherReview,
+    bool ExpectedTeacherReview = false);
 
 public sealed record GradingAccuracyMetrics(
     int TotalCases,
@@ -87,15 +88,8 @@ public static class GradingAccuracyEvaluator
         var automatic = materialized
             .Where(sample => !sample.RequiresTeacherReview)
             .ToArray();
-        var safeAutomaticCount = automatic.Count(sample =>
-            IsExactAgreement(sample)
-            && sample.ExpectedOutcome == "correct"
-            && sample.ActualOutcome == "correct");
-        var risk = materialized
-            .Where(sample => !IsExactAgreement(sample)
-                || sample.ExpectedOutcome != "correct"
-                || sample.ActualOutcome != "correct")
-            .ToArray();
+        var safeAutomaticCount = automatic.Count(sample => !IsRiskCase(sample));
+        var risk = materialized.Where(IsRiskCase).ToArray();
         var riskReviewCount = risk.Count(sample =>
             sample.RequiresTeacherReview);
 
@@ -117,6 +111,11 @@ public static class GradingAccuracyEvaluator
     private static bool IsExactAgreement(GradingAccuracySample sample) =>
         sample.ExpectedOutcome == sample.ActualOutcome
         && sample.ExpectedPointsMilli == sample.ActualPointsMilli;
+
+    private static bool IsRiskCase(GradingAccuracySample sample) =>
+        !IsExactAgreement(sample)
+        || sample.ExpectedTeacherReview
+        || sample.ExpectedOutcome is "review" or "unreadable";
 
     private static int? BasisPoints(int numerator, int denominator) =>
         denominator == 0

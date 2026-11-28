@@ -493,7 +493,7 @@ export function warningMessage(code: string) {
     ORIENTATION_RESPONSE_INVALID:
       "ページの向きの判定結果を確認できませんでした。",
     ORIENTATION_RETRY_EXHAUSTED:
-      "向きを補正した後も用紙を読み取れませんでした。修正したPDFを再アップロードしてください。",
+      "ページの向きを確認できませんでした。失敗した項目を再試行してください。",
     TEST_NAME_REQUIRED: "テスト名を入力してください。",
     STEP_NAME_MISMATCH:
       "同じSTEPセットでテスト名が一致しません。共通の基本名を確認してください。",

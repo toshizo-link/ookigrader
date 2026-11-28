@@ -184,7 +184,8 @@ describe("AdminPage AI configuration", () => {
       expect.objectContaining({
         apiKey: "AIza-test-gemini-key-1234567890",
         provider: "geminiDirect",
-        modelId: "gemini-3.7-flash",
+        modelId: "gemini-3.8-flash",
+        initialGradingMediaResolution: "medium",
         timeoutSeconds: 75,
         concurrencyLimit: 2,
         testAndEnable: true,
@@ -195,7 +196,7 @@ describe("AdminPage AI configuration", () => {
     finishSave?.();
     expect(
       await screen.findByText(
-        "Geminiの接続を確認して保存しました。全てのAI機能を利用できます。",
+        "Geminiの接続を確認して保存しました。ひな形作成と通常採点を利用できます。",
       ),
     ).toBeVisible();
     expect(queryState.connectionsReload).toHaveBeenCalledOnce();
@@ -205,7 +206,7 @@ describe("AdminPage AI configuration", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("shows four read-only feature statuses without pilot controls", () => {
+  it("shows the active workflow's three read-only feature statuses", () => {
     queryState.connections = [configuredGeminiConnection()];
     queryState.profiles = [
       profile("templateExtraction", true),
@@ -230,11 +231,7 @@ describe("AdminPage AI configuration", () => {
         "APIキーを再設定",
       ),
     ).toBeVisible();
-    expect(
-      within(
-        screen.getByRole("row", { name: /採点結果の再確認/ }),
-      ).getByText("APIキーを再設定"),
-    ).toBeVisible();
+    expect(screen.queryByRole("row", { name: /採点結果の再確認/ })).not.toBeInTheDocument();
     expect(screen.queryByText(/パイロット/)).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "評価記録を承認" }),
@@ -282,6 +279,7 @@ describe("AdminPage AI configuration", () => {
     fireEvent.change(screen.getByLabelText(/OpenRouterモデルID/), {
       target: { value: "google/gemini-3.1-flash-lite" },
     });
+    expect(screen.queryByLabelText("初回採点の画像解像度")).toBeNull();
     fireEvent.change(screen.getByLabelText(/OpenRouter APIキー/), {
       target: { value: "sk-or-test-openrouter-key-1234567890" },
     });
@@ -329,7 +327,7 @@ describe("AdminPage AI configuration", () => {
     });
     expect(
       await screen.findByText(
-        "Geminiとの接続と必要な機能を確認しました。全てのAI機能を利用できます。",
+        "Geminiとの接続を確認しました。ひな形作成と通常採点を利用できます。",
       ),
     ).toBeVisible();
   });
@@ -356,6 +354,9 @@ describe("AdminPage AI configuration", () => {
     fireEvent.change(screen.getByLabelText(/GeminiモデルID/), {
       target: { value: "gemini-3.7-flash-preview" },
     });
+    fireEvent.change(screen.getByLabelText("初回採点の画像解像度"), {
+      target: { value: "medium" },
+    });
     fireEvent.click(
       screen.getByRole("button", { name: "接続を確認して有効化" }),
     );
@@ -369,6 +370,7 @@ describe("AdminPage AI configuration", () => {
       expect.objectContaining({
         provider: "geminiDirect",
         modelId: "gemini-3.7-flash-preview",
+        initialGradingMediaResolution: "medium",
         revision: 3,
         testAndEnable: true,
       }),
@@ -376,7 +378,7 @@ describe("AdminPage AI configuration", () => {
     expect(body).not.toHaveProperty("apiKey");
     expect(
       await screen.findByText(
-        "Geminiのモデルと接続設定を確認して保存しました。全てのAI機能を利用できます。",
+        "Geminiのモデルと接続設定を確認して保存しました。ひな形作成と通常採点を利用できます。",
       ),
     ).toBeVisible();
   });
@@ -401,6 +403,46 @@ describe("AdminPage AI configuration", () => {
     ).toBeVisible();
     expect(queryState.connectionsReload).toHaveBeenCalledOnce();
     expect(queryState.profilesReload).toHaveBeenCalledOnce();
+  });
+
+  it("runs the optional Batch connection check only when the administrator requests it", async () => {
+    queryState.connections = [configuredGeminiConnection()];
+    apiState.post.mockResolvedValue({ state: "passed", cleanupSucceeded: true });
+    renderPage();
+    expect(apiState.post).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Batch接続を確認" }));
+    expect(await screen.findByText(/Batch接続を確認しました。新しいテスト実施/)).toBeVisible();
+    expect(apiState.post).toHaveBeenCalledExactlyOnceWith("/admin/ai-connections/connection-gemini:test-batch", {});
+  });
+
+  it("enables Batch and reports a provider-managed output after a completed capability check", async () => {
+    queryState.connections = [configuredGeminiConnection()];
+    apiState.post.mockResolvedValue({
+      state: "passed", cleanupSucceeded: false, safeErrorCode: "gemini_batch_probe_provider_managed_output",
+    });
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: "Batch接続を確認" }));
+    expect(await screen.findByText(/最初に選択されます。 確認用の出力ファイルはGemini側に残っています/)).toBeVisible();
+  });
+
+  it("shows a retained probe output after reopening the AI settings", () => {
+    queryState.connections = [{
+      ...configuredGeminiConnection(),
+      lastBatchCapabilityProbe: {
+        state: "passed", checkedAt: "2026-11-25T20:00:00Z", safeErrorCode: "gemini_batch_probe_provider_managed_output",
+      },
+    }];
+    renderPage();
+    expect(screen.getByText(/確認済み.*確認用の出力ファイルはGemini側に残っています/)).toBeVisible();
+  });
+
+  it("surfaces failed Batch checks without disabling the immediate connection", async () => {
+    queryState.connections = [configuredGeminiConnection()];
+    apiState.post.mockResolvedValue({ state: "failed", cleanupSucceeded: false, safeErrorCode: "gemini_batch_probe_cleanup_failed" });
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: "Batch接続を確認" }));
+    expect(await screen.findByText(/確認用データの削除状況をGemini側で確認/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "再確認" })).toBeEnabled();
   });
 
   it("keeps a temporary service error distinct from hitting the project's usage limit", async () => {

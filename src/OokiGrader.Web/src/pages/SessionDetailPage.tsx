@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useParams } from "../router";
 import { useSession } from "../auth/SessionContext";
 import { Icon } from "../components/Icon";
 import { OrderedScanUploadBoard } from "../components/OrderedScanUploadBoard";
+import { GradingModeField, gradingModeLabels, useBatchAvailability } from "../components/GradingModeField";
 import { PassCriteriaEditor } from "../components/PassCriteriaEditor";
 import {
   Badge,
@@ -32,6 +33,7 @@ import {
 import { submissionWorkflowHref } from "../lib/submissionNavigation";
 import type {
   PagedResponse,
+  SessionGradingMode,
   SubmissionSummary,
   TestSessionSummary,
 } from "../types";
@@ -56,6 +58,19 @@ interface SubmissionStatusResponse extends PagedResponse<SubmissionSummary> {
   summary?: OperatorStatusSummary;
 }
 
+const pendingBatchStates = new Set(["queued", "prepared", "submitted", "running", "delayed", "applying"]);
+const preparingStates = new Set(["preprocessing", "awaiting_ai", "awaitingAi", "awaiting_grading", "awaitingGrading", "grading"]);
+
+const batchStatusLabels: Record<string, string> = {
+  queued: "まとめ採点の送信待ち",
+  prepared: "まとめ採点の送信準備中",
+  submitted: "まとめ採点を送信済み・結果待ち",
+  running: "Geminiでまとめ採点中",
+  delayed: "まとめ採点の結果待ち（24時間経過）",
+  applying: "まとめ採点の結果を反映中",
+  manual_review: "まとめ採点を保留しています。管理者に確認してください",
+  failed: "まとめ採点に失敗しました。管理者に処理状況を確認してください",
+};
 
 export function SessionDetailPage() {
   const { sessionId = "" } = useParams();
@@ -90,8 +105,9 @@ export function SessionDetailPage() {
       ),
     Boolean(sessionId) && !scanOperatorOnly,
   );
-  const submissions = useApiQuery<SubmissionStatusResponse>(
-    `session-submissions:${scanOperatorOnly}:${sessionId}:${stateFilter}:${search}`,
+  const submissionsKey = `session-submissions:${scanOperatorOnly}:${sessionId}:${stateFilter}:${search}`;
+  const submissions = useApiQuery<SubmissionStatusResponse & { queryKey: string }>(
+    submissionsKey,
     async (signal) => {
       const response = await api.get<SubmissionStatusResponse>(
         scanOperatorOnly
@@ -111,11 +127,26 @@ export function SessionDetailPage() {
             },
         signal,
       );
-      return asPaged(response) as SubmissionStatusResponse;
+      return { ...asPaged(response), summary: response.summary, queryKey: submissionsKey };
     },
     Boolean(sessionId),
   );
 
+  const pendingBatchWork = submissions.data?.items.some((item) =>
+    item.initialGradingBatchState
+      ? pendingBatchStates.has(item.initialGradingBatchState)
+      : session.data?.gradingMode === "batch" && preparingStates.has(item.state),
+  );
+  const reloadSubmissions = submissions.reload;
+  const reloadSummary = summary.reload;
+  useEffect(() => {
+    if (!canManageSession || !pendingBatchWork || submissions.status !== "success") return;
+    const timer = window.setTimeout(() => {
+      reloadSubmissions();
+      reloadSummary();
+    }, 30_000);
+    return () => window.clearTimeout(timer);
+  }, [canManageSession, pendingBatchWork, submissions.status, reloadSubmissions, reloadSummary]);
 
   async function toggleSessionState() {
     if (!session.data || sessionStateWorking) return;
@@ -268,6 +299,9 @@ export function SessionDetailPage() {
       ) : null}
       {canManageSession ? <PassCriteriaEditor key={`${data.id}:${data.revision}`}
         session={data} readOnly={isArchived} onSaved={session.reload} /> : null}
+      {canManageSession ? (
+        <SessionGradingModeEditor key={`mode:${data.id}:${data.revision}`} session={data} onSaved={session.reload} />
+      ) : null}
       {isArchived ? (
         <InlineAlert tone="info" title="このテスト実施はアーカイブされています">
           <p>
@@ -362,13 +396,24 @@ export function SessionDetailPage() {
             <h2>答案の処理状況</h2>
             <p>問題のある答案はまとめて絞り込めます。</p>
           </div>
-          {submissions.data ? (
-            <Badge tone="neutral">
-              {submissions.data.totalApproximate ??
-                submissions.data.items.length}
-              件
-            </Badge>
-          ) : null}
+          <div className="button-row">
+            {submissions.data ? (
+              <Badge tone="neutral">
+                {submissions.data.totalApproximate ?? submissions.data.items.length}件
+              </Badge>
+            ) : null}
+            <Button
+              size="small"
+              variant="secondary"
+              disabled={submissions.status === "loading"}
+              onClick={() => {
+                submissions.reload();
+                if (!scanOperatorOnly) summary.reload();
+              }}
+            >
+              状況を更新
+            </Button>
+          </div>
         </div>
         <div className="list-toolbar list-toolbar--submissions">
           <SearchInput
@@ -408,7 +453,7 @@ export function SessionDetailPage() {
             <option value="failed">失敗</option>
           </select>
         </div>
-        {submissions.status === "loading" ? (
+        {submissions.status === "loading" && submissions.data?.queryKey !== submissionsKey ? (
           <LoadingState label="答案の状態を確認しています" />
         ) : submissions.status === "error" ? (
           <ErrorState error={submissions.error} onRetry={submissions.reload} />
@@ -476,7 +521,9 @@ export function SessionDetailPage() {
                     <td>
                       <StatusBadge status={submission.state} />
                       <small className="status-help">
-                        {statusHelp(submission.state)}
+                        {submission.initialGradingBatchState
+                          ? batchStatusLabels[submission.initialGradingBatchState] || "まとめ採点の状態を確認中"
+                          : statusHelp(submission.state)}
                       </small>
                     </td>
                     {!scanOperatorOnly ? (
@@ -614,6 +661,59 @@ export function SessionDetailPage() {
   );
 }
 
+function SessionGradingModeEditor({ session, onSaved }: {
+  session: TestSessionSummary;
+  onSaved: () => void;
+}) {
+  const currentMode = session.gradingMode ?? "standard";
+  const [mode, setMode] = useState<SessionGradingMode>(currentMode);
+  const [working, setWorking] = useState(false);
+  const [error, setError] = useState<string>();
+  const archived = session.state === "archived";
+  const availability = useBatchAvailability(!archived);
+  const canSave = !working && mode !== currentMode && (mode === "standard" || availability === "ready");
+
+  async function save() {
+    if (!canSave) return;
+    setWorking(true);
+    setError(undefined);
+    try {
+      await api.patch(`/test-sessions/${encodeURIComponent(session.id)}`, {
+        gradingMode: mode,
+        revision: session.revision,
+      });
+      onSaved();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "採点方法を保存できませんでした。");
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  return (
+    <Card>
+      <div className="card__header">
+        <div>
+          <h2>答案の採点方法</h2>
+          <p>現在の設定は{gradingModeLabels[currentMode]}です。</p>
+        </div>
+      </div>
+      {!archived ? (
+        <div className="stack">
+          <GradingModeField value={mode} onChange={setMode} availability={availability} disabled={working} />
+          <p>変更は、これから初回採点の待ち列に入る答案に適用されます。</p>
+          {error ? <InlineAlert tone="danger">{error}</InlineAlert> : null}
+          <div>
+            <Button disabled={!canSave} onClick={() => void save()}>
+              {working ? "保存しています…" : "採点方法を保存"}
+            </Button>
+          </div>
+        </div>
+      ) : null}
+    </Card>
+  );
+}
+
 function SummaryMetric({
   label,
   value,
@@ -654,8 +754,8 @@ function statusHelp(state: string) {
     preprocessing: "向き・ページ順・解答欄を学校内で確認中",
     awaiting_ai: "答案はホストに保存済みです",
     awaitingAi: "答案はホストに保存済みです",
-    gemini_batch_running: "AIが答案を採点しています",
-    geminiBatchRunning: "AIが答案を採点しています",
+    gemini_batch_running: "送信から24時間以内が完了の目安です",
+    geminiBatchRunning: "送信から24時間以内が完了の目安です",
     openrouter_queued: "ホストの待機列から順に処理します",
     openRouterQueued: "ホストの待機列から順に処理します",
     budget_blocked: "管理者による利用上限の確認が必要です",

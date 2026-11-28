@@ -22,6 +22,7 @@ using OokiGrader.Application.Abstractions;
 using OokiGrader.Application.Identifiers;
 using OokiGrader.Host.Api;
 using OokiGrader.Host.Jobs;
+using OokiGrader.Host.Services;
 using OokiGrader.Infrastructure.Persistence;
 using OokiGrader.Infrastructure.Persistence.Entities;
 using OokiGrader.Infrastructure.Security;
@@ -32,6 +33,50 @@ public sealed class AiAdminConnectionEndpointsTests
 {
     private const string GeminiModel = AiProviderCatalog.GeminiDefaultModelId;
     private const string OpenRouterModel = "google/gemini-3.1-flash-lite";
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ExplicitBatchProbeBindsCapabilityToCredentialAndPreservesStandardProfiles(bool retainedOutput)
+    {
+        var provider = new GeminiBatchCapabilityProbeTests.ProbeBatchProvider();
+        if (retainedOutput)
+        {
+            provider.CompleteWithProviderManagedOutput();
+        }
+        else
+        {
+            provider.Statuses.Enqueue(provider.Status(AiBatchRemoteState.Pending));
+            provider.Statuses.Enqueue(provider.Status(AiBatchRemoteState.Cancelled));
+        }
+        await using var application = await AiAdminTestApplication.CreateAsync(batchProvider: provider);
+        var created = await application.PostAsync("/api/v1/admin/ai-connections",
+            ConnectionBody("AIza-batch-test-key-123456789012", AiProviders.GeminiDirect, GeminiModel, testAndEnable: true));
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+        using var createdDocument = await ReadJsonAsync(created);
+        var path = $"/api/v1/admin/ai-connections/{createdDocument.RootElement.GetProperty("id").GetString()}";
+        Assert.Equal(0, provider.CreateCalls);
+
+        var tested = await application.PostAsync(path + ":test-batch");
+        Assert.Equal(HttpStatusCode.OK, tested.StatusCode);
+        using var result = await ReadJsonAsync(tested);
+        Assert.Equal("passed", result.RootElement.GetProperty("state").GetString());
+        Assert.Equal(!retainedOutput, result.RootElement.GetProperty("cleanupSucceeded").GetBoolean());
+        string? warning = retainedOutput ? "gemini_batch_probe_provider_managed_output" : null;
+        Assert.Equal(warning, result.RootElement.GetProperty("safeErrorCode").GetString());
+        Assert.Equal(1, provider.CreateCalls);
+        Assert.Equal(1, provider.DeleteBatchCalls);
+        Assert.Equal(HttpStatusCode.OK, (await application.PostAsync(path + ":test")).StatusCode);
+        await application.WithDatabaseAsync(async db =>
+        {
+            var connection = await db.AiConnections.SingleAsync();
+            Assert.Equal("passed", connection.LastBatchCapabilityProbeState);
+            Assert.Equal(warning, connection.LastBatchCapabilityProbeErrorCode);
+            Assert.Equal(connection.CredentialRevision, connection.LastBatchCapabilityProbeCredentialRevision);
+            Assert.All(await db.AiTaskProfiles.Where(item => item.Active).ToListAsync(),
+                profile => Assert.NotEqual("gemini_batch", profile.ProcessingStrategy));
+        });
+    }
 
     [Fact]
     public async Task UsageGroupsFallbackByActualModelAndRetainsLegacyUnknownModelUsage()
@@ -171,16 +216,13 @@ public sealed class AiAdminConnectionEndpointsTests
             Assert.All(profiles, profile =>
             {
                 Assert.True(profile.Active);
+                Assert.Equal(profile.TaskType == AiTaskTypes.InitialGrading ? "medium" : "high", profile.MediaResolution);
                 Assert.Equal("capability_passed", profile.ApprovalState);
                 Assert.Equal(connection.CredentialRevision, profile.ConnectionRevision);
                 Assert.Equal("test-prompt-v1", profile.PromptVersion);
                 Assert.Equal("test-schema-v1", profile.SchemaVersion);
                 Assert.Equal(new string('a', 64), profile.PromptContentHash);
-                Assert.Equal(
-                    profile.TaskType == AiTaskTypes.TemplateExtraction
-                        ? "medium"
-                        : "low",
-                    profile.ThinkingLevel);
+                Assert.Equal(profile.TaskType == AiTaskTypes.TemplateExtraction ? "medium" : "low", profile.ThinkingLevel);
             });
         });
     }
@@ -255,11 +297,7 @@ public sealed class AiAdminConnectionEndpointsTests
             Assert.All(activeProfiles, profile =>
             {
                 Assert.Equal(updatedModel, profile.ModelId);
-                Assert.Equal(
-                    profile.TaskType == AiTaskTypes.TemplateExtraction
-                        ? "medium"
-                        : "low",
-                    profile.ThinkingLevel);
+                Assert.Equal(profile.TaskType == AiTaskTypes.TemplateExtraction ? "medium" : "low", profile.ThinkingLevel);
             });
         });
     }
@@ -707,8 +745,11 @@ public sealed class AiAdminConnectionEndpointsTests
         });
     }
 
-    [Fact]
-    public async Task StartupReconcileReplacesOnlyStaleGeminiProfiles()
+    [Theory]
+    [InlineData(AiTaskTypes.TemplateExtraction, false)]
+    [InlineData(AiTaskTypes.TemplateExtraction, true)]
+    [InlineData(AiTaskTypes.InitialGrading, true)]
+    public async Task StartupReconcileReplacesOnlyStaleGeminiProfiles(string task, bool previousThinkingLevel)
     {
         await using var application = await AiAdminTestApplication.CreateAsync();
         var created = await application.PostAsync(
@@ -723,17 +764,25 @@ public sealed class AiAdminConnectionEndpointsTests
         await application.WithDatabaseAsync(async db =>
         {
             var stale = await db.AiTaskProfiles.SingleAsync(profile =>
-                profile.TaskType == AiTaskTypes.TemplateExtraction
+                profile.TaskType == task
                 && profile.Active);
-            stale.PromptVersion = "old-prompt";
-            stale.PromptContentHash = new string('b', 64);
+            if (previousThinkingLevel) stale.ThinkingLevel = task == AiTaskTypes.InitialGrading ? "medium" : "low";
+            else
+            {
+                stale.PromptVersion = "old-prompt";
+                stale.PromptContentHash = new string('b', 64);
+            }
             await db.SaveChangesAsync();
         });
 
         Assert.Equal(1, await application.EnsureCurrentProfilesAsync());
+        Assert.Equal(0, await application.EnsureCurrentProfilesAsync());
+        Assert.Equal(1, application.GeminiClient.ProbeCount);
         await application.WithDatabaseAsync(async db =>
         {
             Assert.Equal(5, await db.AiTaskProfiles.CountAsync());
+            var original = await db.AiTaskProfiles.SingleAsync(profile => !profile.Active);
+            Assert.Equal(previousThinkingLevel && task == AiTaskTypes.TemplateExtraction ? "low" : "medium", original.ThinkingLevel);
             var active = await db.AiTaskProfiles
                 .AsNoTracking()
                 .Where(profile => profile.Active)
@@ -741,10 +790,104 @@ public sealed class AiAdminConnectionEndpointsTests
             Assert.Equal(4, active.Length);
             Assert.All(active, profile =>
             {
+                Assert.Equal(profile.TaskType == AiTaskTypes.TemplateExtraction ? "medium" : "low", profile.ThinkingLevel);
                 Assert.Equal("test-prompt-v1", profile.PromptVersion);
                 Assert.Equal("test-schema-v1", profile.SchemaVersion);
                 Assert.Equal(new string('a', 64), profile.PromptContentHash);
             });
+        });
+    }
+
+    [Theory]
+    [InlineData(false, 8192, "low", 32768)]
+    [InlineData(true, 8192, "low", 8192)]
+    [InlineData(true, 16384, "low", 16384)]
+    [InlineData(true, 16384, "medium", 16384)]
+    [InlineData(false, 8192, "medium", 8192)]
+    public async Task StartupPreservesCustomGradingCeilingsAndUpgradesTheManagedCeiling(
+        bool custom, int oldLimit, string oldLevel, int expectedLimit)
+    {
+        await using var application = await AiAdminTestApplication.CreateAsync();
+        var response = await application.PostAsync("/api/v1/admin/ai-connections",
+            ConnectionBody("AIza-local-test-budget-1234567890",
+                AiProviders.GeminiDirect, GeminiModel, testAndEnable: true));
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        await application.WithDatabaseAsync(async db =>
+        {
+            var grading = await db.AiTaskProfiles.SingleAsync(p => p.TaskType == AiTaskTypes.InitialGrading);
+            Assert.Equal(32_768, grading.MaxOutputTokens);
+            if (custom) grading.Name = "Custom grading";
+            if (!custom && expectedLimit == oldLimit) grading.AccuracyEvaluationId = "teacher-approved-cap";
+            grading.MaxOutputTokens = oldLimit;
+            grading.ThinkingLevel = oldLevel;
+            await db.SaveChangesAsync();
+        });
+        var replaced = !custom || oldLevel != "low";
+        Assert.Equal(replaced ? 1 : 0, await application.EnsureCurrentProfilesAsync());
+        Assert.Equal(0, await application.EnsureCurrentProfilesAsync());
+        Assert.Equal(1, application.GeminiClient.ProbeCount);
+        await application.WithDatabaseAsync(async db =>
+        {
+            var profiles = await db.AiTaskProfiles.Where(p => p.TaskType == AiTaskTypes.InitialGrading).ToListAsync();
+            var active = Assert.Single(profiles, p => p.Active);
+            Assert.Equal("low", active.ThinkingLevel);
+            Assert.Equal(expectedLimit, active.MaxOutputTokens);
+            if (replaced)
+            {
+                var historical = Assert.Single(profiles, p => !p.Active);
+                Assert.Equal(oldLimit, historical.MaxOutputTokens);
+                Assert.Equal(oldLevel, historical.ThinkingLevel);
+            }
+        });
+    }
+
+    [Fact]
+    public async Task MediumGradingResolutionSurvivesRecheckAndPromptUpgrade()
+    {
+        await using var application = await AiAdminTestApplication.CreateAsync();
+        var created = await application.PostAsync("/api/v1/admin/ai-connections",
+            ConnectionBody("synthetic-resolution-test-key-12345", AiProviders.GeminiDirect, GeminiModel,
+                testAndEnable: true, initialGradingMediaResolution: "high"));
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+        using var createdDocument = await ReadJsonAsync(created);
+        var connection = createdDocument.RootElement;
+        var path = $"/api/v1/admin/ai-connections/{connection.GetProperty("id").GetString()}";
+        var revision = connection.GetProperty("revision").GetInt64();
+        var invalid = await application.PutAsync(path, new
+        {
+            provider = AiProviders.GeminiDirect, modelId = GeminiModel, revision,
+            initialGradingMediaResolution = "low", testAndEnable = true,
+        });
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, invalid.StatusCode);
+        Assert.Equal(1, application.GeminiClient.ProbeCount);
+        var updated = await application.PutAsync(path, new
+        {
+            provider = AiProviders.GeminiDirect, modelId = GeminiModel, revision,
+            initialGradingMediaResolution = "medium", testAndEnable = true,
+        });
+        Assert.Equal(HttpStatusCode.OK, updated.StatusCode);
+        using var saved = await ReadJsonAsync(updated);
+        Assert.Equal("medium", saved.RootElement.GetProperty("initialGradingMediaResolution").GetString());
+        var rechecked = await application.PostAsync(path + ":test", new { });
+        Assert.Equal(HttpStatusCode.OK, rechecked.StatusCode);
+        await application.WithDatabaseAsync(async db =>
+        {
+            var historical = await db.AiTaskProfiles.SingleAsync(profile => !profile.Active);
+            Assert.Equal(AiTaskTypes.InitialGrading, historical.TaskType);
+            Assert.Equal("high", historical.MediaResolution);
+            var current = await db.AiTaskProfiles.SingleAsync(profile =>
+                profile.Active && profile.TaskType == AiTaskTypes.InitialGrading);
+            Assert.Equal("medium", current.MediaResolution);
+            current.PromptVersion = "previous-grading-prompt";
+            await db.SaveChangesAsync();
+        });
+        Assert.Equal(1, await application.EnsureCurrentProfilesAsync());
+        await application.WithDatabaseAsync(async db =>
+        {
+            var active = await db.AiTaskProfiles.Where(profile => profile.Active).ToListAsync();
+            Assert.Equal(4, active.Count);
+            Assert.All(active, profile => Assert.Equal(
+                profile.TaskType == AiTaskTypes.InitialGrading ? "medium" : "high", profile.MediaResolution));
         });
     }
 
@@ -785,6 +928,8 @@ public sealed class AiAdminConnectionEndpointsTests
                 && profile.AiConnectionId == openRouterConnectionId);
             geminiProfile.Active = false;
             await db.SaveChangesAsync();
+            Assert.Equal("medium", openRouterProfile.ThinkingLevel);
+            openRouterProfile.ThinkingLevel = "low";
             openRouterProfile.Active = true;
             openRouterProfile.ActivatedAt = DateTimeOffset.UtcNow;
             openRouterProfile.ActivatedByStaffUserId =
@@ -803,6 +948,10 @@ public sealed class AiAdminConnectionEndpointsTests
                     && profile.Active);
             Assert.Equal(openRouterProfileId, activeTemplate.Id);
             Assert.Equal(openRouterConnectionId, activeTemplate.AiConnectionId);
+            Assert.Equal("low", activeTemplate.ThinkingLevel);
+            var usable = await TemplateExtractionAiProfilePolicy.FindCurrentUsableAsync(
+                db, new StubPromptBundleCatalog(), AiProviderFeaturePolicy.AllowAll, default);
+            Assert.Equal(openRouterProfileId, usable?.Profile.Id);
         });
     }
 
@@ -1144,7 +1293,8 @@ public sealed class AiAdminConnectionEndpointsTests
         string provider,
         string modelId,
         long? revision = null,
-        bool testAndEnable = false) => new
+        bool testAndEnable = false,
+        string? initialGradingMediaResolution = null) => new
         {
             apiKey,
             provider,
@@ -1153,6 +1303,7 @@ public sealed class AiAdminConnectionEndpointsTests
             concurrencyLimit = 2,
             revision,
             testAndEnable,
+            initialGradingMediaResolution,
         };
 
     private static async Task<(string ConnectionId, long Revision)>
@@ -1271,7 +1422,8 @@ public sealed class AiAdminConnectionEndpointsTests
         public static async Task<AiAdminTestApplication> CreateAsync(
             AiCapabilityProbeResult? openRouterProbe = null,
             IAiSecretStore? secretStore = null,
-            AiCapabilityProbeResult? geminiProbe = null)
+            AiCapabilityProbeResult? geminiProbe = null,
+            IAiBatchProviderClient? batchProvider = null)
         {
             var connection = new SqliteConnection("Data Source=:memory:");
             await connection.OpenAsync();
@@ -1300,6 +1452,8 @@ public sealed class AiAdminConnectionEndpointsTests
                         services.AddDbContext<OokiGraderDbContext>(
                             options => options.UseSqlite(connection));
                         services.AddSingleton<IAiSecretStore>(secretStore);
+                        services.AddSingleton<IAiBatchProviderClient>(batchProvider ?? new GeminiBatchCapabilityProbeTests.ProbeBatchProvider());
+                        services.AddSingleton<GeminiBatchCapabilityProbe>();
                         services.AddSingleton<IAiProviderClient>(geminiClient);
                         services.AddSingleton<IAiProviderClient>(openRouterClient);
                         services.AddSingleton<IAiProviderClientResolver>(provider =>

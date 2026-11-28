@@ -150,8 +150,7 @@ internal static class OrientationGatedTemplateExtractionValidator
                 Extraction: null);
         }
 
-        if (decisions.Any(page => page.ClockwiseDegreesToUpright != 0)
-            || metadata.ValueKind != JsonValueKind.Object)
+        if (metadata.ValueKind != JsonValueKind.Object)
         {
             throw Invalid("ORIENTATION_RESPONSE_INVALID");
         }

@@ -220,7 +220,11 @@ public sealed class PublishStartsTestSessionMigrationTests
             Assert.Equal(
                 [Migration0023, Migration0024, Migration0025, "20261016000000_0026_TestSessionPassCriteria",
                     "20261119000000_0027_OptionalTestDate", "20261119000100_0028_GuardianMessageTemplates",
-                    "20261121000000_0029_TemplatePassCriteria", "20261121000100_0030_EditableGuardianMessages"],
+                    "20261121000000_0029_TemplatePassCriteria", "20261121000100_0030_EditableGuardianMessages",
+                    "20261124000000_0031_InitialGradingMediaResolution",
+                    "20261125000000_0032_SessionGradingMode",
+                    "20261125000100_0033_ProviderManagedBatchOutput",
+                    "20261125000200_0034_RetireAutomaticAdjudication"],
                 await context.Database.GetPendingMigrationsAsync());
             Assert.False(context.Database.HasPendingModelChanges());
         }

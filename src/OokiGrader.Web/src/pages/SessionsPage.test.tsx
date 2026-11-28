@@ -14,6 +14,7 @@ import { loadActiveTemplates, SessionsPage } from "./SessionsPage";
 const queryState = vi.hoisted(() => ({
   session: undefined as TestSessionSummary | undefined,
   templates: [] as TemplateSummary[],
+  batchReady: false,
 }));
 
 const apiState = vi.hoisted(() => ({
@@ -44,7 +45,9 @@ vi.mock("../hooks/useApiQuery", () => ({
             nextCursor: null,
             totalApproximate: queryState.templates.length,
           }
-        : { items: [], nextCursor: null, totalApproximate: 0 };
+        : key === "runtime-capabilities"
+          ? { ai: { geminiBatch: { enabled: true, ready: queryState.batchReady } } }
+          : { items: [], nextCursor: null, totalApproximate: 0 };
     return {
       data,
       error: undefined,
@@ -67,6 +70,7 @@ vi.mock("../lib/api", async (importOriginal) => {
 });
 
 beforeEach(() => {
+  queryState.batchReady = false;
   queryState.session = {
     id: "session-1",
     sessionName: "8月 HOP",
@@ -182,6 +186,8 @@ describe("SessionsPage list controls", () => {
     expect(within(dialog).getByText("本科")).toBeVisible();
     expect(within(dialog).queryByLabelText("実施名")).not.toBeInTheDocument();
     expect(within(dialog).queryByLabelText("コース")).not.toBeInTheDocument();
+    expect(within(dialog).getByLabelText("初回採点の方法")).toHaveValue("standard");
+    expect(within(dialog).getByRole("option", { name: /Gemini Batch/ })).toBeDisabled();
 
     fireEvent.change(within(dialog).getByLabelText(/^実施日/), {
       target: { value: testDate },
@@ -207,6 +213,7 @@ describe("SessionsPage list controls", () => {
           testDate: testDate || null,
           classLabel: "4年A組",
           openImmediately: true,
+          gradingMode: "standard",
         },
         expect.objectContaining({ idempotencyKey: expect.any(String) }),
       ),
@@ -224,7 +231,8 @@ describe("SessionsPage list controls", () => {
     expect(dialog).not.toBeInTheDocument();
   });
 
-  it("reuses the idempotency key when an ambiguous network failure is retried", async () => {
+  it("reuses the same Batch selection and idempotency key after an ambiguous network failure", async () => {
+    queryState.batchReady = true;
     apiState.post
       .mockRejectedValueOnce(new TypeError("Failed to fetch"))
       .mockResolvedValueOnce({
@@ -246,6 +254,8 @@ describe("SessionsPage list controls", () => {
     fireEvent.change(within(dialog).getByLabelText(/^実施日/), {
       target: { value: "2026-08-12" },
     });
+    expect(within(dialog).getByLabelText("初回採点の方法")).toHaveValue("batch");
+    expect(within(dialog).getByText(/要確認の設問は、採点後に先生が確認できます/)).toBeVisible();
     fireEvent.click(
       within(dialog).getByRole("button", { name: "答案受付を開始" }),
     );
@@ -266,6 +276,8 @@ describe("SessionsPage list controls", () => {
     })?.idempotencyKey;
     expect(firstKey).toBeTruthy();
     expect(secondKey).toBe(firstKey);
+    expect(apiState.post.mock.calls[0]?.[1]).toMatchObject({ gradingMode: "batch" });
+    expect(apiState.post.mock.calls[1]?.[1]).toEqual(apiState.post.mock.calls[0]?.[1]);
     expect(window.location.pathname).toBe("/sessions/session-after-retry");
   });
 

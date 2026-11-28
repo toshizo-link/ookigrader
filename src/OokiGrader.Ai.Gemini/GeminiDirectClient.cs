@@ -118,7 +118,7 @@ public sealed partial class GeminiDirectClient(
                 Encoding.UTF8.GetString(credentialUtf8.Span));
             message.Headers.Accept.Add(
                 new MediaTypeWithQualityHeaderValue("application/json"));
-            message.Content = new ByteArrayContent(BuildRequestBody(request));
+            message.Content = new ByteArrayContent(BuildRequestBody(request, connection.ModelId));
             message.Content.Headers.ContentType =
                 new MediaTypeHeaderValue("application/json")
                 {
@@ -251,61 +251,12 @@ public sealed partial class GeminiDirectClient(
         }
     }
 
-    private static byte[] BuildRequestBody(AiProviderRequest request)
+    private static byte[] BuildRequestBody(AiProviderRequest request, string modelId)
     {
         using var buffer = new MemoryStream();
         using (var writer = new Utf8JsonWriter(buffer))
         {
-            writer.WriteStartObject();
-            writer.WritePropertyName("system_instruction");
-            writer.WriteStartObject();
-            writer.WriteString("role", "system");
-            writer.WritePropertyName("parts");
-            writer.WriteStartArray();
-            writer.WriteStartObject();
-            writer.WriteString("text", request.SystemInstruction);
-            writer.WriteEndObject();
-            writer.WriteEndArray();
-            writer.WriteEndObject();
-
-            writer.WritePropertyName("contents");
-            writer.WriteStartArray();
-            writer.WriteStartObject();
-            writer.WriteString("role", "user");
-            writer.WritePropertyName("parts");
-            writer.WriteStartArray();
-            foreach (var media in request.Media)
-            {
-                writer.WriteStartObject();
-                writer.WritePropertyName("inline_data");
-                writer.WriteStartObject();
-                writer.WriteString("mime_type", media.MimeType);
-                writer.WriteBase64String("data", media.Bytes.Span);
-                writer.WriteEndObject();
-                writer.WriteEndObject();
-            }
-
-            writer.WriteStartObject();
-            writer.WriteString("text", request.UserInstruction);
-            writer.WriteEndObject();
-            writer.WriteEndArray();
-            writer.WriteEndObject();
-            writer.WriteEndArray();
-
-            writer.WritePropertyName("generationConfig");
-            writer.WriteStartObject();
-            writer.WriteString("responseMimeType", "application/json");
-            writer.WritePropertyName("responseJsonSchema");
-            request.ResponseJsonSchema.WriteTo(writer);
-            writer.WriteNumber("maxOutputTokens", request.MaxOutputTokens);
-            writer.WritePropertyName("thinkingConfig");
-            writer.WriteStartObject();
-            writer.WriteBoolean("includeThoughts", false);
-            writer.WriteString("thinkingLevel", request.ThinkingLevel);
-            writer.WriteEndObject();
-            writer.WriteString("mediaResolution", request.MediaResolution);
-            writer.WriteEndObject();
-            writer.WriteEndObject();
+            WriteGenerateContentRequest(writer, request, modelId);
         }
 
         if (buffer.Length > MaximumInlineRequestBytes)
@@ -317,6 +268,95 @@ public sealed partial class GeminiDirectClient(
         }
 
         return buffer.ToArray();
+    }
+
+    internal static void WriteGenerateContentRequest(
+        Utf8JsonWriter writer,
+        AiProviderRequest request,
+        string modelId)
+    {
+        writer.WriteStartObject();
+        writer.WritePropertyName("system_instruction");
+        writer.WriteStartObject();
+        writer.WriteString("role", "system");
+        writer.WritePropertyName("parts");
+        writer.WriteStartArray();
+        writer.WriteStartObject();
+        writer.WriteString("text", request.SystemInstruction);
+        writer.WriteEndObject();
+        writer.WriteEndArray();
+        writer.WriteEndObject();
+
+        writer.WritePropertyName("contents");
+        writer.WriteStartArray();
+        writer.WriteStartObject();
+        writer.WriteString("role", "user");
+        writer.WritePropertyName("parts");
+        writer.WriteStartArray();
+        // Initial grading starts with a shared rubric that Gemini can cache across students.
+        var initialGrading = request.TaskType == AiTaskTypes.InitialGrading;
+        if (initialGrading)
+        {
+            WriteUserInstruction(writer, request.UserInstruction);
+        }
+
+        foreach (var media in request.Media)
+        {
+            writer.WriteStartObject();
+            writer.WritePropertyName("inline_data");
+            writer.WriteStartObject();
+            writer.WriteString("mime_type", media.MimeType);
+            writer.WriteBase64String("data", media.Bytes.Span);
+            writer.WriteEndObject();
+            writer.WriteEndObject();
+        }
+
+        if (!initialGrading)
+        {
+            WriteUserInstruction(writer, request.UserInstruction);
+        }
+
+        writer.WriteEndArray();
+        writer.WriteEndObject();
+        writer.WriteEndArray();
+
+        writer.WritePropertyName("generationConfig");
+        writer.WriteStartObject();
+        writer.WriteString("responseMimeType", "application/json");
+        writer.WritePropertyName("responseJsonSchema");
+        request.ResponseJsonSchema.WriteTo(writer);
+        writer.WriteNumber("maxOutputTokens", request.MaxOutputTokens);
+        writer.WritePropertyName("thinkingConfig");
+        writer.WriteStartObject();
+        writer.WriteBoolean("includeThoughts", false);
+        if (modelId.StartsWith("gemini-2.5-", StringComparison.OrdinalIgnoreCase))
+        {
+            // The 2.5 generateContent API accepts a token budget rather than a named level.
+            // Leave at least half of a normal grading response budget for the visible result.
+            var budget = request.ThinkingLevel switch
+            {
+                "MINIMAL" => modelId.StartsWith("gemini-2.5-pro", StringComparison.OrdinalIgnoreCase) ? 128 : 0,
+                "LOW" => 512,
+                "MEDIUM" => Math.Clamp(request.MaxOutputTokens / 2, 512, 4_096),
+                _ => Math.Clamp(request.MaxOutputTokens / 2, 512, 8_192),
+            };
+            writer.WriteNumber("thinkingBudget", budget);
+        }
+        else
+        {
+            writer.WriteString("thinkingLevel", request.ThinkingLevel);
+        }
+        writer.WriteEndObject();
+        writer.WriteString("mediaResolution", request.MediaResolution);
+        writer.WriteEndObject();
+        writer.WriteEndObject();
+    }
+
+    private static void WriteUserInstruction(Utf8JsonWriter writer, string instruction)
+    {
+        writer.WriteStartObject();
+        writer.WriteString("text", instruction);
+        writer.WriteEndObject();
     }
 
     private static AiProviderResponse ParseResponse(

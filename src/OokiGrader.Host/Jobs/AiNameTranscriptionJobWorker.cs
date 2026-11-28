@@ -411,10 +411,12 @@ public sealed partial class AiNameTranscriptionJobWorker : BackgroundService
                 return false;
             }
 
+            var combinedSubmissions = SubmissionsUsingCombinedIdentity(db);
             var eligible = await db.Submissions
                 .AsNoTracking()
                 .Where(item =>
                     item.State == "needs_name_review"
+                    && !combinedSubmissions.Contains(item.Id)
                     && item.AssignedStudentId == null
                     && item.VoidedAt == null
                     && item.PreprocessingCompletedAt != null
@@ -531,6 +533,12 @@ public sealed partial class AiNameTranscriptionJobWorker : BackgroundService
                     && openRouterEnabled));
     }
 
+    private static IQueryable<string> SubmissionsUsingCombinedIdentity(OokiGraderDbContext db) =>
+        db.GradingRuns.Where(run => run.PipelineVersion == AiInitialGradingJobWorker.PipelineVersion
+                && run.State == "awaiting_identity")
+            .Select(run => run.SubmissionId)
+            .Union(AiInitialGradingJobWorker.PendingInitialBatchRequests(db).Select(request => request.EntityId));
+
     private Task<JobLease?> LeaseNextAsync(CancellationToken cancellationToken)
     {
         return _writeCoordinator.ExecuteAsync(async token =>
@@ -607,6 +615,14 @@ public sealed partial class AiNameTranscriptionJobWorker : BackgroundService
                 || !IsSha256(payload.ManifestHash))
             {
                 throw Permanent("ai_name_payload_invalid");
+            }
+
+            if (await SubmissionsUsingCombinedIdentity(db).ContainsAsync(payload.SubmissionId, token).ConfigureAwait(false))
+            {
+                CompleteJob(job, now);
+                await db.SaveChangesAsync(token).ConfigureAwait(false);
+                await transaction.CommitAsync(token).ConfigureAwait(false);
+                return null;
             }
 
             var bundle = _promptCatalog.GetRequired(AiTaskTypes.NameTranscription);
@@ -1998,7 +2014,7 @@ public sealed partial class AiNameTranscriptionJobWorker : BackgroundService
             && profile.PromptVersion == bundle.PromptVersion
             && profile.SchemaVersion == bundle.SchemaVersion
             && profile.PromptContentHash == bundle.ContentHash
-            && profile.ThinkingLevel == AiProviderRuntime.DefaultThinkingLevel(
+            && profile.ThinkingLevel == AiProviderCatalog.DefaultThinkingLevel(
                 profile.AiConnection.Provider,
                 profile.ModelId,
                 profile.TaskType)

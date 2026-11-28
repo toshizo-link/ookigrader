@@ -145,11 +145,6 @@ internal sealed class GeminiTaskRoutingClient(
         AiProviderRequest request, string reason, CancellationToken token)
     {
         var settings = connection with { ModelId = AiProviderCatalog.GeminiLightModelId };
-        // Template extraction requires an independent slot inventory as well
-        // as structured questions. Give the smaller fallback model its highest
-        // supported reasoning level without splitting the page request.
-        if (request.TaskType == AiTaskTypes.TemplateExtraction)
-            request = request with { ThinkingLevel = "HIGH" };
         AiProviderResponse response;
         try
         {

@@ -273,10 +273,14 @@ public sealed class Gemini38UpgradeMigrationTests
             Assert.Equal(bundle.PromptVersion, profile.PromptVersion);
             Assert.Equal(bundle.SchemaVersion, profile.SchemaVersion);
             Assert.Equal(bundle.ContentHash, profile.PromptContentHash);
-            Assert.Equal(profile.TaskType == AiTaskTypes.TemplateExtraction
-                ? "medium" : "low", profile.ThinkingLevel);
-            Assert.Equal(profile.TaskType == AiTaskTypes.TemplateExtraction
-                ? 65_536 : 8_192, profile.MaxOutputTokens);
+            Assert.Equal(profile.TaskType == AiTaskTypes.TemplateExtraction ? "medium" : "low", profile.ThinkingLevel);
+            Assert.Equal(profile.TaskType switch
+            {
+                AiTaskTypes.TemplateExtraction => 65_536,
+                // The active historical grading profile has an explicit 16K ceiling.
+                AiTaskTypes.InitialGrading => 16_384,
+                _ => 8_192,
+            }, profile.MaxOutputTokens);
             Assert.Equal(active, profile.Active);
             Assert.Equal(active ? "capability_passed" : "draft", profile.ApprovalState);
             Assert.Null(profile.AccuracyEvaluationId);

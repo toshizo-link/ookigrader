@@ -389,18 +389,6 @@ public sealed class TemplateGenerationFinalizationService
             throw StateConflict(batch.Revision);
         }
 
-        if (failedUnits.Any(item =>
-                ReadWarnings(item).Any(warning =>
-                    warning.Code == "ORIENTATION_RETRY_EXHAUSTED")))
-        {
-            throw new TemplateGenerationBatchServiceException(
-                StatusCodes.Status409Conflict,
-                "ORIENTATION_RETRY_EXHAUSTED",
-                "向きを自動補正できませんでした",
-                "元PDFを正しい向きに直して再アップロードしてください。",
-                batch.Revision);
-        }
-
         var now = _timeProvider.GetUtcNow();
         var supersededJobs = await CancelSupersededCurrentUnitJobsAsync(
                 failedUnits,

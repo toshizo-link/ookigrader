@@ -2,6 +2,8 @@ using System.Text;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using OokiGrader.Ai.Abstractions;
@@ -15,7 +17,7 @@ using OokiGrader.Infrastructure.Security;
 
 namespace OokiGrader.IntegrationTests;
 
-public sealed class AiBatchJobWorkerTests
+public sealed partial class AiBatchJobWorkerTests
 {
     [Fact]
     public async Task CompleteLifecycleStoresResponseReadyUsageAtBatchRate()
@@ -27,6 +29,7 @@ public sealed class AiBatchJobWorkerTests
         Assert.True(await fixture.Worker.ProcessNextAsync());
         Assert.True(await fixture.Worker.ProcessNextAsync());
         fixture.Time.Advance(TimeSpan.FromSeconds(2));
+        Assert.True(await fixture.Worker.ProcessNextAsync());
         Assert.True(await fixture.Worker.ProcessNextAsync());
 
         await using var db = fixture.CreateDbContext();
@@ -108,6 +111,7 @@ public sealed class AiBatchJobWorkerTests
 
         fixture.Time.Advance(TimeSpan.FromSeconds(2));
         Assert.True(await fixture.Worker.ProcessNextAsync());
+        Assert.True(await fixture.Worker.ProcessNextAsync());
 
         await using var verified = fixture.CreateDbContext();
         var completedBatch = await verified.AiBatches.SingleAsync();
@@ -166,6 +170,57 @@ public sealed class AiBatchJobWorkerTests
             Assert.Equal("failed", batch.State);
             Assert.Equal("completed", batch.CleanupState);
         }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MixedUnsentBatchPreservesOnlyTheExistingPapersRemainingChunk(bool alreadyPrepared)
+    {
+        await using var fixture = await BatchFixture.CreateAsync(aggregationRequestCount: 2, thinkingLevel: "medium");
+        var freshPaper = await fixture.StageAsync();
+        var remainingChunk = await fixture.StageAdditionalAsync("second chunk", thinkingLevel: "MEDIUM");
+        if (alreadyPrepared) Assert.True(await fixture.Worker.ProcessNextAsync());
+
+        string frozenLine;
+        await using (var db = fixture.CreateDbContext())
+        {
+            var mapping = await db.AiBatchRequests.SingleAsync(row => row.Id == remainingChunk.BatchRequestId);
+            frozenLine = mapping.ProviderRequestJson!;
+            var paid = await db.AiRequests.AsNoTracking().SingleAsync(row => row.Id == mapping.AiRequestId);
+            paid.Id = UlidId.New(fixture.Time.GetUtcNow());
+            paid.RequestKey = $"grade_{paid.Id}";
+            paid.InputManifestHash = new string('e', 64);
+            paid.State = "succeeded";
+            db.AiRequests.Add(paid);
+            var old = await db.AiTaskProfiles.SingleAsync();
+            var replacement = await db.AiTaskProfiles.AsNoTracking().SingleAsync();
+            old.Active = false;
+            await db.SaveChangesAsync();
+            replacement.Id = UlidId.New(fixture.Time.GetUtcNow());
+            replacement.ThinkingLevel = "low";
+            db.AiTaskProfiles.Add(replacement);
+            await db.SaveChangesAsync();
+        }
+
+        for (var i = 0; i < 8 && fixture.Provider.CreateCalls == 0; i++)
+            Assert.True(await fixture.Worker.ProcessNextAsync());
+        Assert.Equal(1, fixture.Provider.UploadCalls);
+        Assert.Equal(1, fixture.Provider.CreateCalls);
+        Assert.Equal(frozenLine + "\n", fixture.Provider.LastUploadedJson);
+        using var line = JsonDocument.Parse(frozenLine);
+        Assert.Equal("MEDIUM", line.RootElement.GetProperty("request").GetProperty("generationConfig")
+            .GetProperty("thinkingConfig").GetProperty("thinkingLevel").GetString());
+        await using var verified = fixture.CreateDbContext();
+        var eligible = await verified.AiBatchRequests.Include(row => row.AiBatch)
+            .SingleAsync(row => row.Id == remainingChunk.BatchRequestId);
+        Assert.Equal("submitted", eligible.State);
+        Assert.Equal(1, eligible.AiBatch!.RequestCount);
+        var ineligible = await verified.AiBatchRequests.SingleAsync(row => row.Id == freshPaper.BatchRequestId);
+        Assert.Equal("failed", ineligible.State);
+        Assert.Equal("ai_batch_profile_unavailable", ineligible.ErrorCode);
+        Assert.Equal("released", (await verified.AiBudgetReservations.SingleAsync()).State);
+        Assert.Equal(alreadyPrepared ? 1 : 0, await verified.AiBatches.CountAsync(row => row.State == "failed"));
     }
 
     [Fact]
@@ -420,6 +475,49 @@ public sealed class AiBatchJobWorkerTests
             TimeSpan.FromSeconds(11));
     }
 
+    [Theory]
+    [InlineData(1, 1)]
+    [InlineData(2, 2)]
+    public async Task PrepareBoundsJsonLinesByUtf8BytesAndKeepsTheFifoRemainder(
+        int allowedSeparators, int expectedFirstGroupCount)
+    {
+        await using var fixture = await BatchFixture.CreateAsync();
+        var first = await fixture.StageAsync();
+        fixture.Time.Advance(TimeSpan.FromSeconds(1));
+        var second = await fixture.StageAdditionalAsync("second");
+        await using var db = fixture.CreateDbContext();
+        var firstTwoBytes = await db.AiBatchRequests.SumAsync(row => row.ProviderRequestBytes);
+        fixture.Time.Advance(TimeSpan.FromSeconds(1));
+        var large = await fixture.StageAdditionalAsync(new string('x', 4096));
+        fixture.Time.Advance(TimeSpan.FromSeconds(1));
+        var worker = fixture.RestartWorker(new AiBatchJobWorkerOptions
+        {
+            AggregationRequestCount = 20,
+            MaximumAggregationWait = TimeSpan.FromMinutes(5),
+            TargetJsonLinesBytes = checked((int)firstTwoBytes + allowedSeparators),
+        });
+
+        Assert.True(await worker.ProcessNextAsync());
+        var grouped = await db.AiBatchRequests.AsNoTracking().Where(row => row.AiBatchId != null)
+            .OrderBy(row => row.Ordinal).Select(row => row.Id).ToListAsync();
+        var initialIds = new[] { first.BatchRequestId, second.BatchRequestId };
+        Assert.Equal(initialIds.Take(expectedFirstGroupCount), grouped);
+        if (expectedFirstGroupCount == 1)
+        {
+            Assert.True(await worker.ProcessNextAsync());
+            Assert.NotNull(await db.AiBatchRequests.Where(row => row.Id == second.BatchRequestId)
+                .Select(row => row.AiBatchId).SingleAsync());
+        }
+
+        // A single supported request larger than the target must also dispatch immediately.
+        Assert.Null(await db.AiBatchRequests.Where(row => row.Id == large.BatchRequestId)
+            .Select(row => row.AiBatchId).SingleAsync());
+        Assert.True(await worker.ProcessNextAsync());
+        Assert.Equal(1, await db.AiBatchRequests.Where(row => row.Id == large.BatchRequestId)
+            .Select(row => row.AiBatch!.RequestCount).SingleAsync());
+        Assert.False(await db.AiBatchRequests.AnyAsync(row => row.AiBatchId == null));
+    }
+
     [Fact]
     public async Task RemoteFailureMarksRequestsRetryableWithoutUsage()
     {
@@ -483,10 +581,12 @@ public sealed class AiBatchJobWorkerTests
         Assert.Empty(db.AiUsage);
     }
 
-    [Fact]
-    public async Task MissingResultCreatesOnlyOneFreshImmutableAttempt()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MissingResultCreatesOnlyOneFreshImmutableAttempt(bool compact)
     {
-        await using var fixture = await BatchFixture.CreateAsync();
+        await using var fixture = await BatchFixture.CreateAsync(compact: compact);
         fixture.Provider.ReturnNoResults = true;
         await fixture.StageAsync();
         Assert.True(await fixture.Worker.ProcessNextAsync());
@@ -500,6 +600,7 @@ public sealed class AiBatchJobWorkerTests
             .ToListAsync();
         Assert.Equal(2, attempts.Count);
         Assert.Equal("gemini_batch_result_missing", attempts[0].ErrorCode);
+        Assert.Equal(compact, InitialGradingWire.IsCompact(attempts[1].RequestKey));
         Assert.Equal(attempts[0].Id, attempts[1].RetryOfAiRequestId);
         Assert.Equal(2, attempts[1].AttemptNumber);
         Assert.Equal(1, fixture.Provider.CreateCalls);
@@ -648,6 +749,7 @@ public sealed class AiBatchJobWorkerTests
         await fixture.StageAsync();
         Assert.True(await fixture.Worker.ProcessNextAsync());
         Assert.True(await fixture.Worker.ProcessNextAsync());
+        Assert.True(await fixture.Worker.ProcessNextAsync());
 
         await using var db = fixture.CreateDbContext();
         Assert.Equal("failed", (await db.AiBatches.SingleAsync()).State);
@@ -717,7 +819,10 @@ public sealed class AiBatchJobWorkerTests
             int maximumRequestAttempts = 3,
             long? dailyHardLimit = null,
             int aggregationRequestCount = 1,
-            TimeSpan? maximumAggregationWait = null)
+            TimeSpan? maximumAggregationWait = null,
+            bool compact = false,
+            string? migration = null,
+            string thinkingLevel = "low")
         {
             var connection = new SqliteConnection("Data Source=:memory:");
             await connection.OpenAsync();
@@ -735,7 +840,14 @@ public sealed class AiBatchJobWorkerTests
             var factory = new DbContextFactory(options);
             await using (var db = factory.CreateDbContext())
             {
-                await db.Database.EnsureCreatedAsync();
+                if (migration is null)
+                {
+                    await db.Database.EnsureCreatedAsync();
+                }
+                else
+                {
+                    await db.GetService<IMigrator>().MigrateAsync(migration);
+                }
             }
 
             var writeCoordinator = new BoundaryWriteCoordinator();
@@ -748,7 +860,9 @@ public sealed class AiBatchJobWorkerTests
                 "test-only-key".AsMemory());
             var profileId = UlidId.New(time.GetUtcNow());
             var aiRequestId = UlidId.New(time.GetUtcNow());
-            var requestKey = $"grade_{aiRequestId}";
+            var requestKey = compact
+                ? InitialGradingWire.RequestKey(aiRequestId, AiProviders.GeminiDirect)
+                : $"grade_{aiRequestId}";
             await using (var db = factory.CreateDbContext())
             {
                 db.AiConnections.Add(new AiConnectionEntity
@@ -785,7 +899,7 @@ public sealed class AiBatchJobWorkerTests
                     PromptVersion = "prompt-v1",
                     SchemaVersion = "schema-v1",
                     PromptContentHash = new string('a', 64),
-                    ThinkingLevel = "low",
+                    ThinkingLevel = thinkingLevel,
                     MediaResolution = "high",
                     MaxOutputTokens = 1_024,
                     ConcurrencyLimit = 1,
@@ -895,17 +1009,31 @@ public sealed class AiBatchJobWorkerTests
                 worker);
         }
 
-        public Task<AiBatchStageResult> StageAsync(
-            string userInstruction = "user")
+        public Task<AiBatchStageResult> StageAsync(string userInstruction = "user") =>
+            StageAsync(_aiRequestId, _requestKey, userInstruction);
+
+        public async Task<AiBatchStageResult> StageAdditionalAsync(string userInstruction, string thinkingLevel = "MINIMAL")
+        {
+            await using var db = CreateDbContext();
+            var row = await db.AiRequests.AsNoTracking().SingleAsync(item => item.Id == _aiRequestId);
+            row.Id = UlidId.New(Time.GetUtcNow());
+            row.RequestKey = $"grade_{row.Id}";
+            row.EntityId = UlidId.New(Time.GetUtcNow());
+            db.AiRequests.Add(row);
+            await db.SaveChangesAsync();
+            return await StageAsync(row.Id, row.RequestKey, userInstruction, thinkingLevel);
+        }
+
+        private Task<AiBatchStageResult> StageAsync(string aiRequestId, string requestKey, string userInstruction, string thinkingLevel = "MINIMAL")
         {
             using var schema = JsonDocument.Parse(
                 """{"type":"object","additionalProperties":false,"properties":{"ok":{"type":"boolean"}},"required":["ok"]}""");
             var bytes = "answer-crop"u8.ToArray();
             return Stager.StageAsync(new AiBatchStageRequest(
-                _aiRequestId,
+                aiRequestId,
                 new string('c', 64),
                 new AiProviderRequest(
-                    _requestKey,
+                    requestKey,
                     AiTaskTypes.InitialGrading,
                     "prompt-v1",
                     "schema-v1",
@@ -920,11 +1048,15 @@ public sealed class AiBatchJobWorkerTests
                                     System.Security.Cryptography.SHA256.HashData(
                                         bytes))
                                 .ToLowerInvariant()),
-                    ])));
+                    ], ThinkingLevel: thinkingLevel)));
         }
 
         public OokiGraderDbContext CreateDbContext() =>
             _factory.CreateDbContext();
+
+        public AiBatchJobWorker RestartWorker(AiBatchJobWorkerOptions? options = null) =>
+            new(_factory, WriteCoordinator, Provider, _secretStore, Time,
+                Options.Create(options ?? new AiBatchJobWorkerOptions()), NullLogger<AiBatchJobWorker>.Instance);
 
         public async ValueTask DisposeAsync()
         {
@@ -945,6 +1077,10 @@ public sealed class AiBatchJobWorkerTests
         public int UploadCalls { get; private set; }
         public int CreateCalls { get; private set; }
         public int DeleteCalls { get; private set; }
+        public List<string> DeleteFiles { get; } = [];
+        public string? FailingDeleteFile { get; set; }
+        public bool DeleteFailureIsTransient { get; set; } = true;
+        public string? LengthRejectedFile { get; set; }
         public bool ObservedInsideWriteCoordinator { get; private set; }
         public AiBatchCreateException? CreateFailure { get; set; }
         public IReadOnlyList<AiBatchStatus> ListedBatches { get; set; } = [];
@@ -953,15 +1089,16 @@ public sealed class AiBatchJobWorkerTests
         public string ResponseJson { get; set; } = """{"ok":true}""";
         public string? ResultErrorCode { get; set; }
         public List<string> ObservedModelIds { get; } = [];
+        public string? LastUploadedJson { get; private set; }
         private string[] RequestKeys { get; set; } = [];
 
         public byte[] BuildJsonLines(
-            IReadOnlyList<AiProviderRequest> requests)
+            IReadOnlyList<AiProviderRequest> requests, string modelId = AiProviderCatalog.GeminiDefaultModelId)
         {
             RequestKeys = requests
                 .Select(item => item.RequestKey)
                 .ToArray();
-            return _serializer.BuildJsonLines(requests);
+            return _serializer.BuildJsonLines(requests, modelId);
         }
 
         public Task<AiBatchInputFile> UploadJsonLinesAsync(
@@ -974,6 +1111,7 @@ public sealed class AiBatchJobWorkerTests
             cancellationToken.ThrowIfCancellationRequested();
             ObserveBoundary(connection);
             UploadCalls++;
+            LastUploadedJson = Encoding.UTF8.GetString(jsonLines.Span);
             return Task.FromResult(new AiBatchInputFile(
                 "files/input-1",
                 null,
@@ -1001,7 +1139,7 @@ public sealed class AiBatchJobWorkerTests
                 "batches/batch-1",
                 timeProvider.GetUtcNow());
             return Task.FromResult(new AiBatchCreateReceipt(
-                "batches/batch-1",
+                RemoteStatus.ProviderBatchName,
                 request.DisplayName,
                 DateTimeOffset.UtcNow));
         }
@@ -1112,6 +1250,17 @@ public sealed class AiBatchJobWorkerTests
             cancellationToken.ThrowIfCancellationRequested();
             ObserveBoundary(connection);
             DeleteCalls++;
+            DeleteFiles.Add(providerFileName);
+            if (providerFileName == LengthRejectedFile)
+            {
+                throw new AiProviderException(AiFailureKind.RequestRejected, GeminiBatchClient.FileIdLengthError, false);
+            }
+            if (providerFileName == FailingDeleteFile)
+            {
+                throw new AiProviderException(
+                    DeleteFailureIsTransient ? AiFailureKind.TransientProvider : AiFailureKind.Authentication,
+                    "test_delete_unavailable", DeleteFailureIsTransient);
+            }
             return Task.CompletedTask;
         }
 

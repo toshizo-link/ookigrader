@@ -9,6 +9,7 @@ using Microsoft.Extensions.Options;
 using OokiGrader.Ai.Abstractions;
 using OokiGrader.Ai.Gemini;
 using OokiGrader.Application.Abstractions;
+using OokiGrader.Application.Identifiers;
 using OokiGrader.Domain.Templates;
 using OokiGrader.Host.Common;
 using OokiGrader.Host.Jobs;
@@ -23,178 +24,128 @@ namespace OokiGrader.IntegrationTests;
 public sealed class TemplateGenerationUnitJobWorkerTests
 {
     [Fact]
-    public void LargeJapaneseReconciliationFeedbackRemainsValidAndWithinProviderInputLimit()
+    public async Task DenseFillBlankTemplateCommitsOneValidatedExtraction()
     {
-        var questions = Enumerable.Range(1, 62).Select(index => new ValidatedTemplateQuestion(
-            $"slot-{index}", "source", 1, $"問{index}", new string('日', 3000), index, 1,
-            false, true, "exact_short_text", new string('答', 600), "provided_model_answer",
-            new TemplateExtractionAnswerSource("source", 1), [], 1000, false, false, false,
-            false, 1, [], [new TemplateExtractionReviewIssue("question.filled_answer_removal_unconfirmed", "確認", true)]))
-            .ToArray();
-        var candidate = new ValidatedTemplateExtraction(
-            new ValidatedTemplateMetadata(null, null, null, null, null, 1, []),
-            [new ValidatedTemplatePage("source", 1, 62, questions)], [], [], 62000);
-        var feedback = TemplateGenerationUnitJobWorker.CreateReconciliationFeedback(candidate, candidate);
-        Assert.True(feedback.Length <= 60000);
-        using var json = JsonDocument.Parse(feedback);
-        Assert.True(json.RootElement.GetProperty("detailed_prior_output_omitted").GetBoolean());
-        Assert.Equal(62, json.RootElement.GetProperty("first")[0].GetProperty("extracted_slots").GetInt32());
-        Assert.Equal(62, json.RootElement.GetProperty("independent")[0].GetProperty("DetectedAnswerSlotCount").GetInt32());
-    }
-
-    [Fact]
-    public async Task DenseFillBlankInventoryIsIndependentlyAudited()
-    {
-        await using var fixture = await WorkerFixture.CreateAsync(ProviderAction.Embedded, ProviderAction.Embedded);
-        Assert.True(await fixture.Worker.ProcessNextAsync());
-        Assert.Equal(2, fixture.Provider.Requests.Count);
-        Assert.Contains("INDEPENDENT INVENTORY AUDIT", fixture.Provider.Requests[1].UserInstruction);
-        await using var db = await fixture.CreateDbContextAsync();
-        var attempts = await db.AiRequests.OrderBy(item => item.AttemptNumber).Select(item => item.AttemptNumber).ToArrayAsync();
-        Assert.Equal([1, 3], attempts);
-        Assert.All(await db.AiBudgetReservations.ToArrayAsync(), reservation => Assert.Equal("settled", reservation.State));
-    }
-
-    [Fact]
-    public async Task ConflictingInventoryGetsOneBoundedReconciliationWithItsOwnRecordedRequest()
-    {
-        await using var fixture = await WorkerFixture.CreateAsync(
-            ProviderAction.Embedded, ProviderAction.EmbeddedOmitted, ProviderAction.Embedded);
-        Assert.True(await fixture.Worker.ProcessNextAsync());
-        Assert.Equal(3, fixture.Provider.Requests.Count);
-        Assert.Contains("BOUNDED SOURCE-GROUNDED RECONCILIATION", fixture.Provider.Requests[2].UserInstruction);
-        await using var db = await fixture.CreateDbContextAsync();
-        var requests = await db.AiRequests.OrderBy(item => item.AttemptNumber).ToArrayAsync();
-        Assert.Equal([1, 3, 4], requests.Select(item => item.AttemptNumber));
-        Assert.Equal(requests[0].Id, requests[1].RetryOfAiRequestId);
-        Assert.Equal(requests[1].Id, requests[2].RetryOfAiRequestId);
-        Assert.All(await db.AiBudgetReservations.ToArrayAsync(), reservation => Assert.Equal("settled", reservation.State));
-        var unit = await db.TemplateGenerationUnits.SingleAsync();
-        Assert.Equal(TemplateGenerationUnitStatus.Extracted, unit.Status);
-        Assert.DoesNotContain("template.slot_inventory_unconfirmed", unit.WarningsJson);
-    }
-
-    [Theory]
-    [InlineData(false, false)]
-    [InlineData(true, false)]
-    [InlineData(false, true)]
-    public async Task ExplicitRetryRechecksInventoryAndOnlyReusesACompatibleFirstPass(
-        bool rotateCredentials, bool nonTransientFailure)
-    {
-        var freshStart = rotateCredentials || nonTransientFailure;
-        var actions = new List<ProviderAction> { ProviderAction.Embedded, ProviderAction.Fail, ProviderAction.Embedded };
-        if (freshStart) actions.Add(ProviderAction.Embedded);
-        await using var fixture = await WorkerFixture.CreateAsync([.. actions]);
-        fixture.Provider.Failure = nonTransientFailure
-            ? new AiProviderException(AiFailureKind.InvalidResponse, "invalid_response", isTransient: false)
-            : new AiProviderException(AiFailureKind.Timeout, "timeout", isTransient: true);
-        Assert.True(await fixture.Worker.ProcessNextAsync());
-        await using var db = await fixture.CreateDbContextAsync();
-        var first = await db.AiRequests.AsNoTracking().SingleAsync(item => item.AttemptNumber == 1);
-        if (rotateCredentials)
-        {
-            var connection = await db.AiConnections.SingleAsync();
-            connection.CredentialRevision++;
-            var profile = await db.AiTaskProfiles.SingleAsync();
-            profile.ConnectionRevision = connection.CredentialRevision;
-            await db.SaveChangesAsync();
-        }
-        await fixture.RetryFailedAsync("retry-inventory");
-        Assert.True(await fixture.Worker.ProcessNextAsync());
-        var unit = await db.TemplateGenerationUnits.AsNoTracking().SingleAsync();
-        Assert.True(unit.Status == TemplateGenerationUnitStatus.Extracted,
-            $"Unexpected status {unit.Status}: {unit.WarningsJson}. Provider calls: {fixture.Provider.Requests.Count}.");
-        Assert.Equal(freshStart ? 4 : 3, fixture.Provider.Requests.Count);
-        Assert.Contains("INDEPENDENT INVENTORY AUDIT", fixture.Provider.Requests[^1].UserInstruction, StringComparison.Ordinal);
-        Assert.Equal(fixture.Provider.Requests.Count, await db.AiBudgetReservations.CountAsync());
-        var finalAudit = await db.AiRequests.AsNoTracking().SingleAsync(item => item.AttemptNumber == 3 && item.State == "succeeded");
-        var parent = await db.AiRequests.AsNoTracking().SingleAsync(item => item.Id == finalAudit.RetryOfAiRequestId);
-        Assert.Equal(freshStart ? 1 : 3, parent.AttemptNumber);
-        if (!freshStart) Assert.Equal(first.Id, parent.RetryOfAiRequestId);
-    }
-
-    [Fact]
-    public async Task RepeatedExplicitRetriesAfterUpgradeContinueTheFailedAuditChain()
-    {
-        await using var fixture = await WorkerFixture.CreateAsync(ProviderAction.Embedded, ProviderAction.Fail,
-            ProviderAction.Fail, ProviderAction.Embedded);
-        fixture.Provider.Failure = new AiProviderException(AiFailureKind.Timeout, "timeout", isTransient: true);
-        Assert.True(await fixture.Worker.ProcessNextAsync());
-        await using var db = await fixture.CreateDbContextAsync();
-        var first = await db.AiRequests.SingleAsync(item => item.AttemptNumber == 1);
-        first.InputManifestHash = await fixture.GetLegacyFirstPassHashAsync(first.RequestKey);
-        first.CreatedAt = (await db.AiConnections.Select(item => item.UpdatedAt).SingleAsync()).AddSeconds(1);
-        var oldAudit = await db.AiRequests.SingleAsync(item => item.AttemptNumber == 3);
-        oldAudit.ErrorCode = "AI_PROVIDER_UNAVAILABLE";
-        await db.SaveChangesAsync();
-
-        await fixture.RetryFailedAsync("retry-one");
-        Assert.True(await fixture.Worker.ProcessNextAsync());
-        await fixture.RetryFailedAsync("retry-two");
-        Assert.True(await fixture.Worker.ProcessNextAsync());
-
-        Assert.Equal(4, fixture.Provider.Requests.Count);
-        Assert.All(fixture.Provider.Requests.Skip(1),
-            request => Assert.Contains("INDEPENDENT INVENTORY AUDIT", request.UserInstruction));
-        Assert.Equal(TemplateGenerationUnitStatus.Extracted,
-            (await db.TemplateGenerationUnits.AsNoTracking().SingleAsync()).Status);
-        var retriedAudit = await db.AiRequests.AsNoTracking().SingleAsync(item => item.RetryOfAiRequestId == oldAudit.Id);
-        var passedAudit = await db.AiRequests.AsNoTracking().SingleAsync(item => item.RetryOfAiRequestId == retriedAudit.Id);
-        Assert.Equal("succeeded", passedAudit.State);
-        Assert.Equal(4, await db.AiBudgetReservations.CountAsync());
-    }
-
-    [Fact]
-    public async Task ResumedLegacyJobRecognizesItsAcceptedFirstPassAndOriginalAuditError()
-    {
-        await using var fixture = await WorkerFixture.CreateAsync(ProviderAction.Embedded, ProviderAction.Fail);
-        fixture.Provider.Failure = new AiProviderException(AiFailureKind.Timeout, "timeout", isTransient: true);
-        Assert.True(await fixture.Worker.ProcessNextAsync());
-        await using var db = await fixture.CreateDbContextAsync();
-        var first = await db.AiRequests.SingleAsync(item => item.AttemptNumber == 1);
-        first.InputManifestHash = await fixture.GetLegacyFirstPassHashAsync(first.RequestKey);
-        first.CreatedAt = (await db.AiConnections.Select(item => item.UpdatedAt).SingleAsync()).AddSeconds(1);
-        // Model a .24 job restart after its audit error was saved to the request
-        // row, but before the unit and job could be marked failed.
-        var job = await db.BackgroundJobs.SingleAsync();
-        job.State = "queued";
-        job.AttemptCount = 0;
-        var unit = await db.TemplateGenerationUnits.Include(item => item.Batch).SingleAsync();
-        unit.Status = TemplateGenerationUnitStatus.Generating;
-        unit.Batch.Status = TemplateGenerationBatchStatus.Generating;
-        unit.Batch.LastErrorCode = null;
-        await db.SaveChangesAsync();
-
-        Assert.True(await fixture.Worker.ProcessNextAsync());
-        var batch = await db.TemplateGenerationBatches.AsNoTracking().SingleAsync();
-        Assert.Equal("AI_TIMEOUT", batch.LastErrorCode);
-        Assert.Equal(2, fixture.Provider.Requests.Count);
-    }
-
-    [Fact]
-    public async Task UnresolvedAnswerRemovalIsNeverSilentlyApprovedOrRetriedForever()
-    {
-        await using var fixture = await WorkerFixture.CreateAsync(
-            ProviderAction.BadRemoval, ProviderAction.BadRemoval, ProviderAction.BadRemoval);
+        await using var fixture = await WorkerFixture.CreateAsync(ProviderAction.Embedded);
         Assert.True(await fixture.Worker.ProcessNextAsync());
         Assert.False(await fixture.Worker.ProcessNextAsync());
-        Assert.Equal(3, fixture.Provider.Requests.Count);
+        Assert.Equal("MEDIUM", Assert.Single(fixture.Provider.Requests).ThinkingLevel);
+        await using var db = await fixture.CreateDbContextAsync();
+        var unit = await db.TemplateGenerationUnits.SingleAsync();
+        Assert.Equal(TemplateGenerationUnitStatus.Extracted, unit.Status);
+        Assert.Equal(1, (await db.AiRequests.SingleAsync()).AttemptNumber);
+        Assert.Equal("settled", (await db.AiBudgetReservations.SingleAsync()).State);
+    }
+
+    [Fact]
+    public async Task SpreadDetailsShareOneSourcePageAndOneExtractionRequest()
+    {
+        await using var fixture = await WorkerFixture.CreateAsync(ProviderAction.Embedded);
+        fixture.PageExtractor.SupplyBookSpread = true;
+        Assert.True(await fixture.Worker.ProcessNextAsync());
+        var request = Assert.Single(fixture.Provider.Requests);
+        Assert.Equal(["application/pdf", "image/jpeg", "image/jpeg"], request.Media.Select(part => part.MimeType));
+        await using var db = await fixture.CreateDbContextAsync();
+        var unit = await db.TemplateGenerationUnits.SingleAsync();
+        Assert.Equal(TemplateGenerationUnitStatus.Extracted, unit.Status);
+        Assert.Contains($"\"media_index\":1,\"page_id\":\"{unit.Id}:page:1\",\"side\":\"left\"", request.UserInstruction);
+        Assert.Contains($"\"media_index\":2,\"page_id\":\"{unit.Id}:page:1\",\"side\":\"right\"", request.UserInstruction);
+        Assert.Single(await db.AiRequests.ToListAsync());
+    }
+
+    [Fact]
+    public async Task UnconfirmedAnswerRemovalIsFlaggedOnTheFirstDraft()
+    {
+        await using var fixture = await WorkerFixture.CreateAsync(ProviderAction.BadRemoval);
+        Assert.True(await fixture.Worker.ProcessNextAsync());
+        Assert.False(await fixture.Worker.ProcessNextAsync());
+        Assert.Single(fixture.Provider.Requests);
         await using var db = await fixture.CreateDbContextAsync();
         var unit = await db.TemplateGenerationUnits.SingleAsync();
         Assert.Contains("question.filled_answer_removal_unconfirmed", unit.ExtractionDraftJson);
     }
 
-    [Fact]
-    public async Task ThreeDifferentInventoriesRemainBlockedForTeacherReview()
+    [Theory]
+    [InlineData(false, false, false)]
+    [InlineData(true, false, false)]
+    [InlineData(true, true, false)]
+    [InlineData(false, false, true)]
+    public async Task ReusesSavedExtractionAfterInterruptedOrExplicitlyRetriedLegacyAudit(
+        bool explicitRetry, bool changedKey, bool rotated)
     {
-        await using var fixture = await WorkerFixture.CreateAsync(
-            ProviderAction.Embedded, ProviderAction.EmbeddedOmitted, ProviderAction.EmbeddedFour);
+        await using var fixture = await WorkerFixture.CreateAsync(rotated
+            ? [ProviderAction.RotatedExtraction]
+            : [ProviderAction.Embedded, ProviderAction.Embedded]);
         Assert.True(await fixture.Worker.ProcessNextAsync());
-        Assert.False(await fixture.Worker.ProcessNextAsync());
-        Assert.Equal(3, fixture.Provider.Requests.Count);
         await using var db = await fixture.CreateDbContextAsync();
-        var unit = await db.TemplateGenerationUnits.SingleAsync();
-        Assert.Contains("template.slot_inventory_unconfirmed", unit.ExtractionDraftJson);
+        var first = await db.AiRequests.SingleAsync(request => request.AttemptNumber == 1);
+        var unit = await db.TemplateGenerationUnits.Include(item => item.Batch).SingleAsync();
+        var job = await db.BackgroundJobs.SingleAsync();
+        // Recreate the pre-upgrade state after the first response was accepted,
+        // before any draft was published, with an interrupted verification call.
+        unit.ExtractionDraftJson = null;
+        unit.ExtractionDraftHash = null;
+        unit.Status = explicitRetry ? TemplateGenerationUnitStatus.Failed : TemplateGenerationUnitStatus.Generating;
+        unit.Batch.Status = explicitRetry ? TemplateGenerationBatchStatus.Failed : TemplateGenerationBatchStatus.Generating;
+        unit.Batch.CompletedUnitCount = 0;
+        unit.Batch.FailedUnitCount = explicitRetry ? 1 : 0;
+        job.State = explicitRetry ? "failed" : "leased";
+        job.LeaseOwner = explicitRetry ? null : "old-worker";
+        job.LeaseExpiresAt = explicitRetry ? null : first.CreatedAt.AddMinutes(-1);
+        job.AttemptCount = job.MaxAttempts;
+        var lastExtractionId = await db.AiRequests.OrderByDescending(item => item.AttemptNumber)
+            .Select(item => item.Id).FirstAsync();
+        var auditId = UlidId.New(first.CreatedAt);
+        var audit = new AiRequestEntity
+        {
+            Id = auditId, RequestKey = $"template_unit_run_{job.Id}_3_{auditId}",
+            AiTaskProfileId = first.AiTaskProfileId, TaskProfileRevision = first.TaskProfileRevision,
+            Purpose = first.Purpose, EntityType = first.EntityType, EntityId = first.EntityId,
+            EntityRevision = first.EntityRevision, InputManifestHash = first.InputManifestHash,
+            AttemptNumber = 3, RetryOfAiRequestId = lastExtractionId,
+            State = explicitRetry ? "failed" : "dispatching", DispatchAttempt = 1,
+            CreatedAt = first.CreatedAt, UpdatedAt = first.UpdatedAt,
+        };
+        db.AiRequests.Add(audit);
+        var profile = await db.AiTaskProfiles.SingleAsync();
+        if (!rotated)
+        {
+            var contentHash = await fixture.GetLegacyFirstPassHashAsync(first.RequestKey, releasedOrientation: true);
+            var oldManifest = JsonSerializer.Serialize(new
+            {
+                contentHash,
+                connectionId = profile.AiConnectionId,
+                credentialRevision = profile.ConnectionRevision,
+                taskProfileId = profile.Id,
+                taskProfileRevision = first.TaskProfileRevision,
+                profile.MaxOutputTokens,
+                mediaResolution = "MEDIA_RESOLUTION_HIGH",
+                thinkingLevel = "LOW",
+            }, WorkerJsonOptions);
+            first.InputManifestHash = Sha256(Encoding.UTF8.GetBytes(oldManifest));
+            var replacement = (AiTaskProfileEntity)db.Entry(profile).CurrentValues.ToObject();
+            profile.ThinkingLevel = "low";
+            profile.PromptContentHash = ApprovedPromptBundleCatalog.LegacyTemplateExtractionContentHash;
+            profile.Active = false;
+            await db.SaveChangesAsync();
+            replacement.Id = UlidId.New(first.CreatedAt);
+            replacement.Revision = 1;
+            if (changedKey)
+            {
+                var connection = await db.AiConnections.SingleAsync();
+                connection.CredentialRevision++;
+                replacement.ConnectionRevision = connection.CredentialRevision;
+            }
+            db.AiTaskProfiles.Add(replacement);
+        }
+        await db.SaveChangesAsync();
+        if (explicitRetry) await fixture.RetryFailedAsync("upgrade-retry");
+
+        Assert.True(await fixture.Worker.ProcessNextAsync());
+        Assert.Equal(TemplateGenerationUnitStatus.Extracted,
+            (await db.TemplateGenerationUnits.AsNoTracking().SingleAsync()).Status);
+        Assert.Equal(changedKey ? 2 : 1, fixture.Provider.Requests.Count);
+        Assert.Equal("failed", (await db.AiRequests.AsNoTracking().SingleAsync(item => item.Id == audit.Id)).State);
     }
 
     [Theory]
@@ -309,61 +260,46 @@ public sealed class TemplateGenerationUnitJobWorkerTests
     }
 
     [Fact]
-    public async Task RotationThenExtractionMakesExactlyTwoProviderCalls()
+    public async Task RotatedPageReturnsItsQuestionsAndCorrectedPdfWithOneProviderCall()
     {
-        await using var fixture = await WorkerFixture.CreateAsync(
-            ProviderAction.Rotate,
-            ProviderAction.Extract);
-
+        await using var fixture = await WorkerFixture.CreateAsync(ProviderAction.RotatedExtraction);
         Assert.True(await fixture.Worker.ProcessNextAsync());
-
-        Assert.Equal(2, fixture.Provider.Requests.Count);
+        Assert.Single(fixture.Provider.Requests);
         Assert.Equal(2, fixture.PageExtractor.Calls.Count);
-        Assert.Empty(fixture.PageExtractor.Calls[0]);
-        Assert.Equal(90, Assert.Single(fixture.PageExtractor.Calls[1]).Value);
-        Assert.Contains(
-            "\"host_applied_requested_rotations\":true",
-            fixture.Provider.Requests[1].UserInstruction,
-            StringComparison.Ordinal);
+        Assert.Equal(90, fixture.PageExtractor.Calls[1][1]);
         await using var db = await fixture.CreateDbContextAsync();
-        var unit = await db.TemplateGenerationUnits.AsNoTracking().SingleAsync();
-        var requests = await db.AiRequests
-            .AsNoTracking()
-            .OrderBy(item => item.AttemptNumber)
-            .ToArrayAsync();
+        var unit = await db.TemplateGenerationUnits.SingleAsync();
         Assert.Equal(TemplateGenerationUnitStatus.Extracted, unit.Status);
         Assert.Equal(1, unit.OrientationAttemptCount);
-        Assert.Equal([1, 2], requests.Select(item => item.AttemptNumber));
-        Assert.Equal(requests[0].Id, requests[1].RetryOfAiRequestId);
-        Assert.All(requests, item => Assert.Equal("succeeded", item.State));
+        Assert.Equal("pageRangeAndRotation", (await db.TemplateGenerationDerivedSources.SingleAsync()).DerivationType);
+        Assert.Equal("succeeded", (await db.AiRequests.SingleAsync()).State);
     }
 
     [Fact]
-    public async Task SecondRotationRequestFailsWithoutThirdProviderCall()
+    public async Task NewRotationOnlyResponseFailsWithoutAnExtraProviderCall()
     {
         await using var fixture = await WorkerFixture.CreateAsync(
-            ProviderAction.Rotate,
             ProviderAction.Rotate);
 
         Assert.True(await fixture.Worker.ProcessNextAsync());
         Assert.False(await fixture.Worker.ProcessNextAsync());
 
-        Assert.Equal(2, fixture.Provider.Requests.Count);
-        Assert.Equal(2, fixture.PageExtractor.Calls.Count);
+        Assert.Single(fixture.Provider.Requests);
+        Assert.Single(fixture.PageExtractor.Calls);
         await using var db = await fixture.CreateDbContextAsync();
         var unit = await db.TemplateGenerationUnits.AsNoTracking().SingleAsync();
         var batch = await db.TemplateGenerationBatches.AsNoTracking().SingleAsync();
         var job = await db.BackgroundJobs.AsNoTracking().SingleAsync();
         Assert.Equal(TemplateGenerationUnitStatus.Failed, unit.Status);
         Assert.Equal(TemplateGenerationBatchStatus.Failed, batch.Status);
-        Assert.Equal("ORIENTATION_RETRY_EXHAUSTED", batch.LastErrorCode);
+        Assert.Equal("ORIENTATION_RESPONSE_INVALID", batch.LastErrorCode);
         Assert.Equal("failed", job.State);
-        Assert.Equal("ORIENTATION_RETRY_EXHAUSTED", job.ErrorCode);
+        Assert.Equal("ORIENTATION_RESPONSE_INVALID", job.ErrorCode);
         Assert.Contains(
-            "ORIENTATION_RETRY_EXHAUSTED",
+            "ORIENTATION_RESPONSE_INVALID",
             unit.WarningsJson,
             StringComparison.Ordinal);
-        Assert.Equal(2, await db.AiRequests.AsNoTracking().CountAsync());
+        Assert.Equal(1, await db.AiRequests.AsNoTracking().CountAsync());
     }
 
     [Fact]
@@ -405,55 +341,24 @@ public sealed class TemplateGenerationUnitJobWorkerTests
                 .SingleAsync());
     }
 
-    [Fact]
-    public async Task ManualRetryAfterSecondProviderFailureGetsTwoNewCallsAtMost()
+    [Theory]
+    [InlineData(false, 90)]
+    [InlineData(true, 0)]
+    public async Task OldRotationOnlyResultCanBeResumedOnce(bool undoEarlierTurn, int expectedDegrees)
     {
         await using var fixture = await WorkerFixture.CreateAsync(
-            ProviderAction.Rotate,
-            ProviderAction.Fail,
-            ProviderAction.Rotate,
-            ProviderAction.Extract);
-
+            undoEarlierTurn ? ProviderAction.CounterRotatedExtraction : ProviderAction.Extract);
+        await fixture.SeedSavedRotationAsync();
         Assert.True(await fixture.Worker.ProcessNextAsync());
-        await using (var failedDb = await fixture.CreateDbContextAsync())
-        {
-            var failedUnit = await failedDb.TemplateGenerationUnits
-                .AsNoTracking()
-                .SingleAsync();
-            Assert.Equal(1, failedUnit.OrientationAttemptCount);
-            Assert.NotEqual("[]", failedUnit.AppliedRotationsJson);
-        }
-
-        var retried = await fixture.RetryFailedAsync("retry-second-provider-failure");
-        var queued = Assert.Single(retried.Units);
-        Assert.Equal(0, queued.OrientationAttemptCount);
-        Assert.Empty(queued.AppliedRotations.EnumerateArray());
-        Assert.True(await fixture.Worker.ProcessNextAsync());
-        Assert.Equal(4, fixture.Provider.Requests.Count);
-
         await using var db = await fixture.CreateDbContextAsync();
-        var jobs = await db.BackgroundJobs.AsNoTracking().ToArrayAsync();
-        var requests = await db.AiRequests.AsNoTracking().ToArrayAsync();
-        Assert.Equal(2, jobs.Length);
-        Assert.Equal(4, requests.Length);
-        Assert.All(jobs, job => Assert.Equal(
-            2,
-            CountRequestsForRun(job.Id, requests)));
-
-        var failedJob = Assert.Single(jobs, job => job.State == "cancelled");
-        var succeededJob = Assert.Single(jobs, job => job.State == "succeeded");
-        var failedRun = RequestsForRun(failedJob.Id, requests);
-        var succeededRun = RequestsForRun(succeededJob.Id, requests);
-        Assert.Equal([1, 2], failedRun.Select(item => item.AttemptNumber));
-        Assert.Equal([1, 2], succeededRun.Select(item => item.AttemptNumber));
-        Assert.Equal(failedRun[1].Id, succeededRun[0].RetryOfAiRequestId);
-        Assert.Equal(succeededRun[0].Id, succeededRun[1].RetryOfAiRequestId);
-        Assert.Equal(
-            TemplateGenerationUnitStatus.Extracted,
-            await db.TemplateGenerationUnits
-                .AsNoTracking()
-                .Select(item => item.Status)
-                .SingleAsync());
+        var job = await db.BackgroundJobs.SingleAsync();
+        Assert.True(job.State == "succeeded", job.ErrorCode);
+        Assert.Single(fixture.Provider.Requests);
+        var unit = await db.TemplateGenerationUnits.SingleAsync();
+        Assert.Equal(TemplateGenerationUnitStatus.Extracted, unit.Status);
+        var rotations = JsonSerializer.Deserialize<AppliedPageRotation[]>(unit.AppliedRotationsJson, WorkerJsonOptions)!;
+        Assert.Equal(expectedDegrees, rotations.SingleOrDefault()?.ClockwiseDegrees ?? 0);
+        Assert.Equal(2, await db.AiRequests.CountAsync());
     }
 
     [Fact]
@@ -541,11 +446,11 @@ public sealed class TemplateGenerationUnitJobWorkerTests
     {
         Extract,
         Rotate,
+        RotatedExtraction,
+        CounterRotatedExtraction,
         Fail,
         BadRemoval,
         Embedded,
-        EmbeddedOmitted,
-        EmbeddedFour,
     }
 
     private static int CountRequestsForRun(
@@ -699,7 +604,7 @@ public sealed class TemplateGenerationUnitJobWorkerTests
                 CancellationToken.None);
         }
 
-        public async Task<string> GetLegacyFirstPassHashAsync(string requestKey)
+        public async Task<string> GetLegacyFirstPassHashAsync(string requestKey, bool releasedOrientation = false)
         {
             await using var db = await CreateDbContextAsync();
             var unit = await db.TemplateGenerationUnits.SingleAsync();
@@ -722,7 +627,7 @@ public sealed class TemplateGenerationUnitJobWorkerTests
                 requestKey,
                 unit.Id,
                 profile,
-                rotationsWereApplied: false);
+                rotationsWereApplied: false, legacyOrientationContract: releasedOrientation);
             var derivedBytes = Encoding.UTF8.GetBytes(
                 $"derived:{profile.FirstPage}-{profile.LastPage}:");
             var derivedSha256 = Sha256(derivedBytes);
@@ -743,7 +648,7 @@ public sealed class TemplateGenerationUnitJobWorkerTests
                     derivedSha256,
                     rotations = Array.Empty<AppliedPageRotation>(),
                     instruction.Fingerprint,
-                    promptBundleHash = bundle.ContentHash,
+                    promptBundleHash = releasedOrientation ? ApprovedPromptBundleCatalog.LegacyTemplateExtractionContentHash : bundle.ContentHash,
                     bundle.PromptVersion,
                     bundle.SchemaVersion,
                     provider = taskProfile.AiConnection.Provider,
@@ -754,6 +659,33 @@ public sealed class TemplateGenerationUnitJobWorkerTests
                 },
                 WorkerJsonOptions);
             return Sha256(Encoding.UTF8.GetBytes(canonical));
+        }
+
+        public async Task SeedSavedRotationAsync()
+        {
+            await SeedExpiredDispatchingRunAsync(37);
+            await using var db = await CreateDbContextAsync();
+            var unit = await db.TemplateGenerationUnits.SingleAsync();
+            var request = await db.AiRequests.SingleAsync();
+            var profile = await db.AiTaskProfiles.SingleAsync();
+            var job = await db.BackgroundJobs.SingleAsync();
+            job.AttemptCount = 0;
+            var json = JsonSerializer.Serialize(new
+            {
+                schema_version = "template_extract_v6", request_key = request.RequestKey, action = "rotate",
+                orientation = new { pages = new[] { new { page_id = $"{unit.Id}:page:1", clockwise_degrees_to_upright = 90, confidence = 0.99 } } },
+                metadata = (object?)null, pages = Array.Empty<object>(),
+            });
+            request.State = "succeeded";
+            request.InputManifestHash = await GetLegacyFirstPassHashAsync(request.RequestKey, releasedOrientation: true);
+            request.CreatedAt = (await db.AiConnections.SingleAsync()).UpdatedAt.AddSeconds(1);
+            request.ValidatedResponseJson = json;
+            request.AcceptedResponseHash = Sha256(Encoding.UTF8.GetBytes(json));
+            profile.PromptContentHash = ApprovedPromptBundleCatalog.LegacyTemplateExtractionContentHash;
+            // The pre-connection-binding format compares the approved profile revision.
+            await db.SaveChangesAsync();
+            request.TaskProfileRevision = profile.Revision;
+            await db.SaveChangesAsync();
         }
 
         public async Task SeedExpiredDispatchingRunAsync(long reservedUsdMicros)
@@ -1078,9 +1010,15 @@ public sealed class TemplateGenerationUnitJobWorkerTests
             {
                 page_id = pageId,
                 clockwise_degrees_to_upright =
-                    action == ProviderAction.Rotate ? 90 : 0,
+                    action switch
+                    {
+                        ProviderAction.Rotate or ProviderAction.RotatedExtraction => 90,
+                        ProviderAction.CounterRotatedExtraction => 270,
+                        _ => 0,
+                    },
                 confidence = 0.99,
             }).ToArray();
+            var questionCount = action == ProviderAction.Embedded ? 3 : 1;
             object[] pages = action == ProviderAction.Rotate
                 ? []
                 :
@@ -1089,8 +1027,8 @@ public sealed class TemplateGenerationUnitJobWorkerTests
                     {
                         source_id = sourceId,
                         page_number = 1,
-                        detected_answer_slot_count = action == ProviderAction.EmbeddedFour ? 4 : action == ProviderAction.Embedded ? 3 : action == ProviderAction.EmbeddedOmitted ? 2 : 1,
-                        questions = Enumerable.Range(1, action == ProviderAction.EmbeddedFour ? 4 : action == ProviderAction.Embedded ? 3 : action == ProviderAction.EmbeddedOmitted ? 2 : 1)
+                        detected_answer_slot_count = questionCount,
+                        questions = Enumerable.Range(1, questionCount)
                             .Select(index => new
                             {
                                 source_key = $"page-1-slot-{index}",
@@ -1098,11 +1036,11 @@ public sealed class TemplateGenerationUnitJobWorkerTests
                                 major_question_label = (string?)null,
                                 middle_question_label = "設問",
                                 minor_question_label = index.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                                question_text = action is ProviderAction.Embedded or ProviderAction.EmbeddedOmitted or ProviderAction.EmbeddedFour ? "1 + 1 は［　］です。" : "1 + 1 はいくつですか。",
+                                question_text = action == ProviderAction.Embedded ? "1 + 1 は［　］です。" : "1 + 1 はいくつですか。",
                                 answer_slot_ordinal = index,
                                 answer_slot_count = 1,
                                 filled_answer_removed = action != ProviderAction.BadRemoval,
-                                is_embedded_fill_blank = action is ProviderAction.Embedded or ProviderAction.EmbeddedOmitted or ProviderAction.EmbeddedFour,
+                                is_embedded_fill_blank = action == ProviderAction.Embedded,
                                 question_type = "numeric",
                                 expected_answer = "2",
                                 answer_provenance = "ai_proposed",
@@ -1149,14 +1087,22 @@ public sealed class TemplateGenerationUnitJobWorkerTests
 
     private sealed class RecordingPageRangeExtractor : IPdfPageRangeExtractor
     {
+        private static readonly string[] Sides = ["left", "right"];
         public List<IReadOnlyDictionary<int, int>> Calls { get; } = [];
+        public bool SupplyBookSpread { get; set; }
 
         public Task<DerivedPdfResult> ExtractAsync(
+            Stream source, string sourceName, int firstPage, int lastPage,
+            IReadOnlyDictionary<int, int> rotations, CancellationToken cancellationToken = default) =>
+            ExtractForProviderAsync(source, sourceName, firstPage, lastPage, rotations, 0, cancellationToken);
+
+        public Task<DerivedPdfResult> ExtractForProviderAsync(
             Stream source,
             string sourceName,
             int firstPage,
             int lastPage,
             IReadOnlyDictionary<int, int> rotations,
+            int maximumProviderMediaBytes,
             CancellationToken cancellationToken = default)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -1181,7 +1127,17 @@ public sealed class TemplateGenerationUnitJobWorkerTests
                 lastPage - firstPage + 1,
                 firstPage,
                 lastPage,
-                applied));
+                applied)
+            {
+                BookSpreadDetails = SupplyBookSpread && maximumProviderMediaBytes > 0
+                    ? Sides.Select(side =>
+                    {
+                        var image = Encoding.UTF8.GetBytes(side);
+                        return new BookSpreadDetail(firstPage, side, new ImageArtifact(
+                            "image/jpeg", "jpg", 800, 1200, image, Sha256(image)));
+                    }).ToArray()
+                    : [],
+            });
         }
     }
 

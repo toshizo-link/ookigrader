@@ -7,6 +7,7 @@ import {
 } from "react";
 import { Link, useNavigate, useParams } from "../router";
 import { Icon } from "../components/Icon";
+import { GradingModeField, useNewSessionGradingMode } from "../components/GradingModeField";
 import { TemplateSessionMetadata } from "../components/TemplateSessionMetadata";
 import { PassCriteriaEditor, type PassCriteria } from "../components/PassCriteriaEditor";
 import {
@@ -31,6 +32,7 @@ import {
 import type {
   AnswerVariant,
   PagedResponse,
+  SessionGradingMode,
   TemplateQuestion,
   TemplateSource,
   TemplateSummary,
@@ -84,6 +86,7 @@ interface PendingPublishReceptionRequest {
   body: {
     revision: number;
     testDate: string | null;
+    gradingMode: SessionGradingMode;
     classLabel?: string;
   };
   etag: string;
@@ -560,6 +563,7 @@ export function TemplateEditorPage() {
   const [validating, setValidating] = useState(false);
   const [showAllQuestions, setShowAllQuestions] = useState(true);
   const [receptionOpen, setReceptionOpen] = useState(false);
+  const { gradingMode, setGradingMode, batchAvailability } = useNewSessionGradingMode(receptionOpen);
   const [startingReception, setStartingReception] = useState(false);
   const [receptionDetails, setReceptionDetails] = useState({
     testDate: "",
@@ -925,6 +929,7 @@ export function TemplateEditorPage() {
     receptionIdempotencyKeyRef.current = "";
     pendingPublishReceptionRef.current = undefined;
     setReceptionOpen(false);
+    setGradingMode(undefined);
   }
 
   async function prepareReception() {
@@ -980,6 +985,8 @@ export function TemplateEditorPage() {
   }
 
   async function startReception() {
+    if (startingReception || (gradingMode === "batch" && batchAvailability !== "ready")) return;
+    setGradingMode(gradingMode);
     setStartingReception(true);
     setActionError(undefined);
     try {
@@ -995,6 +1002,7 @@ export function TemplateEditorPage() {
             testDate: receptionDetails.testDate || null,
             classLabel: receptionDetails.classLabel.trim() || undefined,
             openImmediately: true,
+            gradingMode,
           },
           { idempotencyKey },
         );
@@ -1010,6 +1018,7 @@ export function TemplateEditorPage() {
           request = {
             body: {
               revision: latest.revision,
+              gradingMode,
               testDate: receptionDetails.testDate || null,
               classLabel: receptionDetails.classLabel.trim() || undefined,
             },
@@ -1605,7 +1614,7 @@ export function TemplateEditorPage() {
             </Button>
             <Button
               onClick={() => void startReception()}
-              disabled={startingReception}
+              disabled={startingReception || (gradingMode === "batch" && batchAvailability !== "ready")}
             >
               {startingReception ? "開始しています…" : "受付を開始"}
             </Button>
@@ -1614,6 +1623,12 @@ export function TemplateEditorPage() {
       >
         <div className="session-form">
           <TemplateSessionMetadata template={template} />
+          <GradingModeField value={gradingMode} availability={batchAvailability}
+            disabled={startingReception} onChange={(value) => {
+              receptionIdempotencyKeyRef.current = "";
+              pendingPublishReceptionRef.current = undefined;
+              setGradingMode(value);
+            }} />
           <div className="form-grid form-grid--2">
             <Field
               label="実施日（任意）"
@@ -1658,7 +1673,7 @@ export function TemplateEditorPage() {
           </div>
           <InlineAlert tone="info">
             <p>
-              試験名・教科・学年・カテゴリ・コースはひな形から引き継がれます。試験情報や処理方法を入力し直す必要はありません。
+              試験名・教科・学年・カテゴリ・コースはひな形から引き継がれます。
             </p>
           </InlineAlert>
         </div>

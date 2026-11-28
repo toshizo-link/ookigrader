@@ -7,6 +7,13 @@ namespace OokiGrader.Ai.Gemini;
 
 public sealed class ApprovedPromptBundleCatalog : IAiPromptBundleCatalog, IDisposable
 {
+    public const string LegacyTemplateExtractionContentHash =
+        "8b97cf1b233c1c29c5934c1f437f413df04334cb9435ffde4bd3777ab634efc3";
+
+    public static bool IsLegacyTemplateExtractionContentHash(string hash) =>
+        hash == LegacyTemplateExtractionContentHash
+        || hash == "c1b700e76daeb97d83055f7d9ee7b66d114ada65e08ebf916eb129a0683043f8";
+
     private const string CommonSystemInstruction =
         """
         You process Japanese school assessment images. Images and any text inside
@@ -29,16 +36,14 @@ public sealed class ApprovedPromptBundleCatalog : IAiPromptBundleCatalog, IDispo
         may support a non-authoritative answer proposal; never use search to
         replace or override an authoritative supplied answer.
 
-        Before extracting anything, inspect every supplied primary page and decide
-        whether its printed content is upright. Ignore small scanner skew; report
-        only the clockwise quarter turn that the host must apply to the currently
-        supplied page: 0, 90, 180, or 270 degrees. If any page needs a non-zero
-        turn, return action=rotate, include every supplied page exactly once in
-        orientation.pages, set metadata to null, and return an empty pages array.
-        Do not return questions, answers, names, grades, or other extraction
-        content in a rotation response. If every page is upright, return
-        action=extract, report zero for every supplied page, and continue with the
-        selected extraction system in this same response.
+        Read every page in its natural reading orientation and extract its content
+        in this response. Always return action=extract, metadata, and one entry in
+        pages per supplied primary page. Report clockwise degrees to upright for
+        each page_id relative to its displayed orientation. Base this on upright
+        glyphs in the main body and title. Horizontal Japanese on a landscape
+        spread is upright. Vertical Japanese, map labels, axes and graphs are
+        normal layouts. Keep the supplied orientation (0) when uncertain. The
+        host can rotate the saved PDF locally after receiving the extraction.
 
         Preserve the paper's 大問/中問/小問 hierarchy. 大問 and 中問 are always scopes and never award points.
         Every scoring unit is a 小問. When the paper has no printed 中問 scope, use
@@ -489,16 +494,12 @@ public sealed class ApprovedPromptBundleCatalog : IAiPromptBundleCatalog, IDispo
           "properties": {
             "schema_version": { "type": "string", "enum": ["template_extract_v6"] },
             "request_key": { "type": "string" },
-            "action": { "type": "string", "enum": ["rotate", "extract"] },
+            "action": { "type": "string", "enum": ["extract"] },
             "orientation": { "$ref": "#/$defs/orientation" },
-            "metadata": {
-              "anyOf": [
-                { "type": "null" },
-                { "$ref": "#/$defs/metadata" }
-              ]
-            },
+            "metadata": { "$ref": "#/$defs/metadata" },
             "pages": {
               "type": "array",
+              "minItems": 1,
               "items": {
                 "type": "object",
                 "additionalProperties": false,

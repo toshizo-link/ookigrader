@@ -4865,6 +4865,41 @@ export type paths = {
         readonly patch?: never;
         readonly trace?: never;
     };
+    readonly "/api/v1/admin/ai-connections/{connectionId}:test-batch": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        readonly post: {
+            readonly parameters: {
+                readonly query?: never;
+                readonly header?: never;
+                readonly path: {
+                    readonly connectionId: string;
+                };
+                readonly cookie?: never;
+            };
+            readonly requestBody?: never;
+            readonly responses: {
+                /** @description OK */
+                readonly 200: {
+                    headers: {
+                        readonly [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
     readonly "/api/v1/admin/ai-task-profiles": {
         readonly parameters: {
             readonly query?: never;
@@ -5752,6 +5787,7 @@ export type components = {
             readonly course: null | string;
             readonly priority: null | string;
             readonly openImmediately: null | boolean;
+            readonly gradingMode?: null | string;
         };
         readonly CreateStaffRequest: {
             readonly username: string;
@@ -5948,6 +5984,7 @@ export type components = {
             readonly instance?: null | string;
         };
         readonly PublishTemplateApiRequest: {
+            readonly gradingMode?: null | string;
             /** Format: int64 */
             readonly revision?: null | number | string;
             /** Format: date */
@@ -6038,6 +6075,7 @@ export type components = {
             /** Format: int64 */
             readonly revision: null | number | string;
             readonly testAndEnable: null | boolean;
+            readonly initialGradingMediaResolution?: null | string;
         };
         readonly SaveAiEvaluationRecordRequest: {
             readonly datasetVersion: string;
@@ -6114,9 +6152,10 @@ export type components = {
         /** @enum {unknown} */
         readonly TestType: "hop" | "step" | "classPlacement" | "other";
         readonly UpdateSessionBody: {
-            readonly priority: string;
+            readonly priority?: null | string;
             /** Format: int64 */
-            readonly revision: null | number | string;
+            readonly revision?: null | number | string;
+            readonly gradingMode?: null | string;
         };
         readonly UpdateStudentRequest: {
             readonly studentNumber: string;

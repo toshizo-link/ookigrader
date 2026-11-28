@@ -253,7 +253,7 @@ public sealed class GeminiTaskRoutingTests : IDisposable
     }
 
     [Fact]
-    public async Task QuotaFallbackPreservesTemplatePagesAndUsesHigherLiteReasoning()
+    public async Task QuotaFallbackPreservesTemplatePagesAndMediumThinking()
     {
         await Client(model => model == AiProviderCatalog.GeminiDefaultModelId ? Quota("60s") : Success())
             .GenerateAsync(Connection, Credential, Request(AiTaskTypes.TemplateExtraction));
@@ -263,7 +263,9 @@ public sealed class GeminiTaskRoutingTests : IDisposable
             after.RootElement.GetProperty("contents").GetRawText());
         Assert.Equal(before.RootElement.GetProperty("generationConfig").GetProperty("responseJsonSchema").GetRawText(),
             after.RootElement.GetProperty("generationConfig").GetProperty("responseJsonSchema").GetRawText());
-        Assert.Equal("HIGH", after.RootElement.GetProperty("generationConfig")
+        Assert.Equal("MEDIUM", before.RootElement.GetProperty("generationConfig")
+            .GetProperty("thinkingConfig").GetProperty("thinkingLevel").GetString());
+        Assert.Equal("MEDIUM", after.RootElement.GetProperty("generationConfig")
             .GetProperty("thinkingConfig").GetProperty("thinkingLevel").GetString());
     }
 
@@ -323,7 +325,7 @@ public sealed class GeminiTaskRoutingTests : IDisposable
                 var bytes = Encoding.UTF8.GetBytes("page " + index);
                 return new AiMediaPart("image/png", bytes, Convert.ToHexString(
                     System.Security.Cryptography.SHA256.HashData(bytes)).ToLowerInvariant());
-            }).ToArray(), ThinkingLevel: "MEDIUM");
+            }).ToArray(), ThinkingLevel: task == AiTaskTypes.TemplateExtraction ? "MEDIUM" : "LOW");
     }
 
     private static HttpResponseMessage Success() => new(HttpStatusCode.OK)

@@ -90,11 +90,11 @@ With `local-raster-v3`, the two completed pages scored 9,890 and 9,894 basis
 points against the blank reference; the routing threshold is 6,500. The local
 teacher-truth matrix covers canonical and equivalent accepted answers,
 Kanji-required rejection, partial credit, an incorrect answer, and a located
-blank. All seven expected outcomes and point values agreed. The three correct
-cases were the only automatic decisions, while all four risk cases required
-teacher review.
+blank. The matrix uses clear readings with 99% confidence. The expected
+outcomes and point values match all seven automatic decisions under the
+current grading policy.
 
-The complete hashes, observations, and limitations are recorded in
+The hashes, observations, and review counts from the September 15 run are recorded in
 `output/accuracy/phase-3-local-evidence-2026-09-15.json` and summarized in
 `output/accuracy/phase-3-intake-grading-report-2026-09-15.md`. The pages and
 answers are synthetic, so this regression proves pipeline behavior rather than

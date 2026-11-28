@@ -18,7 +18,7 @@ internal sealed record BuiltTemplateExtractionInstruction(
 /// </summary>
 internal static class TemplateExtractionInstructionBuilder
 {
-    public const string OrientationFragmentVersion = "orientation-gate-v1";
+    public const string OrientationFragmentVersion = "orientation-with-extraction-v2";
     public const string CommonFragmentVersion = "common-extraction-core-v6";
     public const string StandardFragmentVersion = "system-1-standard-v2";
     public const string ClassPlacementFragmentVersion =
@@ -26,7 +26,19 @@ internal static class TemplateExtractionInstructionBuilder
     public const string FillBlankFragmentVersion = "system-3-fill-blank-v2";
     public const string MetadataFragmentVersion = "paper-name-and-grade-v1";
 
-    private const string OrientationGate =
+    private const string OrientationInstruction =
+        """
+        PAGE ORIENTATION AND EXTRACTION (orientation-with-extraction-v2)
+        Read each page upright now, even if the scan is sideways. Always submit
+        action=extract with the complete inventory, metadata and questions in
+        this response. Report any clockwise quarter turn the host should apply to
+        the saved page. Judge the baseline and upright glyphs of the main body
+        and title. A landscape Japanese two-page spread with upright horizontal
+        text needs 0 degrees. Vertical Japanese columns, map labels, graphs,
+        and paper dimensions alone never justify rotation. When unsure, use 0.
+        """;
+
+    private const string LegacyOrientationGate =
         """
         ORIENTATION GATE (orientation-gate-v1)
         Inspect every primary page before extracting content. Ignore small scanner
@@ -177,6 +189,23 @@ internal static class TemplateExtractionInstructionBuilder
         do not replace other slots in the same context with additional blanks.
         """;
 
+    private const string PageCoverage =
+        """
+        WHOLE-SHEET COVERAGE
+        Before writing question 1, locate the last scored item in every printed
+        panel and the end of each numbered section, including continuations
+        across a gutter. Use these endpoints when tallying detected_answer_slot_count.
+        A sheet designated fillBlank may also contain written responses, graph
+        keys and short-answer lists. Include each of those scoring items.
+        For graphs, match each printed answer label to its own solution, even
+        when labels restart or appear out of alphabetical order. For a prompt
+        asking for several examples in one box, retain the requested number and
+        each distinct printed example as evidence for the teacher.
+        Keep each question_text concise while preserving the printed wording
+        needed to locate and grade that slot. Finish every section through its
+        final item. Use the paper's reading order within each panel.
+        """;
+
     private const string PaperMetadata =
         """
         PAPER NAME AND GRADE (paper-name-and-grade-v1)
@@ -193,7 +222,7 @@ internal static class TemplateExtractionInstructionBuilder
         string unitId,
         TemplateGenerationProfile profile,
         bool rotationsWereApplied,
-        string? qualityControlInstruction = null)
+        bool legacyOrientationContract = false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(requestKey);
         ArgumentException.ThrowIfNullOrWhiteSpace(unitId);
@@ -276,16 +305,16 @@ internal static class TemplateExtractionInstructionBuilder
         });
         var instruction = string.Join(
             "\n\n",
-            OrientationGate,
+            legacyOrientationContract ? LegacyOrientationGate : OrientationInstruction,
             CommonCore,
             selectedSystem,
             PaperMetadata,
-            qualityControlInstruction ?? string.Empty,
+            legacyOrientationContract ? string.Empty : PageCoverage,
             "IMMUTABLE GENERATION CONTEXT AND REQUEST CONTRACT",
             requestContract);
         var fingerprintInput = string.Join(
             "\n",
-            OrientationFragmentVersion,
+            legacyOrientationContract ? "orientation-gate-v1" : OrientationFragmentVersion,
             CommonFragmentVersion,
             selectedVersion,
             MetadataFragmentVersion,

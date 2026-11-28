@@ -327,6 +327,7 @@ public sealed class TestSessionEntity : IRevisionedEntity, IUpdatedEntity
     public DateOnly? TestDate { get; set; }
     public string? Course { get; set; }
     public string? ClassLabel { get; set; }
+    public string GradingMode { get; set; } = "standard";
     public string Priority { get; set; } = "economy";
     public string State { get; set; } = "draft";
     public bool ExpectedRosterEnabled { get; set; }

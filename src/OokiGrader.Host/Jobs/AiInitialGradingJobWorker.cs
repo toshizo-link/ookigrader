@@ -1,8 +1,10 @@
 using System.Numerics;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Unicode;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using OokiGrader.Ai.Abstractions;
@@ -65,6 +67,10 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
     private const int MaximumUserInstructionCharacters = 100_000;
     private const int MaximumSystemInstructionCharacters = 20_000;
     private const int SerializedRequestEnvelopeReserveBytes = 1024 * 1024;
+    private static readonly JsonSerializerOptions GradingInstructionJson = new()
+    {
+        Encoder = JavaScriptEncoder.Create(UnicodeRanges.All),
+    };
     private static readonly JsonSerializerOptions PayloadSerializerOptions =
         new()
         {
@@ -81,7 +87,6 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
     private readonly ILogger<AiInitialGradingJobWorker> _logger;
     private readonly AiInitialGradingJobWorkerOptions _options;
     private readonly AiBatchRequestStager? _batchRequestStager;
-    private readonly AiAdjudicationJobScheduler? _adjudicationJobScheduler;
     private readonly string _workerId = $"gemini-grade-{Guid.NewGuid():N}";
 
     public AiInitialGradingJobWorker(
@@ -95,7 +100,6 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
         IOptions<AiInitialGradingJobWorkerOptions> options,
         ILogger<AiInitialGradingJobWorker> logger,
         AiBatchRequestStager? batchRequestStager = null,
-        AiAdjudicationJobScheduler? adjudicationJobScheduler = null,
         IAiProviderClientResolver? providerResolver = null,
         IAiProviderFeaturePolicy? providerFeaturePolicy = null)
     {
@@ -112,7 +116,6 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
         _logger = logger;
         _options = options.Value;
         _batchRequestStager = batchRequestStager;
-        _adjudicationJobScheduler = adjudicationJobScheduler;
         _options.Validate();
     }
 
@@ -162,17 +165,19 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
                     throw Blocked("ai_batch_stager_unavailable");
                 }
 
-                await _batchRequestStager.StageAsync(
+                var staged = await _batchRequestStager.StageAsync(
                         new AiBatchStageRequest(
                             claim.RequestId,
                             ComputeBatchCompatibilityKey(claim),
                             request,
                             claim.Priority,
-                            claim.CorrelationId),
+                            claim.CorrelationId,
+                            claim.Connection.ModelId),
                         cancellationToken)
                     .ConfigureAwait(false);
                 await CompleteStagedBatchJobAsync(
                         claim,
+                        staged.BatchRequestId,
                         cancellationToken)
                     .ConfigureAwait(false);
                 return true;
@@ -254,7 +259,8 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
                     .ValidateIdentityComponent(
                         response.StructuredOutput,
                         claim.RequestKey,
-                        identityExpected: claim.ChunkIndex == 0);
+                        identityExpected: claim.ChunkIndex == 0,
+                        compact: InitialGradingWire.IsCompact(claim.RequestKey));
                 await RecordInvalidResponseAsync(
                         claim,
                         response,
@@ -332,9 +338,17 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
         long profileRevision,
         string promptContentHash) =>
         $"submission:{submissionId}:gemini-analyze:{manifestHash}:" +
-        $"{profileId}:{profileRevision}:{promptContentHash}";
+        RootProfileKey(profileId, profileRevision, promptContentHash);
 
-    private Task EnsureQueuedJobsAsync(CancellationToken cancellationToken)
+    private static string RootProfileKey(string profileId, long revision, string promptHash) =>
+        $"{profileId}:{revision}:{promptHash}";
+
+    internal static IQueryable<AiRequestEntity> PendingInitialBatchRequests(OokiGraderDbContext db) =>
+        db.AiRequests.Where(request => request.EntityType == "submission"
+            && request.Purpose == AiTaskTypes.InitialGrading && request.BatchRequest != null
+            && (request.State == "prepared" || request.State == "response_ready"));
+
+    internal Task EnsureQueuedJobsAsync(CancellationToken cancellationToken)
     {
         return _writeCoordinator.ExecuteAsync(async token =>
         {
@@ -366,6 +380,8 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
                 return;
             }
 
+            var profileKey = RootProfileKey(profile.Id, profile.Revision, bundle.ContentHash);
+            var pendingBatch = PendingInitialBatchRequests(db);
             var eligible = await db.Submissions
                 .AsNoTracking()
                 .Where(item =>
@@ -375,22 +391,27 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
                     && item.PreprocessingCompletedAt != null
                     && item.PreprocessingManifestHash != null
                     && item.Pages.Any()
+                    && !pendingBatch.Any(request => request.EntityId == item.Id)
                     && !item.GradingRuns.Any(run =>
                         run.PipelineVersion == PipelineVersion
                         && run.State == "awaiting_identity")
                     && (item.State == "needs_name_review"
                         || item.State == "grading"
                         || item.State == "awaiting_grading"))
-                .OrderBy(item => item.UploadCompletedAt)
-                .ThenBy(item => item.Id)
-                .Take(_options.QueueBatchSize)
                 .Select(item => new
                 {
                     item.Id,
+                    item.UploadCompletedAt,
                     ManifestHash = item.PreprocessingManifestHash!,
+                    RootKey = "submission:" + item.Id + ":gemini-analyze:" + item.PreprocessingManifestHash + ":" + profileKey,
                     item.TestSession.TemplateVersionId,
                     item.TestSession.Priority,
+                    item.TestSession.GradingMode,
                 })
+                .Where(item => !db.BackgroundJobs.Any(job => job.DeduplicationKey == item.RootKey))
+                .OrderBy(item => item.UploadCompletedAt)
+                .ThenBy(item => item.Id)
+                .Take(_options.QueueBatchSize)
                 .ToArrayAsync(token)
                 .ConfigureAwait(false);
             if (eligible.Length == 0)
@@ -398,47 +419,22 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
                 return;
             }
 
-            var keys = eligible.Select(item => RootJobDeduplicationKey(
-                    item.Id,
-                    item.ManifestHash,
-                    profile.Id,
-                    profile.Revision,
-                    bundle.ContentHash))
-                .ToArray();
-            var existingKeys = await db.BackgroundJobs
-                .AsNoTracking()
-                .Where(item => keys.Contains(item.DeduplicationKey))
-                .Select(item => item.DeduplicationKey)
-                .ToArrayAsync(token)
-                .ConfigureAwait(false);
-            var existing = existingKeys.ToHashSet(StringComparer.Ordinal);
             var now = _timeProvider.GetUtcNow();
-            var queuedSubmissionIds = new List<string>(eligible.Length);
             foreach (var item in eligible)
             {
-                var key = RootJobDeduplicationKey(
-                    item.Id,
-                    item.ManifestHash,
-                    profile.Id,
-                    profile.Revision,
-                    bundle.ContentHash);
-                if (existing.Contains(key))
-                {
-                    continue;
-                }
-
                 db.BackgroundJobs.Add(new BackgroundJobEntity
                 {
                     Id = UlidId.New(now),
                     Type = JobType,
                     SchemaVersion = JobSchemaVersion,
-                    DeduplicationKey = key,
+                    DeduplicationKey = item.RootKey,
                     Priority = item.Priority == "expedite" ? 100 : 0,
                     PayloadJson = JsonSerializer.Serialize(new
                     {
                         submissionId = item.Id,
                         templateVersionId = item.TemplateVersionId,
                         manifestHash = item.ManifestHash,
+                        gradingMode = item.GradingMode,
                     }),
                     State = "queued",
                     MaxAttempts = 8,
@@ -447,32 +443,28 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
                     CreatedAt = now,
                     UpdatedAt = now,
                 });
-                queuedSubmissionIds.Add(item.Id);
             }
 
-            if (queuedSubmissionIds.Count > 0)
+            var nameJobPrefixes = eligible
+                .Select(item => $"submission:{item.Id}:name:")
+                .ToArray();
+            var legacyNameJobs = await db.BackgroundJobs
+                .Where(job => job.Type
+                        == AiNameTranscriptionJobWorker.JobType
+                    && (job.State == "queued"
+                        || job.State == "retry_waiting"))
+                .ToListAsync(token)
+                .ConfigureAwait(false);
+            foreach (var nameJob in legacyNameJobs.Where(job =>
+                         nameJobPrefixes.Any(prefix =>
+                             job.DeduplicationKey.StartsWith(
+                                 prefix,
+                                 StringComparison.Ordinal))))
             {
-                var nameJobPrefixes = queuedSubmissionIds
-                    .Select(id => $"submission:{id}:name:")
-                    .ToArray();
-                var legacyNameJobs = await db.BackgroundJobs
-                    .Where(job => job.Type
-                            == AiNameTranscriptionJobWorker.JobType
-                        && (job.State == "queued"
-                            || job.State == "retry_waiting"))
-                    .ToListAsync(token)
-                    .ConfigureAwait(false);
-                foreach (var nameJob in legacyNameJobs.Where(job =>
-                             nameJobPrefixes.Any(prefix =>
-                                 job.DeduplicationKey.StartsWith(
-                                     prefix,
-                                     StringComparison.Ordinal))))
-                {
-                    nameJob.State = "cancelled";
-                    nameJob.CompletedAt = now;
-                    nameJob.ErrorCode = "superseded_by_submission_analysis";
-                    nameJob.SafeErrorDetail = null;
-                }
+                nameJob.State = "cancelled";
+                nameJob.CompletedAt = now;
+                nameJob.ErrorCode = "superseded_by_submission_analysis";
+                nameJob.SafeErrorDetail = null;
             }
 
             await db.SaveChangesAsync(token).ConfigureAwait(false);
@@ -555,6 +547,7 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
             var payload = DeserializePayload(lease.PayloadJson);
             if (string.IsNullOrWhiteSpace(payload.SubmissionId)
                 || string.IsNullOrWhiteSpace(payload.TemplateVersionId)
+                || payload.GradingMode is not (null or "standard" or "batch")
                 || !IsSha256(payload.ManifestHash)
                 || (lease.Type == ApplyJobType
                     && string.IsNullOrWhiteSpace(payload.AiRequestId))
@@ -673,6 +666,46 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
                     page,
                     submission.PreprocessingManifestHash!))
                 .ToArray();
+            AiRequestEntity? runAnchor = null;
+            if (applyRequestSnapshot is null && submission.CurrentGradingRunId is null)
+            {
+                // Continuations written before the upgrade have no anchor in their payload.
+                // Match a paid chunk to the full current paper before borrowing its profile.
+                var priorChunks = await db.AiRequests.AsNoTracking()
+                    .Include(item => item.AiTaskProfile).ThenInclude(item => item.AiConnection)
+                    .Where(item => item.EntityType == "submission" && item.EntityId == submission.Id
+                        && item.Purpose == AiTaskTypes.InitialGrading && item.State == "succeeded"
+                        && (payload.ContinuationOfRequestId != null ? item.Id == payload.ContinuationOfRequestId
+                            : item.AiTaskProfileId != profile.Id || item.TaskProfileRevision != profile.Revision))
+                    .OrderByDescending(item => item.CreatedAt).ToListAsync(token).ConfigureAwait(false);
+                foreach (var prior in priorChunks)
+                {
+                    var historicalHash = ComputeInputManifestHash(submission, version, prior.AiTaskProfileId,
+                        prior.TaskProfileRevision, bundle, questions, artifactSnapshots);
+                    var historicalChunks = CreateArtifactChunks(historicalHash, artifactSnapshots, questionSnapshots,
+                        bundle, prior.AiTaskProfile.AiConnection.Provider);
+                    if (!historicalChunks.Any(chunk => chunk.InputManifestHash == prior.InputManifestHash)) continue;
+                    runAnchor = prior;
+                    break;
+                }
+                if (payload.ContinuationOfRequestId is not null && runAnchor is null)
+                    throw Blocked("ai_initial_profile_snapshot_invalid");
+                if (runAnchor is not null && (profile.Id != runAnchor.AiTaskProfileId
+                    || profile.Revision != runAnchor.TaskProfileRevision))
+                {
+                    var historical = runAnchor.AiTaskProfile;
+                    if (historical.AiConnectionId != profile.AiConnectionId || historical.ModelId != profile.ModelId
+                        || !GeminiBatchEligibility.IsRetiredRunProfile(historical, runAnchor.TaskProfileRevision))
+                        throw Blocked("ai_initial_profile_snapshot_invalid");
+                    ValidateProfile(historical, bundle, continuingRun: true);
+                    profile = historical;
+                    profileRevisionSnapshot = runAnchor.TaskProfileRevision;
+                }
+                if (await PendingInitialBatchRequests(db).AnyAsync(item => item.EntityId == submission.Id
+                    && (item.AiTaskProfileId != profile.Id || item.TaskProfileRevision != profileRevisionSnapshot),
+                    token).ConfigureAwait(false))
+                    throw Blocked("ai_batch_previous_profile_in_progress");
+            }
             var inputManifestHash = ComputeInputManifestHash(
                 submission,
                 version,
@@ -685,7 +718,8 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
                 inputManifestHash,
                 artifactSnapshots,
                 questionSnapshots,
-                bundle);
+                bundle,
+                executionProvider);
             var existingRun = submission.GradingRuns.SingleOrDefault(
                 run => run.PipelineVersion == PipelineVersion
                     && run.CanonicalInputManifestHash == inputManifestHash);
@@ -802,7 +836,6 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
                         inputManifestHash,
                         completedChunks,
                         lease.CorrelationId,
-                        job,
                         now,
                         token)
                     .ConfigureAwait(false);
@@ -861,7 +894,7 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
 
                 if (requestEntity.State == "response_ready")
                 {
-                    if (profile.ProcessingStrategy != "gemini_batch"
+                    if (!GeminiBatchEligibility.IsBatchRequest(requestEntity, profile)
                         || requestEntity.BatchRequest?.State
                             != "response_ready")
                     {
@@ -907,11 +940,18 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
                 throw Permanent("ai_grading_submission_state_invalid");
             }
 
+            var gradingMode = requestEntity?.GradingMode ?? runAnchor?.GradingMode
+                ?? (runAnchor is not null && runAnchor.AiTaskProfile.ProcessingStrategy == "gemini_batch" ? "batch" : null)
+                ?? ResolveGradingMode(payload, submission.TestSession, profile, requestEntity?.BatchRequest);
+            if (gradingMode == "batch" && !GeminiBatchEligibility.CanDispatch(profile, continuingRun: runAnchor is not null && !profile.Active))
+                throw Blocked("ai_batch_connection_not_ready");
+
             requestEntity ??= CreateRequest(
                 now,
                 submission,
                 profile,
-                selectedChunk.InputManifestHash);
+                selectedChunk.InputManifestHash, gradingMode, profileRevisionSnapshot, runAnchor?.RequestKey);
+            requestEntity.GradingMode ??= gradingMode;
             if (requestEntity.Id.Length == 0)
             {
                 throw Permanent("ai_request_identity_invalid");
@@ -943,7 +983,7 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
                     pricing,
                     profile.MaxOutputTokens,
                     instruction,
-                    selectedChunk.Artifacts);
+                    selectedChunk.Artifacts, gradingMode == "batch");
             var usageWindow = await GetUsageWindowAsync(db, now, token)
                 .ConfigureAwait(false);
 
@@ -1063,6 +1103,18 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
         }, cancellationToken);
     }
 
+    private static string ResolveGradingMode(GradingPayload payload, TestSessionEntity session,
+        AiTaskProfileEntity profile, AiBatchRequestEntity? staged)
+    {
+        if (staged is not null) return "batch";
+        if (payload.ForceExpedite) return "standard";
+        if (payload.GradingMode is not null) return payload.GradingMode;
+
+        // Preserve routing for jobs written before the per-test selection existed.
+        return session.Priority != "expedite" && profile.ProcessingStrategy == "gemini_batch"
+            ? "batch" : "standard";
+    }
+
     private static PreparedClaim CreatePreparedClaim(
         JobLease lease,
         SubmissionEntity submission,
@@ -1085,12 +1137,10 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
             ?? profile.AiConnection.Provider;
         var modelId = batchSnapshot?.ModelId
             ?? profile.AiConnection.ModelId;
-        var processingStrategy = batchSnapshot is not null
+        var processingStrategy = batchSnapshot is not null || request.GradingMode == "batch"
             ? "gemini_batch"
-            : forceExpedite
-                || submission.TestSession.Priority == "expedite"
-                ? "expedite_standard"
-                : profile.ProcessingStrategy;
+            : forceExpedite || submission.TestSession.Priority == "expedite"
+                ? "expedite_standard" : "queued_standard";
         return new PreparedClaim(
             lease.Id,
             lease.CorrelationId,
@@ -1108,7 +1158,8 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
             inputManifestHash,
             profile.MaxOutputTokens,
             ToMediaResolution(profile.MediaResolution),
-            AiProviderRuntime.ToProviderThinkingLevel(profile.ThinkingLevel),
+            batchSnapshot is null && profile.Active ? AiProviderRuntime.CurrentProviderThinkingLevel(profile)
+                : AiProviderRuntime.ToProviderThinkingLevel(profile.ThinkingLevel),
             profile.AiConnection.SecretReference,
             new AiConnectionSettings(
                 profile.AiConnection.Id,
@@ -1194,7 +1245,8 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
         string canonicalInputManifestHash,
         IReadOnlyList<ArtifactSnapshot> artifacts,
         IReadOnlyList<QuestionSnapshot> questions,
-        AiPromptBundle bundle)
+        AiPromptBundle bundle,
+        string provider)
     {
         var groups = new List<IReadOnlyList<ArtifactSnapshot>>();
         var current = new List<ArtifactSnapshot>();
@@ -1207,7 +1259,7 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
             .ThenBy(item => item.Id, StringComparer.Ordinal)
             .ToArray();
         var conservativeInstruction = CreateUserInstruction(
-            $"grade_{new string('0', 26)}",
+            InitialGradingWire.RequestKey(new string('0', 26), provider),
             questions,
             maximumInstructionArtifacts,
             chunkIndex: 199,
@@ -1391,15 +1443,18 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
         int chunkIndex,
         int mediaPartCount)
     {
+        var compact = InitialGradingWire.IsCompact(expectedRequestKey);
         var identity = AiGradingResponseValidator.ValidateIdentityComponent(
             response,
             expectedRequestKey,
-            identityExpected: chunkIndex == 0);
+            identityExpected: chunkIndex == 0,
+            compact: compact);
         var grading = AiGradingResponseValidator.Validate(
             response,
             expectedRequestKey,
             questions,
-            mediaPartCount);
+            mediaPartCount,
+            compact: compact);
         return grading with
         {
             Identity = identity.Transcription,
@@ -1472,11 +1527,12 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
             throw Permanent("ai_submission_page_count_mismatch");
         }
 
+        var compact = InitialGradingWire.IsCompact(claim.RequestKey);
         return new AiProviderRequest(
             claim.RequestKey,
             AiTaskTypes.InitialGrading,
             claim.Bundle.PromptVersion,
-            claim.Bundle.SchemaVersion,
+            compact ? AiGradingResponseValidator.CompactSchemaVersion : claim.Bundle.SchemaVersion,
             claim.Bundle.SystemInstruction,
             CreateUserInstruction(
                 claim.RequestKey,
@@ -1484,7 +1540,9 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
                 claim.Artifacts,
                 claim.ChunkIndex,
                 claim.Chunks.Count),
-            BindQuestionIds(claim.Bundle.ResponseJsonSchema, claim.Questions.Select(question => question.Id)),
+            compact
+                ? InitialGradingWire.ResponseSchema(claim.Bundle.ResponseJsonSchema, claim.Questions.Count)
+                : BindQuestionIds(claim.Bundle.ResponseJsonSchema, claim.Questions.Select(question => question.Id)),
             media,
             claim.MaxOutputTokens,
             claim.MediaResolution,
@@ -1537,7 +1595,8 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
             var identity = AiGradingResponseValidator.ValidateIdentityComponent(
                 stored.Response.StructuredOutput,
                 claim.RequestKey,
-                identityExpected: claim.ChunkIndex == 0);
+                identityExpected: claim.ChunkIndex == 0,
+                compact: InitialGradingWire.IsCompact(claim.RequestKey));
             await RecordInvalidStoredResponseAsync(
                     claim,
                     BoundedErrorCode(exception.Message),
@@ -1560,6 +1619,7 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
 
     private Task CompleteStagedBatchJobAsync(
         PreparedClaim claim,
+        string batchRequestId,
         CancellationToken cancellationToken)
     {
         return _writeCoordinator.ExecuteAsync(async token =>
@@ -1570,15 +1630,10 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
             var now = _timeProvider.GetUtcNow();
             var job = await LoadOwnedJobAsync(db, claim.JobId, token)
                 .ConfigureAwait(false);
-            var request = await db.AiRequests
-                .Include(item => item.BatchRequest)
-                .SingleOrDefaultAsync(
-                    item => item.Id == claim.RequestId,
-                    token)
-                .ConfigureAwait(false)
-                ?? throw Permanent("ai_request_missing");
-            if (request.State != "prepared"
-                || request.BatchRequest?.State != "ready")
+            // The batch processor may already have advanced this exact mapping.
+            if (!await db.AiBatchRequests.AnyAsync(
+                    item => item.Id == batchRequestId && item.AiRequestId == claim.RequestId
+                        && item.RequestKey == claim.RequestKey, token).ConfigureAwait(false))
             {
                 throw Permanent("ai_batch_staging_state_invalid");
             }
@@ -1588,12 +1643,12 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
             {
                 Id = UlidId.New(now),
                 AggregateType = "aiRequest",
-                AggregateId = request.Id,
+                AggregateId = claim.RequestId,
                 EventType = "ai.request.batch_staged",
                 SchemaVersion = 1,
                 PayloadJson = JsonSerializer.Serialize(new
                 {
-                    aiRequestId = request.Id,
+                    aiRequestId = claim.RequestId,
                     submissionId = claim.SubmissionId,
                 }),
                 CorrelationId = claim.CorrelationId,
@@ -1643,9 +1698,15 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
             var job = await LoadOwnedJobAsync(db, claim.JobId, token)
                 .ConfigureAwait(false);
             var request = await db.AiRequests
+                .Include(item => item.AiTaskProfile).ThenInclude(profile => profile.AiConnection)
                 .SingleOrDefaultAsync(item => item.Id == claim.RequestId, token)
                 .ConfigureAwait(false)
                 ?? throw Permanent("ai_request_missing");
+            var profile = request.AiTaskProfile;
+            if (profile.AiConnection.State != "active"
+                || profile.AiConnection.CredentialRevision != claim.ConnectionRevision
+                || profile.AiConnection.ModelId != claim.Connection.ModelId)
+                throw Blocked("ai_initial_profile_not_approved");
             if (request.PossibleDuplicate
                 || request.State is not ("prepared" or "retry_waiting")
                 || request.DispatchAttempt >= 8)
@@ -1793,7 +1854,6 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
                         claim.CanonicalInputManifestHash,
                         completedChunks,
                         claim.CorrelationId,
-                        job,
                         now,
                         token)
                     .ConfigureAwait(false);
@@ -1813,7 +1873,8 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
                             claim.SubmissionId,
                             claim.TemplateVersionId,
                             claim.Artifacts[0].InputManifestHash,
-                            ForceExpedite: claim.ForceExpedite),
+                            ForceExpedite: claim.ForceExpedite,
+                            GradingMode: claim.ProcessingStrategy == "gemini_batch" ? "batch" : "standard"),
                         claim.CanonicalInputManifestHash,
                         claim.Chunks,
                         completedChunks,
@@ -1875,6 +1936,8 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
                 templateVersionId = payload.TemplateVersionId,
                 manifestHash = payload.ManifestHash,
                 forceExpedite = payload.ForceExpedite,
+                gradingMode = payload.GradingMode,
+                continuationOfRequestId = completedChunks.OrderBy(chunk => chunk.Index).First().RequestId,
             }),
             State = "queued",
             AttemptCount = 0,
@@ -1887,7 +1950,7 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
         });
     }
 
-    private async Task CreateGradingRunAsync(
+    private static async Task CreateGradingRunAsync(
         OokiGraderDbContext db,
         SubmissionEntity submission,
         string templateVersionId,
@@ -1899,7 +1962,6 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
         string canonicalInputManifestHash,
         IReadOnlyList<CompletedChunk> completedChunks,
         string? correlationId,
-        BackgroundJobEntity job,
         DateTimeOffset now,
         CancellationToken cancellationToken)
     {
@@ -2126,47 +2188,8 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
 
         await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
 
-        var aggregateResponse = new ValidatedAiGradingResponse(
-            $"aggregate_{canonicalInputManifestHash}",
-            unique.Values
-                .OrderBy(item => item.Chunk.Index)
-                .Select(item => item.Observation)
-                .ToArray(),
-            unexpectedContent || conflicts.Count > 0);
         var identityConfirmed = submission.AssignedStudentId is not null
             || IsExplicitlyUnidentified(submission);
-        if (_adjudicationJobScheduler is not null)
-        {
-            await _adjudicationJobScheduler.EnqueueAmbiguousAsync(
-                    db,
-                    submission,
-                    run,
-                    results.Select(item => item.Result).ToArray(),
-                    aggregateResponse,
-                    questions
-                        .Select(item => new AiAdjudicationArtifactCandidate(
-                            item.Id,
-                            ProviderDisclosureAllowed: true))
-                        .ToArray(),
-                    correlationId,
-                    job.Id,
-                    now,
-                    cancellationToken)
-                .ConfigureAwait(false);
-            if (!identityConfirmed)
-            {
-                foreach (var adjudicationJob in db.BackgroundJobs.Local.Where(
-                             item => item.Type
-                                    == AiAdjudicationJobWorker.JobType
-                                 && item.CausationId == job.Id
-                                 && item.State == "queued"))
-                {
-                    adjudicationJob.State = "blocked";
-                    adjudicationJob.ErrorCode = "awaiting_identity";
-                }
-            }
-        }
-
         run.EarnedPointsMilli = results.Aggregate(
             0L,
             static (total, item) => checked(total + item.Points));
@@ -2786,10 +2809,11 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
 
     private static void ValidateProfile(
         AiTaskProfileEntity profile,
-        AiPromptBundle bundle)
+        AiPromptBundle bundle,
+        bool continuingRun = false)
     {
         if (profile.TaskType != AiTaskTypes.InitialGrading
-            || !profile.Active
+            || (!profile.Active && !continuingRun)
             || !AiTaskProfileRuntimePolicy.IsReadyApprovalState(
                 profile.ApprovalState)
             || !AiProviderCatalog.IsSupportedProvider(
@@ -2805,21 +2829,10 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
             || profile.AiConnection.LastCapabilityProbeState != "passed"
             || profile.ConnectionRevision
                 != profile.AiConnection.CredentialRevision
-            || (profile.ProcessingStrategy == "gemini_batch"
-                && (profile.AiConnection.Provider != AiProviders.GeminiDirect
-                    || profile.ModelId != profile.AiConnection.ModelId
-                    || profile.AiConnection
-                        .LastBatchCapabilityProbeState != "passed"
-                    || profile.AiConnection
-                            .LastBatchCapabilityProbeCredentialRevision
-                        != profile.AiConnection.CredentialRevision))
             || profile.PromptVersion != bundle.PromptVersion
             || profile.SchemaVersion != bundle.SchemaVersion
             || profile.PromptContentHash != bundle.ContentHash
-            || profile.ThinkingLevel != AiProviderRuntime.DefaultThinkingLevel(
-                profile.AiConnection.Provider,
-                profile.ModelId,
-                profile.TaskType)
+            || profile.ThinkingLevel is not ("medium" or "low" or "minimal")
             || profile.ProcessingStrategy is not (
                 "queued_standard" or "expedite_standard" or "gemini_batch"))
         {
@@ -2849,16 +2862,13 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
             || !AiProviderCatalog.SupportsImageTasks(
                 batch.Provider,
                 batch.ModelId)
-            || profile.ProcessingStrategy != "gemini_batch"
+            || !GeminiBatchEligibility.IsBatchRequest(request, profile)
             || !AiTaskProfileRuntimePolicy.IsReadyApprovalState(
                 profile.ApprovalState)
             || profile.PromptVersion != bundle.PromptVersion
             || profile.SchemaVersion != bundle.SchemaVersion
             || profile.PromptContentHash != bundle.ContentHash
-            || profile.ThinkingLevel != AiProviderRuntime.DefaultThinkingLevel(
-                batch.Provider,
-                batch.ModelId,
-                profile.TaskType))
+            || profile.ThinkingLevel is not ("medium" or "low" or "minimal"))
         {
             throw Blocked("ai_initial_profile_snapshot_invalid");
         }
@@ -3052,9 +3062,19 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
             .Append('\n');
     }
 
+    private const string GradingConfidenceInstruction =
+        """
+        Confidence measures how sure you are of your reading and grade, including when the answer is wrong or blank.
+        Report it on a 0 to 1 scale. The host flags results below 0.50 for a teacher.
+        A legible misspelling, wrong kanji or incomplete student answer can be graded confidently.
+        Use clear when the writing can be read well enough to grade. Use ambiguous only when plausible readings could change the grade,
+        unreadable when writing cannot be read, and cropped when relevant evidence is cut off. An empty answer box visible in full is clear.
+        Give the rubric's score when you can decide it, including partial credit when allowed. Use review when the evidence or rubric genuinely leaves the grade undecidable.
+        """;
+
     private static string CreateUserInstruction(
         string requestKey,
-        IReadOnlyCollection<QuestionSnapshot> questions,
+        IReadOnlyList<QuestionSnapshot> questions,
         IReadOnlyCollection<ArtifactSnapshot> artifacts,
         int chunkIndex,
         int chunkCount)
@@ -3066,6 +3086,10 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
                 page_number = artifact.Ordinal + 1,
                 page_label = artifact.PanelLabel,
             });
+        if (InitialGradingWire.IsCompact(requestKey))
+        {
+            return CreateCompactInstruction(requestKey, questions, media, chunkIndex, chunkCount);
+        }
         var rubric = questions.Select(question => new
         {
             question_id = question.Id,
@@ -3083,7 +3107,7 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
             accepted_answers = question.AcceptedAnswers,
         });
         return
-            """
+            $"""
             The attached media are one consecutive page chunk from a completed
             Japanese test, in original test page order. Other page chunks may
             contain answers that are not visible here. Match only visible answers
@@ -3114,8 +3138,8 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
             but no component may be missing and duplicate counts must match.
             Include every question ID either once in results or once in
             missing_question_ids; use missing_question_ids when its answer is not
-            visible in this chunk. Recommend review whenever evidence is
-            ambiguous, incomplete, subjective, unexpected, or unreadable.
+            visible in this chunk.
+            {GradingConfidenceInstruction}
 
             When identity_required is true, transcribe only the visibly written
             name and student number from PAGE_1's printed identity field into
@@ -3127,29 +3151,97 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
             + JsonSerializer.Serialize(new
             {
                 schema_version = "submission_analysis_v2",
+                // Keep the complete template ahead of all per-submission data.
+                questions = rubric,
                 request_key = requestKey,
                 chunk_index = chunkIndex + 1,
                 chunk_count = chunkCount,
                 identity_required = chunkIndex == 0,
                 identity_page_number = chunkIndex == 0 ? 1 : (int?)null,
                 media,
-                questions = rubric,
-            });
+            }, GradingInstructionJson);
+    }
+
+    private static string CreateCompactInstruction<TMedia>(
+        string requestKey, IReadOnlyList<QuestionSnapshot> questions, IEnumerable<TMedia> media,
+        int chunkIndex, int chunkCount)
+    {
+        static JsonObject GradingSettings(QuestionSnapshot question) => new()
+        {
+            ["type"] = question.QuestionType,
+            ["mode"] = question.GradingMode,
+            ["max"] = question.MaximumPointsMilli,
+            ["step"] = question.PointIncrementMilli,
+            ["kana"] = question.AllowNonKanji,
+            ["complete"] = question.RequiresCompleteAnswer,
+            ["unordered"] = question.AnswerOrderInsensitive,
+        };
+
+        var defaults = GradingSettings(questions[0]);
+        var rows = questions.Select((question, index) =>
+        {
+            var row = new JsonObject
+            {
+                ["q"] = index + 1,
+                ["i"] = question.OrderIndex,
+                ["label"] = question.DisplayLabel,
+                ["text"] = question.QuestionText,
+                ["a"] = JsonSerializer.SerializeToNode(question.AcceptedAnswers),
+            };
+            if (question.RubricText is not null)
+            {
+                row["rubric"] = question.RubricText;
+            }
+            foreach (var (field, value) in GradingSettings(question))
+            {
+                if (!JsonNode.DeepEquals(defaults[field], value))
+                {
+                    row[field] = value?.DeepClone();
+                }
+            }
+            return row;
+        });
+        return
+            $"""
+            Grade directly from the pixels of these consecutive pages. Match visible answers by printed label, text and layout. Transcribe every visible line boundary as \n. For each question use the grading defaults plus that row's overrides. q is its unique integer ID, i its original order, a its equally valid complete accepted answers. An absent rubric means no additional teacher criteria.
+            max and step are maximum_points_milli and point_increment_milli. kana=false requires the Kanji in a model answer unless a kana version is separately accepted. complete=true requires all components for full credit and otherwise zero, with unclear evidence sent to review. unordered=true compares the complete multiset of components separated by Japanese/ASCII commas, slashes, semicolons, middle dots or line breaks; preserve duplicates.
+            In each result q=question_id, m=evidence_media_index (zero-based), t=transcription, l=legibility, b=blank, o=proposed_outcome, p=proposed_points_milli, c=confidence. Return every q exactly once in results or missing_question_ids. Report a located empty answer with b=true, t="", l="clear", o="blank", p=0. Use missing_question_ids only if the answer location cannot be found in this chunk. Inspect the PAGE_1 identity field only if identity_required; otherwise return identity=null.
+            {GradingConfidenceInstruction}
+
+            """
+            + JsonSerializer.Serialize(new
+            {
+                schema_version = AiGradingResponseValidator.CompactSchemaVersion,
+                grading_defaults = defaults,
+                questions = rows,
+                request_key = requestKey,
+                chunk_index = chunkIndex + 1,
+                chunk_count = chunkCount,
+                identity_required = chunkIndex == 0,
+                identity_page_number = chunkIndex == 0 ? 1 : (int?)null,
+                media,
+            }, GradingInstructionJson);
     }
 
     private static AiRequestEntity CreateRequest(
         DateTimeOffset now,
         SubmissionEntity submission,
         AiTaskProfileEntity profile,
-        string inputManifestHash)
+        string inputManifestHash,
+        string gradingMode,
+        long profileRevision,
+        string? previousRequestKey)
     {
         var id = UlidId.New(now);
         return new AiRequestEntity
         {
             Id = id,
-            RequestKey = $"grade_{id}",
+            RequestKey = previousRequestKey is null
+                ? InitialGradingWire.RequestKey(id, profile.AiConnection.Provider)
+                : InitialGradingWire.RetryKey(id, previousRequestKey),
+            GradingMode = gradingMode,
             AiTaskProfileId = profile.Id,
-            TaskProfileRevision = profile.Revision,
+            TaskProfileRevision = profileRevision,
             Purpose = AiTaskTypes.InitialGrading,
             EntityType = "submission",
             EntityId = submission.Id,
@@ -3229,7 +3321,8 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
         PricingSnapshotEntity pricing,
         int maxOutputTokens,
         string instruction,
-        IReadOnlyCollection<ArtifactSnapshot> artifacts)
+        IReadOnlyCollection<ArtifactSnapshot> artifacts,
+        bool isBatch)
     {
         var textTokens = Math.Max(
             1,
@@ -3258,7 +3351,7 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
             0,
             pricing.InputUsdMicrosPerMillionTokens,
             pricing.OutputUsdMicrosPerMillionTokens,
-            pricing.ThinkingUsdMicrosPerMillionTokens);
+            pricing.ThinkingUsdMicrosPerMillionTokens, isBatch);
     }
 
     private static long CalculateActualCost(
@@ -3280,7 +3373,8 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
         long thinkingTokens,
         long inputRate,
         long outputRate,
-        long thinkingRate)
+        long thinkingRate,
+        bool isBatch = false)
     {
         var numerator =
             (BigInteger)inputTokens * inputRate
@@ -3291,7 +3385,8 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
             return 0;
         }
 
-        var result = (numerator + 999_999) / 1_000_000;
+        var denominator = isBatch ? 2_000_000 : 1_000_000;
+        var result = (numerator + denominator - 1) / denominator;
         if (result > long.MaxValue)
         {
             throw Blocked("ai_cost_overflow");
@@ -3578,7 +3673,9 @@ public sealed partial class AiInitialGradingJobWorker : BackgroundService
         string TemplateVersionId,
         string ManifestHash,
         string? AiRequestId = null,
-        bool ForceExpedite = false);
+        bool ForceExpedite = false,
+        string? GradingMode = null,
+        string? ContinuationOfRequestId = null);
 
     private sealed record PreparedClaim(
         string JobId,

@@ -13,7 +13,9 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using OokiGrader.Ai.Abstractions;
 using OokiGrader.Domain.Templates;
+using OokiGrader.Host.Jobs;
 using OokiGrader.Host.Api;
 using OokiGrader.Infrastructure.Persistence;
 using OokiGrader.Infrastructure.Persistence.Entities;
@@ -186,6 +188,54 @@ public sealed class RobustListQueryIntegrationTests
         Assert.Equal(3, all.Distinct(StringComparer.Ordinal).Count());
     }
 
+    [Fact]
+    public async Task SubmissionListUsesEachInitialGradingJobAndRemoteBatchState()
+    {
+        await using var application = await ListTestApplication.CreateAsync(async db =>
+        {
+            var now = DateTimeOffset.UtcNow;
+            db.BackgroundJobs.Add(new BackgroundJobEntity
+            {
+                Id = "job", Type = AiInitialGradingJobWorker.JobType, SchemaVersion = 1,
+                DeduplicationKey = "submission:submission-04:gemini-analyze:fixture",
+                PayloadJson = """{"gradingMode":"batch"}""", State = "queued", MaxAttempts = 8,
+                NextAttemptAt = now, CreatedAt = now, UpdatedAt = now,
+            });
+            var connection = new AiConnectionEntity { Id = "connection", CreatedAt = now, UpdatedAt = now };
+            var profile = new AiTaskProfileEntity
+            {
+                Id = "profile", TaskType = AiTaskTypes.InitialGrading, AiConnection = connection,
+                ConnectionRevision = 1, ProcessingStrategy = "queued_standard", CreatedAt = now, UpdatedAt = now,
+            };
+            var request = new AiRequestEntity
+            {
+                Id = "request", RequestKey = "request", AiTaskProfile = profile, TaskProfileRevision = 1,
+                Purpose = profile.TaskType, EntityType = "submission", EntityId = "submission-05", EntityRevision = 1,
+                InputManifestHash = new string('a', 64), GradingMode = "batch", CreatedAt = now, UpdatedAt = now,
+            };
+            var remote = new AiBatchEntity
+            {
+                Id = "remote", AiConnection = connection, AiTaskProfile = profile, ConnectionRevision = 1,
+                TaskProfileRevision = 1, RequestCount = 1, State = "delayed", CreatedAt = now, UpdatedAt = now,
+            };
+            db.AiBatchRequests.Add(new AiBatchRequestEntity
+            {
+                Id = "mapping", AiRequest = request, AiBatch = remote, RequestKey = request.RequestKey,
+                State = "submitted", Ordinal = 0, ProviderRequestJson = "{}", ProviderRequestBytes = 2,
+                CreatedAt = now, UpdatedAt = now,
+            });
+            await db.SaveChangesAsync();
+        });
+        var response = await application.GetAsync("/api/v1/submissions");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        using var document = await ReadJsonAsync(response);
+        var items = document.RootElement.GetProperty("items").EnumerateArray()
+            .ToDictionary(item => item.GetProperty("id").GetString()!, item => item.GetProperty("initialGradingBatchState"));
+        Assert.Equal("queued", items["submission-04"].GetString());
+        Assert.Equal("delayed", items["submission-05"].GetString());
+        Assert.Equal(JsonValueKind.Null, items["submission-01"].ValueKind);
+    }
+
     [Theory]
     [InlineData("readyForReview", "submission-04")]
     [InlineData("awaitingAi", "submission-05")]
@@ -309,7 +359,7 @@ public sealed class RobustListQueryIntegrationTests
 
         private HttpClient Client { get; }
 
-        public static async Task<ListTestApplication> CreateAsync()
+        public static async Task<ListTestApplication> CreateAsync(Func<OokiGraderDbContext, Task>? seedExtra = null)
         {
             var connection = new SqliteConnection("Data Source=:memory:");
             await connection.OpenAsync();
@@ -362,6 +412,7 @@ public sealed class RobustListQueryIntegrationTests
                     .GetRequiredService<OokiGraderDbContext>();
                 await db.Database.EnsureCreatedAsync();
                 await SeedAsync(db);
+                if (seedExtra is not null) await seedExtra(db);
             }
 
             await host.StartAsync();

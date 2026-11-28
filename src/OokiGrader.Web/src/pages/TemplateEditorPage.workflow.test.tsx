@@ -42,6 +42,8 @@ vi.mock("../hooks/useApiQuery", () => ({
           status: state.editorData ? "success" : "loading",
           reload: state.reloadEditor,
         }
+      : key === "runtime-capabilities"
+        ? { data: { ai: { geminiBatch: { enabled: true, ready: true } } }, status: "success", reload: vi.fn() }
       : {
           data: state.generationData,
           error: undefined,
@@ -418,6 +420,7 @@ describe("TemplateEditorPage autosave and publish recovery", () => {
         {
           revision: 7,
           testDate: testDate || null,
+          gradingMode: "batch",
           classLabel: "6年A組",
         },
         expect.objectContaining({
@@ -538,6 +541,8 @@ describe("TemplateEditorPage autosave and publish recovery", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "受付を開始" }));
     const dialog = screen.getByRole("dialog", { name: "答案受付を開始" });
+    expect(within(dialog).getByLabelText("初回採点の方法")).toHaveValue("batch");
+    fireEvent.change(within(dialog).getByLabelText("初回採点の方法"), { target: { value: "standard" } });
     fireEvent.change(within(dialog).getByLabelText(/^実施日/), {
       target: { value: "2026-08-13" },
     });
@@ -553,6 +558,7 @@ describe("TemplateEditorPage autosave and publish recovery", () => {
           testDate: "2026-08-13",
           classLabel: undefined,
           openImmediately: true,
+          gradingMode: "standard",
         },
         expect.objectContaining({ idempotencyKey: expect.any(String) }),
       ),

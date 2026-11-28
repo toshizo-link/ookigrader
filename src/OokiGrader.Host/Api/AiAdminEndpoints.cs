@@ -45,6 +45,7 @@ public static class AiAdminEndpoints
         group.MapPost("/ai-connections", CreateConnectionAsync);
         group.MapPut("/ai-connections/{connectionId}", ReplaceConnectionAsync);
         group.MapPost("/ai-connections/{connectionId}:test", ProbeConnectionAsync);
+        group.MapPost("/ai-connections/{connectionId}:test-batch", ProbeBatchConnectionAsync);
         group.MapGet("/ai-task-profiles", ListProfilesAsync);
         group.MapPost("/ai-task-profiles", CreateProfileAsync);
         group.MapPatch("/ai-task-profiles/{profileId}", UpdateProfileAsync);
@@ -154,6 +155,7 @@ public static class AiAdminEndpoints
             Provider = provider,
             EndpointProfile = AiProviderCatalog.GetEndpointProfile(provider),
             ModelId = modelId,
+            InitialGradingMediaResolution = request.InitialGradingMediaResolution ?? "medium",
             TimeoutSeconds = Math.Clamp(request.TimeoutSeconds
                 ?? (provider == AiProviders.GeminiDirect ? 300 : 75), 5, 300),
             ConcurrencyLimit = Math.Clamp(request.ConcurrencyLimit ?? 2, 1, 16),
@@ -211,6 +213,7 @@ public static class AiAdminEndpoints
                 {
                     connection.Provider,
                     connection.ModelId,
+                    connection.InitialGradingMediaResolution,
                     connection.KeyFingerprint,
                     automaticSetup = automaticProbe is not null,
                 });
@@ -383,6 +386,8 @@ public static class AiAdminEndpoints
                 Provider = connection.Provider,
                 EndpointProfile = AiProviderCatalog.GetEndpointProfile(provider),
                 ModelId = modelId,
+                InitialGradingMediaResolution = request.InitialGradingMediaResolution
+                    ?? connection.InitialGradingMediaResolution,
                 CredentialRevision = apiKey is null
                     ? connection.CredentialRevision
                     : checked(connection.CredentialRevision + 1),
@@ -476,6 +481,8 @@ public static class AiAdminEndpoints
                 16);
             connection.EndpointProfile = AiProviderCatalog.GetEndpointProfile(provider);
             connection.ModelId = modelId;
+            connection.InitialGradingMediaResolution = request.InitialGradingMediaResolution
+                ?? connection.InitialGradingMediaResolution;
             connection.State = "pending_probe";
             connection.LastCapabilityProbeState = null;
             connection.LastCapabilityProbeErrorCode = null;
@@ -505,6 +512,7 @@ public static class AiAdminEndpoints
                 {
                     previousModelId,
                     connection.ModelId,
+                    connection.InitialGradingMediaResolution,
                     credentialReused = true,
                     deactivatedProfileCount = settingsDeactivatedProfileCount,
                 });
@@ -529,6 +537,8 @@ public static class AiAdminEndpoints
         connection.ConcurrencyLimit = Math.Clamp(request.ConcurrencyLimit ?? 2, 1, 16);
         connection.EndpointProfile = AiProviderCatalog.GetEndpointProfile(provider);
         connection.ModelId = modelId;
+        connection.InitialGradingMediaResolution = request.InitialGradingMediaResolution
+            ?? connection.InitialGradingMediaResolution;
         connection.State = "pending_probe";
         connection.LastCapabilityProbeState = null;
         connection.LastCapabilityProbeErrorCode = null;
@@ -632,6 +642,7 @@ public static class AiAdminEndpoints
             connection.ConcurrencyLimit = candidate.ConcurrencyLimit;
             connection.EndpointProfile = candidate.EndpointProfile;
             connection.ModelId = candidate.ModelId;
+            connection.InitialGradingMediaResolution = candidate.InitialGradingMediaResolution;
             ApplyProbeResult(connection, probeResult, now);
             persistedProbe = BuildProbe(connection, probeResult, now);
             db.AiCapabilityProbes.Add(persistedProbe);
@@ -647,6 +658,7 @@ public static class AiAdminEndpoints
                 {
                     connection.CredentialRevision,
                     connection.KeyFingerprint,
+                    connection.InitialGradingMediaResolution,
                     automaticSetup = true,
                 });
             await ReconcileCurrentProfilesAsync(
@@ -724,6 +736,7 @@ public static class AiAdminEndpoints
         connection.ConcurrencyLimit = candidate.ConcurrencyLimit;
         connection.EndpointProfile = candidate.EndpointProfile;
         connection.ModelId = candidate.ModelId;
+        connection.InitialGradingMediaResolution = candidate.InitialGradingMediaResolution;
         ApplyProbeResult(connection, probeResult, now);
         var persistedProbe = BuildProbe(connection, probeResult, now);
         db.AiCapabilityProbes.Add(persistedProbe);
@@ -739,6 +752,7 @@ public static class AiAdminEndpoints
             {
                 previousModelId,
                 connection.ModelId,
+                connection.InitialGradingMediaResolution,
                 credentialReused = true,
                 automaticSetup = true,
             });
@@ -768,6 +782,54 @@ public static class AiAdminEndpoints
 
         ApiHelpers.SetRevisionEtag(context.Response, connection.Revision);
         return Results.Ok(ToConnectionResponse(connection, persistedProbe));
+    }
+
+    private static async Task<IResult> ProbeBatchConnectionAsync(
+        string connectionId, HttpContext context, ClaimsPrincipal principal, OokiGraderDbContext db,
+        IAiSecretStore secretStore, [FromServices] GeminiBatchCapabilityProbe probe,
+        [FromServices] IAiProviderFeaturePolicy providerFeaturePolicy,
+        TimeProvider timeProvider, CancellationToken cancellationToken)
+    {
+        var connection = await db.AiConnections.SingleOrDefaultAsync(item => item.Id == connectionId, cancellationToken);
+        if (connection is null) return Results.NotFound();
+        if (!providerFeaturePolicy.IsEnabled(connection.Provider)) return ProviderFeatureDisabled(context);
+        if (connection.Provider != AiProviders.GeminiDirect || connection.State != "active"
+            || connection.LastCapabilityProbeState != "passed")
+        {
+            return ApiHelpers.Problem(context, StatusCodes.Status409Conflict,
+                "GEMINI_BATCH_CONNECTION_NOT_READY", "まとめ採点の接続テストを開始できません",
+                "Gemini の通常の接続テストを先に完了してください。");
+        }
+
+        GeminiBatchCapabilityProbeResult result;
+        try
+        {
+            using var secret = await secretStore.ReadAsync(new AiSecretReference(connection.SecretReference), cancellationToken);
+            result = await probe.ProbeAsync(ToSettings(connection), secret.Utf8Bytes, cancellationToken);
+        }
+        catch (KeyNotFoundException)
+        {
+            return MissingStoredSecret(context);
+        }
+
+        var now = timeProvider.GetUtcNow();
+        connection.LastBatchCapabilityProbeAt = now;
+        connection.LastBatchCapabilityProbeState = result.State;
+        connection.LastBatchCapabilityProbeErrorCode = result.SafeErrorCode;
+        connection.LastBatchCapabilityProbeCredentialRevision = connection.CredentialRevision;
+        connection.UpdatedAt = now;
+        AddAudit(db, context, principal, now, "ai.connection_batch_probed", connection.Id,
+            new { result.State, result.SafeErrorCode, result.CleanupSucceeded, connection.ModelId, connection.CredentialRevision });
+        try
+        {
+            await db.SaveChangesAsync(cancellationToken);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            return RevisionMismatch(context);
+        }
+
+        return Results.Ok(new { result.State, result.SafeErrorCode, result.CleanupSucceeded });
     }
 
     private static async Task<IResult> ProbeConnectionAsync(
@@ -826,7 +888,7 @@ public static class AiAdminEndpoints
             && IsTransientGeminiProbeFailure(connection, result);
         if (!previousConfigurationRetained)
         {
-            ApplyProbeResult(connection, result, now);
+            ApplyProbeResult(connection, result, now, preserveBatchProbe: true);
         }
         var imageTasksReady = IsSuccessfulImageProbe(connection, result);
         await using var transaction = imageTasksReady
@@ -991,7 +1053,7 @@ public static class AiAdminEndpoints
                 : request.Name.Trim(),
             request.ProcessingStrategy
                 ?? DefaultProcessingStrategy(request.TaskType),
-            request.MaxOutputTokens ?? 8_192,
+            request.MaxOutputTokens ?? DefaultMaxOutputTokens(request.TaskType),
             request.ConcurrencyLimit ?? connection.ConcurrencyLimit,
             ApiHelpers.StaffId(principal),
             bundle,
@@ -2309,15 +2371,19 @@ public static class AiAdminEndpoints
     internal static void ApplyProbeResult(
         AiConnectionEntity connection,
         AiCapabilityProbeResult result,
-        DateTimeOffset now)
+        DateTimeOffset now,
+        bool preserveBatchProbe = false)
     {
         connection.LastCapabilityProbeState = result.State;
         connection.LastCapabilityProbeErrorCode = result.SafeErrorCode;
         connection.LastCapabilityProbeAt = now;
-        connection.LastBatchCapabilityProbeState = "not_run";
-        connection.LastBatchCapabilityProbeErrorCode = null;
-        connection.LastBatchCapabilityProbeAt = null;
-        connection.LastBatchCapabilityProbeCredentialRevision = null;
+        if (!preserveBatchProbe || connection.LastBatchCapabilityProbeState is null)
+        {
+            connection.LastBatchCapabilityProbeState = "not_run";
+            connection.LastBatchCapabilityProbeErrorCode = null;
+            connection.LastBatchCapabilityProbeAt = null;
+            connection.LastBatchCapabilityProbeCredentialRevision = null;
+        }
         connection.State = IsSuccessfulImageProbe(connection, result)
             ? "active"
             : "blocked";
@@ -2482,13 +2548,36 @@ public static class AiAdminEndpoints
         {
             var bundle = catalog.GetRequired(taskType);
             var processingStrategy = DefaultProcessingStrategy(taskType);
-            var thinkingLevel = AiProviderRuntime.DefaultThinkingLevel(
+            var thinkingLevel = AiProviderCatalog.DefaultThinkingLevel(
                 connection.Provider,
                 connection.ModelId,
                 taskType);
             var defaultName = DefaultProfileName(
                 connection.Provider,
                 taskType);
+            var targetName = defaultName;
+            var maxOutputTokens = DefaultMaxOutputTokens(taskType);
+            string? customGradingProfileId = null;
+            var current = activeByTask.GetValueOrDefault(taskType);
+            if (taskType == AiTaskTypes.InitialGrading && current is null)
+            {
+                // A failed model probe can leave only draft targets. Recover the
+                // prior grading ceiling on the next successful recheck.
+                current = await db.AiTaskProfiles.AsNoTracking()
+                    .Where(p => p.AiConnectionId == connection.Id && p.TaskType == taskType && p.ApprovalState != "draft")
+                    .OrderByDescending(p => p.UpdatedAt).ThenByDescending(p => p.Id)
+                    .FirstOrDefaultAsync(cancellationToken);
+            }
+            if (taskType == AiTaskTypes.InitialGrading
+                && current?.AiConnectionId == connection.Id
+                && await HasCustomGradingCeilingAsync(db, current, defaultName, maxOutputTokens, cancellationToken))
+            {
+                targetName = current.Name;
+                maxOutputTokens = current.MaxOutputTokens;
+                customGradingProfileId = current.Id;
+            }
+            var matchGradingResolution = connection.Provider == AiProviders.GeminiDirect
+                && taskType == AiTaskTypes.InitialGrading;
             var target = await db.AiTaskProfiles
                 .Where(profile =>
                     profile.AiConnectionId == connection.Id
@@ -2497,9 +2586,13 @@ public static class AiAdminEndpoints
                     && profile.ConnectionRevision
                         == connection.CredentialRevision
                     && profile.ModelId == connection.ModelId
-                    && profile.ThinkingLevel == thinkingLevel
-                    && (taskType != AiTaskTypes.TemplateExtraction
-                        || profile.MaxOutputTokens == 65_536)
+                    && (profile.ThinkingLevel == thinkingLevel
+                        || profile.Id == customGradingProfileId
+                            && (profile.ThinkingLevel == "low" || profile.ThinkingLevel == "minimal"))
+                    && (!matchGradingResolution || profile.MediaResolution == connection.InitialGradingMediaResolution)
+                    && (taskType != AiTaskTypes.TemplateExtraction || profile.MaxOutputTokens == maxOutputTokens)
+                    && (taskType != AiTaskTypes.InitialGrading
+                        || profile.MaxOutputTokens == maxOutputTokens && profile.Name == targetName)
                     && profile.PromptVersion == bundle.PromptVersion
                     && profile.SchemaVersion == bundle.SchemaVersion
                     && profile.PromptContentHash == bundle.ContentHash)
@@ -2513,11 +2606,9 @@ public static class AiAdminEndpoints
                 target = BuildProfile(
                     connection,
                     taskType,
-                    defaultName,
+                    targetName,
                     processingStrategy,
-                    taskType == AiTaskTypes.TemplateExtraction
-                        ? 65_536
-                        : 8_192,
+                    maxOutputTokens,
                     connection.ConcurrencyLimit,
                     staffId,
                     bundle,
@@ -2593,10 +2684,14 @@ public static class AiAdminEndpoints
         {
             var bundle = catalog.GetRequired(taskType);
             var processingStrategy = DefaultProcessingStrategy(taskType);
+            var thinkingLevel = AiProviderCatalog.DefaultThinkingLevel(connection.Provider, connection.ModelId, taskType);
+            var maxOutputTokens = DefaultMaxOutputTokens(taskType);
             if (await db.AiTaskProfiles.AnyAsync(
                     profile => profile.AiConnectionId == connection.Id
                         && profile.TaskType == taskType
                         && profile.ProcessingStrategy == processingStrategy
+                        && profile.ThinkingLevel == thinkingLevel
+                        && profile.MaxOutputTokens == maxOutputTokens
                         && profile.ConnectionRevision
                             == connection.CredentialRevision
                         && profile.PromptVersion == bundle.PromptVersion
@@ -2612,7 +2707,7 @@ public static class AiAdminEndpoints
                 taskType,
                 DefaultProfileName(connection.Provider, taskType),
                 processingStrategy,
-                taskType == AiTaskTypes.TemplateExtraction ? 65_536 : 8_192,
+                maxOutputTokens,
                 connection.ConcurrencyLimit,
                 staffId,
                 bundle,
@@ -2642,11 +2737,13 @@ public static class AiAdminEndpoints
             PromptVersion = bundle.PromptVersion,
             SchemaVersion = bundle.SchemaVersion,
             PromptContentHash = bundle.ContentHash,
-            ThinkingLevel = AiProviderRuntime.DefaultThinkingLevel(
+            ThinkingLevel = AiProviderCatalog.DefaultThinkingLevel(
                 connection.Provider,
                 connection.ModelId,
                 taskType),
-            MediaResolution = "high",
+            MediaResolution = connection.Provider == AiProviders.GeminiDirect && taskType == AiTaskTypes.InitialGrading
+                ? connection.InitialGradingMediaResolution
+                : "high",
             MaxOutputTokens = Math.Clamp(maxOutputTokens, 64, 65_536),
             ConcurrencyLimit = Math.Clamp(concurrencyLimit, 1, 16),
             ApprovalState = "capability_passed",
@@ -2667,6 +2764,9 @@ public static class AiAdminEndpoints
             configured = !string.IsNullOrWhiteSpace(connection.SecretReference),
             connection.KeyFingerprint,
             connection.ModelId,
+            initialGradingMediaResolution = connection.Provider == AiProviders.GeminiDirect
+                ? connection.InitialGradingMediaResolution
+                : null,
             connection.State,
             connection.TimeoutSeconds,
             connection.ConcurrencyLimit,
@@ -2901,7 +3001,9 @@ public static class AiAdminEndpoints
         bool requireApiKey)
     {
         var apiKeySupplied = !string.IsNullOrEmpty(request.ApiKey);
-        if (!TryResolveConnectionSelection(request, out _, out _)
+        if (!TryResolveConnectionSelection(request, out var provider, out _)
+            || (request.InitialGradingMediaResolution is { } resolution
+                && (provider != AiProviders.GeminiDirect || resolution is not ("high" or "medium")))
             || (requireApiKey && !apiKeySupplied)
             || (apiKeySupplied
                 && (string.IsNullOrWhiteSpace(request.ApiKey)
@@ -2979,6 +3081,26 @@ public static class AiAdminEndpoints
             or "expedite_standard"
             or "queued_standard";
 
+    private static async Task<bool> HasCustomGradingCeilingAsync(OokiGraderDbContext db,
+        AiTaskProfileEntity profile, string defaultName, int defaultLimit, CancellationToken cancellationToken)
+    {
+        if (profile.Name != defaultName || profile.AccuracyEvaluationId is not null) return true;
+        if (profile.MaxOutputTokens != 8_192) return profile.MaxOutputTokens != defaultLimit;
+        // The old auto ceiling and a teacher's explicit 8192-token limit can coincide.
+        // Its evaluation remains attached to the original profile after the effort changes.
+        return await db.AiTaskProfiles.AnyAsync(prior => prior.Id != profile.Id
+            && prior.AiConnectionId == profile.AiConnectionId && prior.TaskType == profile.TaskType
+            && prior.Name == profile.Name && prior.MaxOutputTokens == profile.MaxOutputTokens
+            && prior.AccuracyEvaluationId != null, cancellationToken);
+    }
+
+    private static int DefaultMaxOutputTokens(string taskType) => taskType switch
+    {
+        AiTaskTypes.InitialGrading => 32_768,
+        AiTaskTypes.TemplateExtraction => 65_536,
+        _ => 8_192,
+    };
+
     internal static string DefaultProcessingStrategy(string taskType) =>
         taskType == AiTaskTypes.InitialGrading
             ? "queued_standard"
@@ -3029,7 +3151,8 @@ public static class AiAdminEndpoints
         int? TimeoutSeconds,
         int? ConcurrencyLimit,
         long? Revision,
-        bool? TestAndEnable);
+        bool? TestAndEnable,
+        string? InitialGradingMediaResolution = null);
 
     private sealed record SaveAiTaskProfileRequest(
         string ConnectionId,

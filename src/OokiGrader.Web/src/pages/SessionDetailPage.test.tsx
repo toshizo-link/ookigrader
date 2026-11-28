@@ -7,16 +7,18 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BrowserRouter, Route, Routes } from "../router";
-import type { TestSessionSummary } from "../types";
+import type { SubmissionSummary, TestSessionSummary } from "../types";
 import { SessionDetailPage } from "./SessionDetailPage";
 
 const queryState = vi.hoisted(() => ({
   session: undefined as TestSessionSummary | undefined,
+  submissions: [] as SubmissionSummary[],
+  batchReady: true,
   reloadSession: vi.fn(),
   reloadSubmissions: vi.fn(),
   reloadSummary: vi.fn(),
 }));
-const apiState = vi.hoisted(() => ({ post: vi.fn() }));
+const apiState = vi.hoisted(() => ({ post: vi.fn(), patch: vi.fn() }));
 
 vi.mock("../auth/SessionContext", () => ({
   useSession: () => ({
@@ -27,6 +29,9 @@ vi.mock("../auth/SessionContext", () => ({
 
 vi.mock("../hooks/useApiQuery", () => ({
   useApiQuery: (key: string) => {
+    if (key === "runtime-capabilities") {
+      return { data: { ai: { geminiBatch: { enabled: true, ready: queryState.batchReady } } }, status: "success" };
+    }
     if (key.startsWith("session:")) {
       return {
         data: queryState.session,
@@ -48,7 +53,7 @@ vi.mock("../hooks/useApiQuery", () => ({
       };
     }
     return {
-      data: { items: [], totalApproximate: 0 },
+      data: { items: queryState.submissions, totalApproximate: queryState.submissions.length },
       error: undefined,
       status: "success" as const,
       reload: queryState.reloadSubmissions,
@@ -70,13 +75,16 @@ vi.mock("../lib/api", async () => {
   );
   return {
     ...actual,
-    api: { ...actual.api, post: apiState.post },
+    api: { ...actual.api, post: apiState.post, patch: apiState.patch },
   };
 });
 
 beforeEach(() => {
   window.history.replaceState(null, "", "/sessions/session-1");
   queryState.session = makeSession();
+  queryState.submissions = [];
+  queryState.batchReady = true;
+  apiState.patch.mockResolvedValue(undefined);
   apiState.post.mockResolvedValue(undefined);
 });
 
@@ -153,6 +161,45 @@ describe("SessionDetailPage archival", () => {
     expect(
       screen.queryByRole("button", { name: "アーカイブ" }),
     ).not.toBeInTheDocument();
+  });
+});
+
+describe("SessionDetailPage grading mode", () => {
+  it("updates the mode for newly queued submissions with the current session revision", async () => {
+    renderPage();
+    expect(screen.getByRole("button", { name: "採点方法を保存" })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("初回採点の方法"), { target: { value: "batch" } });
+    fireEvent.click(screen.getByRole("button", { name: "採点方法を保存" }));
+    await waitFor(() => expect(queryState.reloadSession).toHaveBeenCalledOnce());
+    expect(apiState.patch).toHaveBeenCalledExactlyOnceWith("/test-sessions/session-1", { gradingMode: "batch", revision: 4 });
+  });
+
+  it("shows each batch's actual state and refreshes without starting work", () => {
+    queryState.session = makeSession({ gradingMode: "standard" });
+    queryState.submissions = [
+      { id: "submitted-1", state: "grading", initialGradingBatchState: "submitted" },
+      { id: "issue-1", state: "grading", initialGradingBatchState: "manual_review" },
+    ];
+    renderPage();
+    expect(screen.getByText("まとめ採点を送信済み・結果待ち")).toBeVisible();
+    expect(screen.getByText(/まとめ採点を保留しています。管理者に確認/)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "状況を更新" }));
+    expect(queryState.reloadSubmissions).toHaveBeenCalledOnce();
+    expect(apiState.patch).not.toHaveBeenCalled();
+    expect(apiState.post).not.toHaveBeenCalled();
+  });
+
+  it("allows an explicit switch to standard if Batch becomes unavailable", async () => {
+    queryState.session = makeSession({ gradingMode: "batch" });
+    queryState.batchReady = false;
+    renderPage();
+    expect(screen.getByLabelText("初回採点の方法")).toHaveValue("batch");
+    expect(screen.getByRole("option", { name: /Gemini Batch/ })).toBeDisabled();
+    expect(apiState.patch).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByLabelText("初回採点の方法"), { target: { value: "standard" } });
+    fireEvent.click(screen.getByRole("button", { name: "採点方法を保存" }));
+    await waitFor(() => expect(queryState.reloadSession).toHaveBeenCalledOnce());
+    expect(apiState.patch).toHaveBeenCalledExactlyOnceWith("/test-sessions/session-1", { gradingMode: "standard", revision: 4 });
   });
 });
 

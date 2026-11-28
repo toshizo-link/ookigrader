@@ -1,8 +1,8 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json.Nodes;
 using Microsoft.EntityFrameworkCore;
 using OokiGrader.Ai.Abstractions;
-using OokiGrader.Ai.Gemini;
 using OokiGrader.Application.Abstractions;
 using OokiGrader.Application.Identifiers;
 using OokiGrader.Infrastructure.Persistence;
@@ -15,7 +15,8 @@ public sealed record AiBatchStageRequest(
     string CompatibilityKey,
     AiProviderRequest ProviderRequest,
     int Priority = 0,
-    string? CorrelationId = null);
+    string? CorrelationId = null,
+    string ModelId = AiProviderCatalog.GeminiDefaultModelId);
 
 public sealed record AiBatchStageResult(
     string BatchRequestId,
@@ -49,7 +50,7 @@ public sealed class AiBatchRequestStager(
                 nameof(request));
         }
 
-        var jsonLines = batchProvider.BuildJsonLines([request.ProviderRequest]);
+        var jsonLines = batchProvider.BuildJsonLines([request.ProviderRequest], request.ModelId);
         if (jsonLines.Length > 25_000_000)
         {
             throw new InvalidDataException("ai_batch_request_too_large");
@@ -76,6 +77,9 @@ public sealed class AiBatchRequestStager(
                 .ConfigureAwait(false)
                 ?? throw new KeyNotFoundException(
                     $"AI request '{request.AiRequestId}' does not exist.");
+            var eligible = await GeminiBatchEligibility.EligibleRequestIdsAsync(db, [aiRequest], token).ConfigureAwait(false);
+            if (!eligible.Contains(aiRequest.Id))
+                throw new InvalidOperationException("The AI request is not eligible for Gemini batch processing.");
             ValidateAiRequest(aiRequest, request);
 
             var existing = await db.AiBatchRequests
@@ -85,9 +89,10 @@ public sealed class AiBatchRequestStager(
                 .ConfigureAwait(false);
             if (existing is not null)
             {
-                if (existing.ProviderRequestHash != requestHash
-                    || existing.CompatibilityKey != request.CompatibilityKey
-                    || existing.RequestKey != request.ProviderRequest.RequestKey)
+                if (existing.CompatibilityKey != request.CompatibilityKey
+                    || existing.RequestKey != request.ProviderRequest.RequestKey
+                    || (existing.ProviderRequestHash != requestHash
+                        && !MatchesLegacyGradingLine(existing, request.ProviderRequest, line)))
                 {
                     throw new InvalidOperationException(
                         "A different immutable batch request is already staged.");
@@ -157,25 +162,56 @@ public sealed class AiBatchRequestStager(
         }, cancellationToken);
     }
 
+    private static bool MatchesLegacyGradingLine(
+        AiBatchRequestEntity existing, AiProviderRequest request, string line)
+    {
+        var staged = existing.ProviderRequestJson;
+        // A restart can encounter a pre-upgrade initial-grading line with the
+        // same rubric in escaped JSON and the user instruction after the images.
+        if (request.TaskType != AiTaskTypes.InitialGrading || request.SchemaVersion != "submission_analysis_v2"
+            || staged is null || Encoding.UTF8.GetByteCount(staged) != existing.ProviderRequestBytes
+            || !string.Equals(Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(staged))),
+                existing.ProviderRequestHash, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var previous = JsonNode.Parse(staged);
+        if (previous?["request"]?["contents"]?[0]?["parts"] is not JsonArray parts
+            || parts.Count != request.Media.Count + 1
+            || parts[^1] is not JsonObject textPart
+            || textPart["text"]?.GetValue<string>() is not { } oldInstruction)
+        {
+            return false;
+        }
+
+        var dataStart = request.UserInstruction.IndexOf('{');
+        if (dataStart < 0 || oldInstruction.IndexOf('{') != dataStart
+            || !oldInstruction.AsSpan(0, dataStart).SequenceEqual(request.UserInstruction.AsSpan(0, dataStart))
+            || !JsonNode.DeepEquals(JsonNode.Parse(oldInstruction[dataStart..]),
+                JsonNode.Parse(request.UserInstruction[dataStart..])))
+        {
+            return false;
+        }
+
+        // Compare the complete envelope, including every ordered page, the bound
+        // response schema, generation settings and both request keys. The stored
+        // JSON and its digest remain untouched.
+        parts.RemoveAt(parts.Count - 1);
+        textPart["text"] = request.UserInstruction;
+        parts.Insert(0, textPart);
+        return JsonNode.DeepEquals(previous, JsonNode.Parse(line));
+    }
+
     private static void ValidateAiRequest(
         AiRequestEntity aiRequest,
         AiBatchStageRequest stage)
     {
         var profile = aiRequest.AiTaskProfile;
-        var connection = profile.AiConnection;
         if (aiRequest.RequestKey != stage.ProviderRequest.RequestKey
+            || profile.ModelId != stage.ModelId
             || aiRequest.State is not ("prepared" or "budget_blocked")
-            || profile.ProcessingStrategy != "gemini_batch"
-            || !profile.Active
-            || profile.ModelId != connection.ModelId
-            || connection.Provider != AiProviders.GeminiDirect
-            || connection.State != "active"
-            || connection.LastCapabilityProbeState != "passed"
-            || connection.LastBatchCapabilityProbeState != "passed"
-            || connection.LastBatchCapabilityProbeCredentialRevision
-                != connection.CredentialRevision
-            || profile.ConnectionRevision != connection.CredentialRevision
-            || aiRequest.TaskProfileRevision != profile.Revision)
+            || !GeminiBatchEligibility.IsBatchRequest(aiRequest, profile))
         {
             throw new InvalidOperationException(
                 "The AI request is not eligible for Gemini batch processing.");

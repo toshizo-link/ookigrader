@@ -27,7 +27,8 @@ public sealed partial class GeminiBatchClient(HttpClient httpClient)
 
     public string Provider => AiProviders.GeminiDirect;
 
-    public byte[] BuildJsonLines(IReadOnlyList<AiProviderRequest> requests)
+    public byte[] BuildJsonLines(IReadOnlyList<AiProviderRequest> requests,
+        string modelId = AiProviderCatalog.GeminiDefaultModelId)
     {
         ArgumentNullException.ThrowIfNull(requests);
         if (requests.Count is < 1 or > 10_000
@@ -52,7 +53,7 @@ public sealed partial class GeminiBatchClient(HttpClient httpClient)
                 writer.WriteStartObject();
                 writer.WriteString("key", request.RequestKey);
                 writer.WritePropertyName("request");
-                WriteGenerateContentRequest(writer, request);
+                GeminiDirectClient.WriteGenerateContentRequest(writer, request, modelId);
                 writer.WriteEndObject();
             }
 
@@ -133,11 +134,7 @@ public sealed partial class GeminiBatchClient(HttpClient httpClient)
                 uploadValues.SingleOrDefault(),
                 UriKind.Absolute,
                 out var uploadUri)
-            || uploadUri.Scheme != Uri.UriSchemeHttps
-            || !string.Equals(
-                uploadUri.Host,
-                AllowedHost,
-                StringComparison.OrdinalIgnoreCase))
+            || !IsGeminiOrigin(uploadUri))
         {
             throw Failure(
                 AiFailureKind.InvalidResponse,
@@ -265,8 +262,13 @@ public sealed partial class GeminiBatchClient(HttpClient httpClient)
             if (!response.IsSuccessStatusCode)
             {
                 var failure = FromHttpStatus(response);
+                // An upstream timeout or server error can arrive after the batch was accepted.
+                var outcome = response.StatusCode == HttpStatusCode.RequestTimeout
+                    || (int)response.StatusCode >= 500
+                    ? AiBatchCreateFailureKind.AmbiguousAfterSend
+                    : AiBatchCreateFailureKind.DefiniteRemoteRejection;
                 throw new AiBatchCreateException(
-                    AiBatchCreateFailureKind.DefiniteRemoteRejection,
+                    outcome,
                     failure.SafeErrorCode,
                     failure.IsTransient,
                     failure.RetryAfter,
@@ -302,6 +304,16 @@ public sealed partial class GeminiBatchClient(HttpClient httpClient)
         {
             throw;
         }
+        catch (AiProviderException exception)
+        {
+            // The server accepted the POST, but its receipt exceeded the local read limit.
+            throw new AiBatchCreateException(
+                AiBatchCreateFailureKind.AmbiguousAfterSend,
+                exception.SafeErrorCode,
+                exception.IsTransient,
+                exception.RetryAfter,
+                exception);
+        }
         catch (OperationCanceledException exception)
             when (!cancellationToken.IsCancellationRequested)
         {
@@ -312,6 +324,14 @@ public sealed partial class GeminiBatchClient(HttpClient httpClient)
                 innerException: exception);
         }
         catch (HttpRequestException exception)
+        {
+            throw new AiBatchCreateException(
+                AiBatchCreateFailureKind.AmbiguousAfterSend,
+                "gemini_batch_create_network_unknown",
+                isTransient: true,
+                innerException: exception);
+        }
+        catch (IOException exception)
         {
             throw new AiBatchCreateException(
                 AiBatchCreateFailureKind.AmbiguousAfterSend,
@@ -558,10 +578,52 @@ public sealed partial class GeminiBatchClient(HttpClient httpClient)
             Encoding.UTF8.GetString(credentialUtf8.Span));
         using var response = await SendControlAsync(message, timeout.Token)
             .ConfigureAwait(false);
+        if (response.StatusCode == HttpStatusCode.BadRequest
+            && providerFileName.Length - "files/".Length > 40
+            && await IsDeleteFileLengthRejectionAsync(response, timeout.Token).ConfigureAwait(false))
+        {
+            throw Failure(AiFailureKind.RequestRejected, FileIdLengthError, isTransient: false);
+        }
         if (response.StatusCode != HttpStatusCode.NotFound
             && !response.IsSuccessStatusCode)
         {
             throw FromHttpStatus(response);
+        }
+    }
+
+    public const string FileIdLengthError = "gemini_delete_file_id_too_long";
+
+    public static bool IsProviderManagedOutput(string? batchName, string? outputFileName, AiProviderException failure) =>
+        failure.SafeErrorCode == FileIdLengthError
+        && IsBatchName(batchName) && IsFileName(outputFileName)
+        && outputFileName!.Length - "files/".Length > 40
+        && outputFileName == "files/batch-" + batchName!["batches/".Length..];
+
+    private static async Task<bool> IsDeleteFileLengthRejectionAsync(HttpResponseMessage response, CancellationToken token)
+    {
+        try
+        {
+            var bytes = await ReadBoundedAsync(response.Content, 16_384, token).ConfigureAwait(false);
+            using var json = JsonDocument.Parse(bytes);
+            if (json.RootElement.ValueKind != JsonValueKind.Object
+                || !json.RootElement.TryGetProperty("error", out var error)
+                || error.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+            var message = GetString(error, "message");
+            return GetString(error, "status") == "INVALID_ARGUMENT"
+                && message?.Contains("DeleteFileRequest.name", StringComparison.Ordinal) == true
+                && message.Contains("File ID", StringComparison.Ordinal)
+                && message.Contains("cannot be more than 40 characters", StringComparison.Ordinal);
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+        catch (AiProviderException)
+        {
+            return false;
         }
     }
 
@@ -573,65 +635,9 @@ public sealed partial class GeminiBatchClient(HttpClient httpClient)
     {
         using var timeout = CreateTimeout(connection, cancellationToken);
         var credential = Encoding.UTF8.GetString(credentialUtf8.Span);
-        using var metadataRequest = new HttpRequestMessage(
-            HttpMethod.Get,
-            new Uri(connection.BaseAddress, $"v1beta/{providerFileName}"));
-        AddCredential(metadataRequest, credential);
-        using var metadataResponse = await SendControlAsync(
-                metadataRequest,
-                timeout.Token)
-            .ConfigureAwait(false);
-        if (!metadataResponse.IsSuccessStatusCode)
-        {
-            throw FromHttpStatus(metadataResponse);
-        }
-
-        var metadataBytes = await ReadBoundedAsync(
-                metadataResponse.Content,
-                MaximumControlResponseBytes,
-                timeout.Token)
-            .ConfigureAwait(false);
-        Uri downloadUri;
-        try
-        {
-            using var document = JsonDocument.Parse(metadataBytes);
-            var downloadValue = GetString(
-                document.RootElement,
-                "downloadUri");
-            if (!Uri.TryCreate(
-                    downloadValue,
-                    UriKind.Absolute,
-                    out downloadUri!))
-            {
-                downloadUri = new Uri(
-                    connection.BaseAddress,
-                    $"download/v1beta/{providerFileName}:download?alt=media");
-            }
-        }
-        catch (JsonException exception)
-        {
-            throw new AiProviderException(
-                AiFailureKind.InvalidResponse,
-                "gemini_file_metadata_json_invalid",
-                isTransient: false,
-                innerException: exception);
-        }
-
-        if (downloadUri.Scheme != Uri.UriSchemeHttps
-            || !string.Equals(
-                downloadUri.Host,
-                AllowedHost,
-                StringComparison.OrdinalIgnoreCase))
-        {
-            throw Failure(
-                AiFailureKind.InvalidResponse,
-                "gemini_file_download_url_invalid",
-                isTransient: false);
-        }
-
         using var downloadRequest = new HttpRequestMessage(
             HttpMethod.Get,
-            downloadUri);
+            new Uri(connection.BaseAddress, $"/download/v1beta/{providerFileName}:download?alt=media"));
         AddCredential(downloadRequest, credential);
         using var response = await SendControlAsync(
                 downloadRequest,
@@ -917,10 +923,23 @@ public sealed partial class GeminiBatchClient(HttpClient httpClient)
             ?? GetString(resource, "state");
         var state = ParseRemoteState(stateValue);
         var error = GetObject(root, "error");
-        if (state == AiBatchRemoteState.Unspecified
-            && GetInt64(error, "code") == 1)
+        if (state is AiBatchRemoteState.Pending or AiBatchRemoteState.Running or AiBatchRemoteState.Unspecified
+            && root.TryGetProperty("done", out var done) && done.ValueKind == JsonValueKind.True)
         {
-            state = AiBatchRemoteState.Cancelled;
+            if (error.ValueKind == JsonValueKind.Object)
+            {
+                state = GetInt64(error, "code") == 1
+                    ? AiBatchRemoteState.Cancelled
+                    : AiBatchRemoteState.Failed;
+            }
+            else if (response.ValueKind == JsonValueKind.Object)
+            {
+                state = AiBatchRemoteState.Succeeded;
+            }
+            else
+            {
+                throw Failure(AiFailureKind.InvalidResponse, "gemini_batch_terminal_result_missing", isTransient: false);
+            }
         }
 
         var output = GetObject(resource, "output");
@@ -1051,62 +1070,6 @@ public sealed partial class GeminiBatchClient(HttpClient httpClient)
         return false;
     }
 
-    private static void WriteGenerateContentRequest(
-        Utf8JsonWriter writer,
-        AiProviderRequest request)
-    {
-        writer.WriteStartObject();
-        writer.WritePropertyName("system_instruction");
-        writer.WriteStartObject();
-        writer.WriteString("role", "system");
-        writer.WritePropertyName("parts");
-        writer.WriteStartArray();
-        writer.WriteStartObject();
-        writer.WriteString("text", request.SystemInstruction);
-        writer.WriteEndObject();
-        writer.WriteEndArray();
-        writer.WriteEndObject();
-
-        writer.WritePropertyName("contents");
-        writer.WriteStartArray();
-        writer.WriteStartObject();
-        writer.WriteString("role", "user");
-        writer.WritePropertyName("parts");
-        writer.WriteStartArray();
-        foreach (var media in request.Media)
-        {
-            writer.WriteStartObject();
-            writer.WritePropertyName("inline_data");
-            writer.WriteStartObject();
-            writer.WriteString("mime_type", media.MimeType);
-            writer.WriteBase64String("data", media.Bytes.Span);
-            writer.WriteEndObject();
-            writer.WriteEndObject();
-        }
-
-        writer.WriteStartObject();
-        writer.WriteString("text", request.UserInstruction);
-        writer.WriteEndObject();
-        writer.WriteEndArray();
-        writer.WriteEndObject();
-        writer.WriteEndArray();
-
-        writer.WritePropertyName("generationConfig");
-        writer.WriteStartObject();
-        writer.WriteString("responseMimeType", "application/json");
-        writer.WritePropertyName("responseJsonSchema");
-        request.ResponseJsonSchema.WriteTo(writer);
-        writer.WriteNumber("maxOutputTokens", request.MaxOutputTokens);
-        writer.WritePropertyName("thinkingConfig");
-        writer.WriteStartObject();
-        writer.WriteBoolean("includeThoughts", false);
-        writer.WriteString("thinkingLevel", request.ThinkingLevel);
-        writer.WriteEndObject();
-        writer.WriteString("mediaResolution", request.MediaResolution);
-        writer.WriteEndObject();
-        writer.WriteEndObject();
-    }
-
     private static void ValidateProviderRequest(AiProviderRequest request)
     {
         if (string.IsNullOrWhiteSpace(request.RequestKey)
@@ -1142,11 +1105,7 @@ public sealed partial class GeminiBatchClient(HttpClient httpClient)
     {
         ArgumentNullException.ThrowIfNull(connection);
         if (connection.Provider != AiProviders.GeminiDirect
-            || connection.BaseAddress.Scheme != Uri.UriSchemeHttps
-            || !string.Equals(
-                connection.BaseAddress.Host,
-                AllowedHost,
-                StringComparison.OrdinalIgnoreCase)
+            || !IsGeminiOrigin(connection.BaseAddress)
             || !AiProviderCatalog.IsModelIdValid(
                 AiProviders.GeminiDirect,
                 connection.ModelId)
@@ -1386,11 +1345,8 @@ public sealed partial class GeminiBatchClient(HttpClient httpClient)
     private static int? GetInt32(
         JsonElement value,
         string propertyName) =>
-        value.ValueKind == JsonValueKind.Object
-        && value.TryGetProperty(propertyName, out var property)
-        && property.TryGetInt32(out var result)
-            ? result
-            : null;
+        GetInt64(value, propertyName) is { } count && count is >= 0 and <= int.MaxValue
+            ? (int)count : null;
 
     private static long? GetInt64(
         JsonElement value,
@@ -1402,7 +1358,7 @@ public sealed partial class GeminiBatchClient(HttpClient httpClient)
             return null;
         }
 
-        if (property.TryGetInt64(out var number))
+        if (property.ValueKind == JsonValueKind.Number && property.TryGetInt64(out var number))
         {
             return number;
         }
@@ -1431,6 +1387,11 @@ public sealed partial class GeminiBatchClient(HttpClient httpClient)
 
     private static bool IsBatchName(string? value) =>
         value is not null && BatchNamePattern().IsMatch(value);
+
+    private static bool IsGeminiOrigin(Uri uri) =>
+        uri.IsAbsoluteUri && uri.Scheme == Uri.UriSchemeHttps && uri.IsDefaultPort
+        && string.IsNullOrEmpty(uri.UserInfo)
+        && string.Equals(uri.Host, AllowedHost, StringComparison.OrdinalIgnoreCase);
 
     private static bool IsFileName(string? value) =>
         value is not null && FileNamePattern().IsMatch(value);
